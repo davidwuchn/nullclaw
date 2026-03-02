@@ -90,6 +90,11 @@ pub const OpenAiCompatibleProvider = struct {
         };
     }
 
+    fn validateUserAgent(user_agent: []const u8) bool {
+        // Disallow header injection and malformed values.
+        return std.mem.indexOfAny(u8, user_agent, "\r\n") == null;
+    }
+
     fn trimTrailingSlash(s: []const u8) []const u8 {
         if (s.len > 0 and s[s.len - 1] == '/') {
             return s[0 .. s.len - 1];
@@ -473,13 +478,13 @@ pub const OpenAiCompatibleProvider = struct {
         // Build extra headers (User-Agent if configured)
         var extra_headers: [1][]const u8 = undefined;
         var extra_header_count: usize = 0;
-        var user_agent_buf: [256]u8 = undefined;
+        var user_agent_hdr: ?[]u8 = null;
+        defer if (user_agent_hdr) |h| allocator.free(h);
         if (self.user_agent) |ua| {
-            const ua_header = std.fmt.bufPrint(&user_agent_buf, "User-Agent: {s}", .{ua}) catch null;
-            if (ua_header) |h| {
-                extra_headers[extra_header_count] = h;
-                extra_header_count += 1;
-            }
+            if (!validateUserAgent(ua)) return error.CompatibleApiError;
+            user_agent_hdr = std.fmt.allocPrint(allocator, "User-Agent: {s}", .{ua}) catch return error.CompatibleApiError;
+            extra_headers[extra_header_count] = user_agent_hdr.?;
+            extra_header_count += 1;
         }
 
         return sse.curlStream(allocator, url, body, auth_hdr, extra_headers[0..extra_header_count], request.timeout_secs, callback, callback_ctx);
@@ -532,13 +537,13 @@ pub const OpenAiCompatibleProvider = struct {
             headers_buf[header_count] = auth_hdr;
             header_count += 1;
         }
-        var user_agent_buf: [256]u8 = undefined;
+        var user_agent_hdr: ?[]u8 = null;
+        defer if (user_agent_hdr) |h| allocator.free(h);
         if (self.user_agent) |ua| {
-            const ua_header = std.fmt.bufPrint(&user_agent_buf, "User-Agent: {s}", .{ua}) catch null;
-            if (ua_header) |h| {
-                headers_buf[header_count] = h;
-                header_count += 1;
-            }
+            if (!validateUserAgent(ua)) return error.CompatibleApiError;
+            user_agent_hdr = std.fmt.allocPrint(allocator, "User-Agent: {s}", .{ua}) catch return error.CompatibleApiError;
+            headers_buf[header_count] = user_agent_hdr.?;
+            header_count += 1;
         }
 
         const resp_body = root.curlPost(allocator, url, body, headers_buf[0..header_count]) catch return error.CompatibleApiError;
@@ -587,13 +592,13 @@ pub const OpenAiCompatibleProvider = struct {
             headers_buf[header_count] = auth_hdr;
             header_count += 1;
         }
-        var user_agent_buf: [256]u8 = undefined;
+        var user_agent_hdr: ?[]u8 = null;
+        defer if (user_agent_hdr) |h| allocator.free(h);
         if (self.user_agent) |ua| {
-            const ua_header = std.fmt.bufPrint(&user_agent_buf, "User-Agent: {s}", .{ua}) catch null;
-            if (ua_header) |h| {
-                headers_buf[header_count] = h;
-                header_count += 1;
-            }
+            if (!validateUserAgent(ua)) return error.CompatibleApiError;
+            user_agent_hdr = std.fmt.allocPrint(allocator, "User-Agent: {s}", .{ua}) catch return error.CompatibleApiError;
+            headers_buf[header_count] = user_agent_hdr.?;
+            header_count += 1;
         }
 
         const resp_body = root.curlPostTimed(allocator, url, body, headers_buf[0..header_count], request.timeout_secs) catch return error.CompatibleApiError;
@@ -1109,6 +1114,11 @@ test "supportsStreaming returns true for compatible" {
     var p = OpenAiCompatibleProvider.init(std.testing.allocator, "test", "https://example.com", "key", .bearer, null);
     const prov = p.provider();
     try std.testing.expect(prov.supportsStreaming());
+}
+
+test "validateUserAgent rejects CRLF injection" {
+    try std.testing.expect(OpenAiCompatibleProvider.validateUserAgent("nullclaw/1.0"));
+    try std.testing.expect(!OpenAiCompatibleProvider.validateUserAgent("bad\r\nX-Test: 1"));
 }
 
 test "vtable has stream_chat not null" {

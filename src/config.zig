@@ -584,12 +584,14 @@ pub const Config = struct {
                 try w.print("      \"{s}\": {{", .{entry.name});
                 var has_field = false;
                 if (entry.api_key) |key| {
-                    try w.print("\"api_key\": \"{s}\"", .{key});
+                    try w.print("\"api_key\": ", .{});
+                    try writePrettyJsonInline(self.allocator, w, key, "");
                     has_field = true;
                 }
                 if (entry.base_url) |base| {
                     if (has_field) try w.print(", ", .{});
-                    try w.print("\"base_url\": \"{s}\"", .{base});
+                    try w.print("\"base_url\": ", .{});
+                    try writePrettyJsonInline(self.allocator, w, base, "");
                     has_field = true;
                 }
                 if (comptime @hasField(ProviderEntry, "native_tools")) {
@@ -602,7 +604,8 @@ pub const Config = struct {
                 if (comptime @hasField(ProviderEntry, "user_agent")) {
                     if (entry.user_agent) |ua| {
                         if (has_field) try w.print(", ", .{});
-                        try w.print("\"user_agent\": \"{s}\"", .{ua});
+                        try w.print("\"user_agent\": ", .{});
+                        try writePrettyJsonInline(self.allocator, w, ua, "");
                         has_field = true;
                     }
                 }
@@ -2925,6 +2928,49 @@ test "save writes provider native_tools when false" {
 
     try std.testing.expect(std.mem.indexOf(u8, content, "\"native_tools\": false") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "\"user_agent\": \"nullclaw-test/1.0\"") != null);
+}
+
+test "save escapes provider string fields" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+    defer allocator.free(config_path);
+
+    var cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    cfg.providers = &.{
+        .{
+            .name = "openai",
+            .api_key = "sk-\"quoted\"",
+            .base_url = "https://api.example.com/v1/\"quoted\"",
+            .user_agent = "nullclaw \"agent\"",
+        },
+    };
+
+    try cfg.save();
+
+    const file = try std.fs.openFileAbsolute(config_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(content);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
+    defer parsed.deinit();
+
+    const models = parsed.value.object.get("models").?.object;
+    const providers = models.get("providers").?.object;
+    const openai = providers.get("openai").?.object;
+
+    try std.testing.expectEqualStrings("sk-\"quoted\"", openai.get("api_key").?.string);
+    try std.testing.expectEqualStrings("https://api.example.com/v1/\"quoted\"", openai.get("base_url").?.string);
+    try std.testing.expectEqualStrings("nullclaw \"agent\"", openai.get("user_agent").?.string);
 }
 
 test "json parse tools.media.audio section" {
