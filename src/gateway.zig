@@ -20,6 +20,7 @@ const providers = @import("providers/root.zig");
 const http_util = @import("http_util.zig");
 const tools_mod = @import("tools/root.zig");
 const memory_mod = @import("memory/root.zig");
+const bootstrap_mod = @import("bootstrap/root.zig");
 const subagent_mod = @import("subagent.zig");
 const subagent_runner = @import("subagent_runner.zig");
 const observability = @import("observability.zig");
@@ -2549,6 +2550,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
     var session_mgr_opt: ?session_mod.SessionManager = null;
     var tools_slice: []const tools_mod.Tool = &.{};
     var mem_rt: ?memory_mod.MemoryRuntime = null;
+    var bootstrap_provider_opt: ?bootstrap_mod.BootstrapProvider = null;
     var subagent_manager_opt: ?*subagent_mod.SubagentManager = null;
     var sec_tracker_opt: ?security.RateTracker = null;
     var sec_policy_opt: ?security.SecurityPolicy = null;
@@ -2627,6 +2629,14 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
 
                 // Optional memory backend.
                 mem_rt = memory_mod.initRuntime(allocator, &cfg.memory, cfg.workspace_dir);
+                const mem_opt: ?memory_mod.Memory = if (mem_rt) |rt| rt.memory else null;
+
+                bootstrap_provider_opt = bootstrap_mod.createProvider(
+                    allocator,
+                    cfg.memory.backend,
+                    mem_opt,
+                    cfg.workspace_dir,
+                ) catch null;
 
                 const subagent_manager = allocator.create(subagent_mod.SubagentManager) catch null;
                 if (subagent_manager) |mgr| {
@@ -2651,9 +2661,10 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                     .allowed_paths = cfg.autonomy.allowed_paths,
                     .policy = if (sec_policy_opt) |*policy| policy else null,
                     .subagent_manager = subagent_manager_opt,
+                    .bootstrap_provider = bootstrap_provider_opt,
+                    .backend_name = cfg.memory.backend,
                 }) catch &.{};
 
-                const mem_opt: ?memory_mod.Memory = if (mem_rt) |rt| rt.memory else null;
                 var sm = session_mod.SessionManager.init(allocator, cfg, provider_i, tools_slice, mem_opt, gateway_thread_observer.observer(), if (mem_rt) |rt| rt.session_store else null, if (mem_rt) |*rt| rt.response_cache else null);
                 if (sec_policy_opt) |*policy| {
                     sm.policy = policy;
@@ -2673,6 +2684,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
         state.pairing_guard = try PairingGuard.init(allocator, true, &.{});
     }
     defer if (provider_bundle_opt) |*bundle| bundle.deinit();
+    defer if (bootstrap_provider_opt) |bp| bp.deinit();
     defer if (mem_rt) |*rt| rt.deinit();
     defer if (subagent_manager_opt) |mgr| {
         mgr.deinit();
