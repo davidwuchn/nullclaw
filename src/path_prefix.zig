@@ -7,11 +7,13 @@ pub fn pathStartsWith(path: []const u8, prefix: []const u8) bool {
         const norm_prefix = normalizeWindowsPrefix(prefix);
         if (!windowsPrefixEquals(norm_path, norm_prefix)) return false;
         if (norm_path.len == norm_prefix.len) return true;
+        if (norm_prefix.len > 0 and isWindowsPathSeparator(norm_prefix[norm_prefix.len - 1])) return true;
         return isWindowsPathSeparator(norm_path[norm_prefix.len]);
     }
 
     if (!std.mem.startsWith(u8, path, prefix)) return false;
     if (path.len == prefix.len) return true;
+    if (prefix.len > 0 and (prefix[prefix.len - 1] == '/' or prefix[prefix.len - 1] == '\\')) return true;
     const c = path[prefix.len];
     return c == '/' or c == '\\';
 }
@@ -44,6 +46,11 @@ test "path_prefix exact and nested match" {
 
 test "path_prefix rejects partial segment" {
     try std.testing.expect(!pathStartsWith("/foo/barbaz", "/foo/bar"));
+}
+
+test "path_prefix accepts separator-terminated roots" {
+    try std.testing.expect(pathStartsWith("/tmp/workspace", "/"));
+    try std.testing.expect(pathStartsWith("C:\\tmp\\workspace", "C:\\"));
 }
 
 test "path_prefix windows case-insensitive and separators" {
