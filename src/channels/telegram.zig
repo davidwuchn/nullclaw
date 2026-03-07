@@ -7,17 +7,18 @@ const config_types = @import("../config_types.zig");
 const interaction_choices = @import("../interactions/choices.zig");
 const streaming = @import("../streaming.zig");
 const telegram_draft_presenter = @import("telegram_draft_presenter.zig");
+const telegram_ingress = @import("telegram_ingress.zig");
 const thread_stacks = @import("../thread_stacks.zig");
 const Atomic = @import("../portable_atomic.zig").Atomic;
 
 const log = std.log.scoped(.telegram);
 const MEDIA_GROUP_FLUSH_SECS: u64 = 3;
-const TEXT_MESSAGE_DEBOUNCE_SECS: u64 = 3;
-const LARGE_TEXT_CHAIN_DEBOUNCE_SECS: u64 = 8;
-const LARGE_TEXT_CHAIN_MIN_PARTS: usize = 4;
-const LARGE_TEXT_CHAIN_MIN_BYTES: usize = 16 * 1024;
+const TEXT_MESSAGE_DEBOUNCE_SECS: u64 = telegram_ingress.TEXT_MESSAGE_DEBOUNCE_SECS;
+const LARGE_TEXT_CHAIN_DEBOUNCE_SECS: u64 = telegram_ingress.LARGE_TEXT_CHAIN_DEBOUNCE_SECS;
+const LARGE_TEXT_CHAIN_MIN_PARTS: usize = telegram_ingress.LARGE_TEXT_CHAIN_MIN_PARTS;
+const LARGE_TEXT_CHAIN_MIN_BYTES: usize = telegram_ingress.LARGE_TEXT_CHAIN_MIN_BYTES;
 // Debounce medium+ chunks so rapid-fire split messages get coalesced.
-const TEXT_SPLIT_LIKELY_MIN_LEN: usize = 500;
+const TEXT_SPLIT_LIKELY_MIN_LEN: usize = telegram_ingress.TEXT_SPLIT_LIKELY_MIN_LEN;
 const TEMP_MEDIA_SWEEP_INTERVAL_POLLS: u32 = 20;
 const TEMP_MEDIA_TTL_SECS: i64 = 24 * 60 * 60;
 const TELEGRAM_BOT_COMMANDS_JSON =
@@ -319,11 +320,7 @@ fn pendingTextLatestSeenForKey(
     return if (seen) latest else null;
 }
 
-const PendingTextChainStats = struct {
-    latest: u64,
-    parts: usize,
-    total_bytes: usize,
-};
+const PendingTextChainStats = telegram_ingress.PendingTextChainStats;
 
 fn pendingTextChainStatsForKey(
     id: []const u8,
@@ -331,46 +328,15 @@ fn pendingTextChainStatsForKey(
     pending_messages: []const root.ChannelMessage,
     received_at: []const u64,
 ) ?PendingTextChainStats {
-    const n = @min(pending_messages.len, received_at.len);
-    var seen = false;
-    var latest: u64 = 0;
-    var parts: usize = 0;
-    var total_bytes: usize = 0;
-    for (0..n) |i| {
-        const msg = pending_messages[i];
-        if (!std.mem.eql(u8, msg.id, id) or !std.mem.eql(u8, msg.sender, sender)) continue;
-        if (!seen or received_at[i] > latest) latest = received_at[i];
-        seen = true;
-        parts += 1;
-        total_bytes += msg.content.len;
-    }
-    if (!seen) return null;
-    return .{ .latest = latest, .parts = parts, .total_bytes = total_bytes };
+    return telegram_ingress.pendingTextChainStatsForKey(id, sender, pending_messages, received_at);
 }
 
 fn textDebounceSecsForChain(parts: usize, total_bytes: usize) u64 {
-    if (parts >= LARGE_TEXT_CHAIN_MIN_PARTS or total_bytes >= LARGE_TEXT_CHAIN_MIN_BYTES) {
-        return LARGE_TEXT_CHAIN_DEBOUNCE_SECS;
-    }
-    return TEXT_MESSAGE_DEBOUNCE_SECS;
+    return telegram_ingress.textDebounceSecsForChain(parts, total_bytes);
 }
 
 fn nextPendingTextDeadline(pending_messages: []const root.ChannelMessage, received_at: []const u64) ?u64 {
-    const n = @min(pending_messages.len, received_at.len);
-    var seen = false;
-    var next_deadline: u64 = 0;
-    for (0..n) |i| {
-        const stats = pendingTextChainStatsForKey(
-            pending_messages[i].id,
-            pending_messages[i].sender,
-            pending_messages,
-            received_at,
-        ) orelse continue;
-        const deadline = stats.latest + textDebounceSecsForChain(stats.parts, stats.total_bytes);
-        if (!seen or deadline < next_deadline) next_deadline = deadline;
-        seen = true;
-    }
-    return if (seen) next_deadline else null;
+    return telegram_ingress.nextPendingTextDeadline(pending_messages, received_at);
 }
 
 fn sweepTempMediaFilesInDir(dir_path: []const u8, now_secs: i64, ttl_secs: i64) void {
@@ -2644,6 +2610,8 @@ pub const TelegramChannel = struct {
 
         switch (stage) {
             .chunk => {
+                if (message.len == 0) return;
+
                 var pending_flush: ?telegram_draft_presenter.DraftFlush = null;
                 defer if (pending_flush) |*flush| flush.deinit(self.allocator);
 
@@ -2959,94 +2927,23 @@ fn appendHtmlEscaped(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Alloca
 /// long texts that were split by the Telegram client (which splits at 4096 chars).
 /// Handles interleaving of messages from different chats.
 fn isSlashCommandMessage(content: []const u8) bool {
-    const trimmed = std.mem.trim(u8, content, " \t\r\n");
-    return std.mem.startsWith(u8, trimmed, "/");
+    return telegram_ingress.isSlashCommandMessage(content);
 }
 
 fn shouldDebounceTextMessage(self: *const TelegramChannel, msg: root.ChannelMessage) bool {
-    if (msg.message_id == null) return false;
-    if (isSlashCommandMessage(msg.content)) return false;
-
-    // Telegram split chunks tend to be near the hard 4096-char limit, but
-    // in practice many clients emit chunk sizes around ~3.3k-3.6k.
-    if (msg.content.len >= TEXT_SPLIT_LIKELY_MIN_LEN) return true;
-
-    // Only debounce follow-ups when they are part of a *recent* rapid-fire chain.
-    const stats = pendingTextChainStatsForKey(
-        msg.id,
-        msg.sender,
+    return telegram_ingress.shouldDebounceTextMessage(
+        root.nowEpochSecs(),
         self.pending_text_messages.items,
         self.pending_text_received_at.items,
-    ) orelse return false;
-    const now = root.nowEpochSecs();
-    const chain_debounce_secs = textDebounceSecsForChain(stats.parts, stats.total_bytes);
-    return now <= stats.latest + chain_debounce_secs;
+        msg,
+    );
 }
 
 fn mergeConsecutiveMessages(
     allocator: std.mem.Allocator,
     messages: *std.ArrayListUnmanaged(root.ChannelMessage),
 ) void {
-    if (messages.items.len <= 1) return;
-
-    var i: usize = 0;
-    while (i < messages.items.len) {
-        _ = messages.items[i].message_id orelse {
-            i += 1;
-            continue;
-        };
-
-        if (isSlashCommandMessage(messages.items[i].content)) {
-            i += 1;
-            continue;
-        }
-
-        var found_idx: ?usize = null;
-        for (i + 1..messages.items.len) |j| {
-            if (std.mem.eql(u8, messages.items[i].sender, messages.items[j].sender) and
-                std.mem.eql(u8, messages.items[i].id, messages.items[j].id))
-            {
-                if (messages.items[j].message_id) |_| {
-                    if (!isSlashCommandMessage(messages.items[j].content)) {
-                        found_idx = j;
-                    }
-                }
-                break; // Found the next message from this user, consecutive or not.
-            }
-        }
-
-        if (found_idx) |j| {
-            var merged: std.ArrayListUnmanaged(u8) = .empty;
-            defer merged.deinit(allocator);
-            var merge_ok = true;
-            merged.appendSlice(allocator, messages.items[i].content) catch {
-                merge_ok = false;
-            };
-            if (merge_ok) {
-                merged.appendSlice(allocator, "\n") catch {
-                    merge_ok = false;
-                };
-                merged.appendSlice(allocator, messages.items[j].content) catch {
-                    merge_ok = false;
-                };
-            }
-
-            if (merge_ok and merged.items.len > 0) {
-                const new_content = merged.toOwnedSlice(allocator) catch null;
-                if (new_content) |nc| {
-                    allocator.free(messages.items[i].content);
-                    messages.items[i].content = nc;
-                    messages.items[i].message_id = messages.items[j].message_id;
-
-                    var extra = messages.orderedRemove(j);
-                    extra.deinit(allocator);
-
-                    continue; // Do not increment i, allow chain-merging
-                }
-            }
-        }
-        i += 1;
-    }
+    telegram_ingress.mergeConsecutiveMessages(allocator, messages);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
