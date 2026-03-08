@@ -311,7 +311,7 @@ pub const ProviderHolder = union(enum) {
             .azure_openai_provider => .{ .azure_openai = azure_openai.AzureOpenAiProvider.init(
                 allocator,
                 api_key,
-                base_url,
+                base_url orelse "https://your-resource.openai.azure.com",
                 user_agent,
             ) },
             .gemini_provider => .{ .gemini = gemini.GeminiProvider.init(allocator, api_key) },
