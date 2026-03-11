@@ -40,10 +40,12 @@ pub const TELEGRAM_BOT_COMMANDS_JSON =
     \\{"command":"verbose","description":"Set verbose level"},
     \\{"command":"reasoning","description":"Set reasoning output"},
     \\{"command":"exec","description":"Set exec policy"},
+    \\{"command":"allowlist","description":"Show allowlist"},
     \\{"command":"queue","description":"Set queue policy"},
     \\{"command":"usage","description":"Set usage footer mode"},
     \\{"command":"tts","description":"Set TTS mode"},
     \\{"command":"memory","description":"Memory tools and diagnostics"},
+    \\{"command":"skill","description":"List skills"},
     \\{"command":"doctor","description":"Memory diagnostics quick check"},
     \\{"command":"stop","description":"Stop active background task"},
     \\{"command":"restart","description":"Restart current session"},
@@ -128,7 +130,9 @@ test "isStopLikeCommand rejects non-control commands" {
     try std.testing.expect(!isStopLikeCommand(""));
 }
 
-test "telegram bot command payload includes memory and doctor commands" {
+test "telegram bot command payload includes registered menu commands" {
+    try std.testing.expect(std.mem.indexOf(u8, TELEGRAM_BOT_COMMANDS_JSON, "\"command\":\"allowlist\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, TELEGRAM_BOT_COMMANDS_JSON, "\"command\":\"skill\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, TELEGRAM_BOT_COMMANDS_JSON, "\"command\":\"memory\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, TELEGRAM_BOT_COMMANDS_JSON, "\"command\":\"doctor\"") != null);
 }
