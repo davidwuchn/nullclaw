@@ -11,7 +11,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Config = @import("config.zig").Config;
-const Agent = @import("agent/root.zig").Agent;
+const agent_mod = @import("agent/root.zig");
+const Agent = agent_mod.Agent;
 const ConversationContext = @import("agent/prompt.zig").ConversationContext;
 const providers = @import("providers/root.zig");
 const Provider = providers.Provider;
@@ -22,14 +23,34 @@ const Observer = observability.Observer;
 const tools_mod = @import("tools/root.zig");
 const Tool = tools_mod.Tool;
 const SecurityPolicy = @import("security/policy.zig").SecurityPolicy;
+const streaming = @import("streaming.zig");
+const thread_stacks = @import("thread_stacks.zig");
 const log = std.log.scoped(.session);
 const MESSAGE_LOG_MAX_BYTES: usize = 4096;
+const TOKEN_USAGE_LEDGER_FILENAME = "llm_token_usage.jsonl";
+const NS_PER_SEC: i128 = std.time.ns_per_s;
 
 fn messageLogPreview(text: []const u8) struct { slice: []const u8, truncated: bool } {
     if (text.len <= MESSAGE_LOG_MAX_BYTES) {
         return .{ .slice = text, .truncated = false };
     }
     return .{ .slice = text[0..MESSAGE_LOG_MAX_BYTES], .truncated = true };
+}
+
+fn estimateRestoredSessionTokens(entries: []const memory_mod.MessageEntry) u64 {
+    var total: u64 = 0;
+    for (entries) |entry| {
+        if (!std.mem.eql(u8, entry.role, "assistant")) continue;
+        total += agent_mod.estimate_text_tokens(entry.content);
+    }
+    return total;
+}
+
+fn persistedAssistantReply(agent: *const Agent, response: []const u8) []const u8 {
+    if (agent.history.items.len == 0) return response;
+    const last = agent.history.items[agent.history.items.len - 1];
+    if (last.role != .assistant) return response;
+    return last.content;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -43,6 +64,7 @@ pub const Session = struct {
     last_consolidated: u64 = 0,
     session_key: []const u8, // owned copy
     turn_count: u64,
+    turn_running: std.atomic.Value(bool),
     mutex: std.Thread.Mutex,
 
     pub fn deinit(self: *Session, allocator: Allocator) void {
@@ -68,6 +90,10 @@ pub const SessionManager = struct {
     policy: ?*const SecurityPolicy = null,
 
     mutex: std.Thread.Mutex,
+    usage_log_mutex: std.Thread.Mutex,
+    usage_ledger_state_initialized: bool,
+    usage_ledger_window_started_at: i64,
+    usage_ledger_line_count: u64,
     sessions: std.StringHashMapUnmanaged(*Session),
 
     pub fn init(
@@ -92,6 +118,10 @@ pub const SessionManager = struct {
             .response_cache = response_cache,
             .observer = observer_i,
             .mutex = .{},
+            .usage_log_mutex = .{},
+            .usage_ledger_state_initialized = false,
+            .usage_ledger_window_started_at = 0,
+            .usage_ledger_line_count = 0,
             .sessions = .{},
         };
     }
@@ -135,6 +165,10 @@ pub const SessionManager = struct {
         agent.response_cache = self.response_cache;
         agent.mem_rt = self.mem_rt;
         agent.memory_session_id = owned_key;
+        if (self.config.diagnostics.token_usage_ledger_enabled) {
+            agent.usage_record_callback = usageRecordForwarder;
+            agent.usage_record_ctx = @ptrCast(self);
+        }
 
         session.* = .{
             .agent = agent,
@@ -143,6 +177,7 @@ pub const SessionManager = struct {
             .last_consolidated = 0,
             .session_key = owned_key,
             .turn_count = 0,
+            .turn_running = std.atomic.Value(bool).init(false),
             .mutex = .{},
         };
         // From here, session owns agent — must deinit on error.
@@ -150,14 +185,17 @@ pub const SessionManager = struct {
 
         // Restore persisted conversation history from session store
         if (self.session_store) |store| {
-            const entries = store.loadMessages(self.allocator, session_key) catch &.{};
-            if (entries.len > 0) {
-                session.agent.loadHistory(entries) catch {};
-                for (entries) |entry| {
-                    self.allocator.free(entry.role);
-                    self.allocator.free(entry.content);
+            const maybe_entries = store.loadMessages(self.allocator, session_key) catch null;
+            if (maybe_entries) |entries| {
+                defer memory_mod.freeMessages(self.allocator, entries);
+                if (entries.len > 0) {
+                    session.agent.loadHistory(entries) catch {};
                 }
-                self.allocator.free(entries);
+                if (try store.loadUsage(session_key)) |total_tokens| {
+                    session.agent.total_tokens = total_tokens;
+                } else if (entries.len > 0) {
+                    session.agent.total_tokens = estimateRestoredSessionTokens(entries);
+                }
             }
         }
 
@@ -165,30 +203,168 @@ pub const SessionManager = struct {
         return session;
     }
 
-    fn slashCommandName(message: []const u8) ?[]const u8 {
-        const trimmed = std.mem.trim(u8, message, " \t\r\n");
-        if (trimmed.len <= 1 or trimmed[0] != '/') return null;
+    const StreamAdapterCtx = struct {
+        sink: streaming.Sink,
+    };
 
-        const body = trimmed[1..];
-        var split_idx: usize = 0;
-        while (split_idx < body.len) : (split_idx += 1) {
-            const ch = body[split_idx];
-            if (ch == ':' or ch == ' ' or ch == '\t') break;
-        }
-        if (split_idx == 0) return null;
-        return body[0..split_idx];
+    fn streamChunkForwarder(ctx_ptr: *anyopaque, chunk: providers.StreamChunk) void {
+        const adapter: *StreamAdapterCtx = @ptrCast(@alignCast(ctx_ptr));
+        streaming.forwardProviderChunk(adapter.sink, chunk);
     }
 
-    fn slashClearsSession(message: []const u8) bool {
-        const cmd = slashCommandName(message) orelse return false;
-        return std.ascii.eqlIgnoreCase(cmd, "new") or
-            std.ascii.eqlIgnoreCase(cmd, "reset") or
-            std.ascii.eqlIgnoreCase(cmd, "restart");
+    fn usageRecordForwarder(ctx_ptr: *anyopaque, record: Agent.UsageRecord) void {
+        const self: *SessionManager = @ptrCast(@alignCast(ctx_ptr));
+        self.appendUsageRecord(record);
+    }
+
+    fn usageLedgerPath(self: *SessionManager) ?[]u8 {
+        if (!self.config.diagnostics.token_usage_ledger_enabled) return null;
+        const config_dir = std.fs.path.dirname(self.config.config_path) orelse return null;
+        return std.fs.path.join(self.allocator, &.{ config_dir, TOKEN_USAGE_LEDGER_FILENAME }) catch null;
+    }
+
+    fn usageWindowSeconds(self: *SessionManager) i64 {
+        const hours = self.config.diagnostics.token_usage_ledger_window_hours;
+        if (hours == 0) return 0;
+        return @as(i64, @intCast(hours)) * 60 * 60;
+    }
+
+    fn countLedgerLines(file: *std.fs.File) !u64 {
+        try file.seekTo(0);
+        var lines: u64 = 0;
+        var saw_data = false;
+        var last_byte: u8 = '\n';
+        var buf: [4096]u8 = undefined;
+        while (true) {
+            const n = try file.read(&buf);
+            if (n == 0) break;
+            saw_data = true;
+            last_byte = buf[n - 1];
+            lines += @intCast(std.mem.count(u8, buf[0..n], "\n"));
+        }
+        if (saw_data and last_byte != '\n') lines += 1;
+        return lines;
+    }
+
+    fn initializeUsageLedgerState(
+        self: *SessionManager,
+        file: *std.fs.File,
+        stat: std.fs.File.Stat,
+        now_ts: i64,
+    ) void {
+        if (self.usage_ledger_state_initialized) return;
+        self.usage_ledger_state_initialized = true;
+        if (stat.size > 0) {
+            const mtime_secs: i64 = @intCast(@divFloor(stat.mtime, NS_PER_SEC));
+            self.usage_ledger_window_started_at = if (mtime_secs > 0) mtime_secs else now_ts;
+            if (self.config.diagnostics.token_usage_ledger_max_lines > 0) {
+                self.usage_ledger_line_count = countLedgerLines(file) catch 0;
+            } else {
+                self.usage_ledger_line_count = 0;
+            }
+        } else {
+            self.usage_ledger_window_started_at = now_ts;
+            self.usage_ledger_line_count = 0;
+        }
+    }
+
+    fn shouldResetUsageLedger(
+        self: *SessionManager,
+        stat: std.fs.File.Stat,
+        now_ts: i64,
+        pending_bytes: usize,
+        pending_lines: u64,
+    ) bool {
+        const window_secs = self.usageWindowSeconds();
+        if (window_secs > 0) {
+            const started_at = self.usage_ledger_window_started_at;
+            if (started_at > 0 and now_ts - started_at >= window_secs) return true;
+        }
+
+        const max_bytes = self.config.diagnostics.token_usage_ledger_max_bytes;
+        if (max_bytes > 0) {
+            const projected = @as(u64, @intCast(stat.size)) + @as(u64, @intCast(pending_bytes));
+            if (projected > max_bytes) return true;
+        }
+
+        const max_lines = self.config.diagnostics.token_usage_ledger_max_lines;
+        if (max_lines > 0 and self.usage_ledger_line_count + pending_lines > max_lines) return true;
+
+        return false;
+    }
+
+    fn appendUsageRecord(self: *SessionManager, record: Agent.UsageRecord) void {
+        self.usage_log_mutex.lock();
+        defer self.usage_log_mutex.unlock();
+
+        const ledger_path = self.usageLedgerPath() orelse return;
+        defer self.allocator.free(ledger_path);
+
+        var file = std.fs.openFileAbsolute(ledger_path, .{ .mode = .read_write }) catch |err| switch (err) {
+            error.FileNotFound => std.fs.createFileAbsolute(ledger_path, .{ .truncate = false, .read = true }) catch return,
+            else => return,
+        };
+        var file_needs_close = true;
+        defer if (file_needs_close) file.close();
+
+        const now_ts = std.time.timestamp();
+        const stat = file.stat() catch return;
+        self.initializeUsageLedgerState(&file, stat, now_ts);
+
+        const record_line = std.fmt.allocPrint(
+            self.allocator,
+            "{{\"ts\":{d},\"provider\":{f},\"model\":{f},\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d},\"success\":{}}}\n",
+            .{
+                record.ts,
+                std.json.fmt(record.provider, .{}),
+                std.json.fmt(record.model, .{}),
+                record.usage.prompt_tokens,
+                record.usage.completion_tokens,
+                record.usage.total_tokens,
+                record.success,
+            },
+        ) catch return;
+        defer self.allocator.free(record_line);
+
+        const pending_bytes: usize = record_line.len;
+        if (self.shouldResetUsageLedger(stat, now_ts, pending_bytes, 1)) {
+            file.close();
+            file_needs_close = false;
+            file = std.fs.createFileAbsolute(ledger_path, .{ .truncate = true, .read = true }) catch return;
+            file_needs_close = true;
+            self.usage_ledger_state_initialized = true;
+            self.usage_ledger_window_started_at = now_ts;
+            self.usage_ledger_line_count = 0;
+        }
+
+        // Zig 0.15 buffered File.writer ignores manual seek position for append-style writes.
+        // Use direct file.writeAll after seek to guarantee true append semantics.
+        file.seekFromEnd(0) catch return;
+        file.writeAll(record_line) catch return;
+
+        if (self.usage_ledger_window_started_at == 0) {
+            self.usage_ledger_window_started_at = now_ts;
+        }
+        if (self.config.diagnostics.token_usage_ledger_max_lines > 0) {
+            self.usage_ledger_line_count += 1;
+        }
     }
 
     /// Process a message within a session context.
     /// Finds or creates the session, locks it, runs agent.turn(), returns owned response.
     pub fn processMessage(self: *SessionManager, session_key: []const u8, content: []const u8, conversation_context: ?ConversationContext) ![]const u8 {
+        return self.processMessageStreaming(session_key, content, conversation_context, null);
+    }
+
+    /// Process a message within a session context and optionally forward text deltas.
+    /// Deltas are only emitted when provider streaming is active.
+    pub fn processMessageStreaming(
+        self: *SessionManager,
+        session_key: []const u8,
+        content: []const u8,
+        conversation_context: ?ConversationContext,
+        stream_sink: ?streaming.Sink,
+    ) ![]const u8 {
         const channel = if (conversation_context) |ctx| (ctx.channel orelse "unknown") else "unknown";
         const session_hash = std.hash.Wyhash.hash(0, session_key);
 
@@ -204,7 +380,7 @@ pub const SessionManager = struct {
                     session_hash,
                     content.len,
                     std.json.fmt(preview.slice, .{}),
-                    if (preview.truncated) " [truncated]" else "",
+                    if (preview.truncated) " [log preview truncated]" else "",
                 },
             );
         }
@@ -213,11 +389,34 @@ pub const SessionManager = struct {
 
         session.mutex.lock();
         defer session.mutex.unlock();
+        session.turn_running.store(true, .release);
+        defer {
+            session.turn_running.store(false, .release);
+            session.agent.clearInterruptRequest();
+        }
 
         // Set conversation context for this turn (Signal-specific for now)
         session.agent.conversation_context = conversation_context;
         defer session.agent.conversation_context = null;
 
+        const prev_stream_callback = session.agent.stream_callback;
+        const prev_stream_ctx = session.agent.stream_ctx;
+        defer {
+            session.agent.stream_callback = prev_stream_callback;
+            session.agent.stream_ctx = prev_stream_ctx;
+        }
+
+        var stream_adapter: StreamAdapterCtx = undefined;
+        if (stream_sink) |sink| {
+            stream_adapter = .{ .sink = sink };
+            session.agent.stream_callback = streamChunkForwarder;
+            session.agent.stream_ctx = @ptrCast(&stream_adapter);
+        } else {
+            session.agent.stream_callback = null;
+            session.agent.stream_ctx = null;
+        }
+
+        const turn_input = agent_mod.commands.planTurnInput(content);
         const response = try session.agent.turn(content);
         session.turn_count += 1;
         session.last_active = std.time.timestamp();
@@ -229,16 +428,29 @@ pub const SessionManager = struct {
 
         // Persist messages via session store
         if (self.session_store) |store| {
-            const trimmed = std.mem.trim(u8, content, " \t\r\n");
-            if (slashClearsSession(trimmed)) {
+            if (turn_input.clear_session) {
                 // Clear persisted messages on session reset
                 store.clearMessages(session_key) catch {};
                 // Clear stale auto-saved memories
                 store.clearAutoSaved(session_key) catch {};
-            } else if (!std.mem.startsWith(u8, trimmed, "/")) {
-                // Persist user + assistant messages (skip slash commands)
-                store.saveMessage(session_key, "user", content) catch {};
-                store.saveMessage(session_key, "assistant", response) catch {};
+            }
+
+            if (turn_input.llm_user_message) |persisted_user| {
+                // Persist canonical conversation history.
+                // Local-only slash commands are skipped, but any input that
+                // reached the LLM must persist with the exact same routing
+                // decision used by Agent.turn().
+                // When the turn ends with an assistant history message, prefer
+                // that canonical text over the rendered reply so restored
+                // sessions do not replay /usage footers or reasoning blocks.
+                // Some degraded turns return a fallback response without
+                // appending a final assistant history entry; in that case we
+                // must persist the actual response instead of stale tool-step
+                // assistant text from earlier in the turn.
+                const persisted_assistant = persistedAssistantReply(&session.agent, response);
+                store.saveMessage(session_key, "user", persisted_user) catch {};
+                store.saveMessage(session_key, "assistant", persisted_assistant) catch {};
+                store.saveUsage(session_key, session.agent.total_tokens) catch {};
             }
         }
 
@@ -251,7 +463,7 @@ pub const SessionManager = struct {
                     session_hash,
                     response.len,
                     std.json.fmt(preview.slice, .{}),
-                    if (preview.truncated) " [truncated]" else "",
+                    if (preview.truncated) " [log preview truncated]" else "",
                 },
             );
         }
@@ -259,11 +471,63 @@ pub const SessionManager = struct {
         return response;
     }
 
+    pub const InterruptRequestResult = struct {
+        requested: bool = false,
+        active_tool: ?[]u8 = null,
+
+        pub fn deinit(self: *InterruptRequestResult, allocator: Allocator) void {
+            if (self.active_tool) |name| allocator.free(name);
+            self.active_tool = null;
+        }
+    };
+
+    /// Request interruption of a currently running turn for a session.
+    /// Returns whether it was signaled and the active tool snapshot (if any).
+    pub fn requestTurnInterrupt(self: *SessionManager, session_key: []const u8) InterruptRequestResult {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const session = self.sessions.get(session_key) orelse return .{};
+        if (!session.turn_running.load(.acquire)) return .{};
+        session.agent.requestInterrupt();
+        return .{
+            .requested = true,
+            .active_tool = session.agent.snapshotActiveToolName(self.allocator) catch null,
+        };
+    }
+
     /// Number of active sessions.
     pub fn sessionCount(self: *SessionManager) usize {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.sessions.count();
+    }
+
+    pub const ReloadSkillsResult = struct {
+        sessions_seen: usize = 0,
+        sessions_reloaded: usize = 0,
+        failures: usize = 0,
+    };
+
+    /// Reload skill-backed system prompts for all active sessions.
+    /// Each session is reloaded under its own lock to avoid in-flight turn races.
+    pub fn reloadSkillsAll(self: *SessionManager) ReloadSkillsResult {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var result = ReloadSkillsResult{};
+
+        var it = self.sessions.iterator();
+        while (it.next()) |entry| {
+            const session = entry.value_ptr.*;
+            result.sessions_seen += 1;
+            session.mutex.lock();
+            session.agent.has_system_prompt = false;
+            session.mutex.unlock();
+            result.sessions_reloaded += 1;
+        }
+
+        return result;
     }
 
     /// Evict sessions idle longer than max_idle_secs. Returns number evicted.
@@ -274,7 +538,9 @@ pub const SessionManager = struct {
         const now = std.time.timestamp();
         var evicted: usize = 0;
 
-        // Collect keys to remove (can't modify map while iterating)
+        // Collect keys to remove (can't modify map while iterating).
+        // Active turns keep stale last_active until the turn finishes, so skip
+        // any session that is currently executing.
         var to_remove: std.ArrayListUnmanaged([]const u8) = .{};
         defer to_remove.deinit(self.allocator);
 
@@ -282,7 +548,7 @@ pub const SessionManager = struct {
         while (it.next()) |entry| {
             const session = entry.value_ptr.*;
             const idle_secs: u64 = @intCast(@max(0, now - session.last_active));
-            if (idle_secs > max_idle_secs) {
+            if (idle_secs > max_idle_secs and !session.turn_running.load(.acquire)) {
                 to_remove.append(self.allocator, entry.key_ptr.*) catch continue;
             }
         }
@@ -359,6 +625,176 @@ const MockProvider = struct {
     fn mockDeinit(_: *anyopaque) void {}
 };
 
+const MockStreamingProvider = struct {
+    response: []const u8,
+
+    const vtable = Provider.VTable{
+        .chatWithSystem = mockChatWithSystem,
+        .chat = mockChat,
+        .supportsNativeTools = mockSupportsNativeTools,
+        .getName = mockGetName,
+        .deinit = mockDeinit,
+        .supports_streaming = mockSupportsStreaming,
+        .stream_chat = mockStreamChat,
+    };
+
+    fn provider(self: *MockStreamingProvider) Provider {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+
+    fn mockChatWithSystem(
+        ptr: *anyopaque,
+        _: Allocator,
+        _: ?[]const u8,
+        _: []const u8,
+        _: []const u8,
+        _: f64,
+    ) anyerror![]const u8 {
+        const self: *MockStreamingProvider = @ptrCast(@alignCast(ptr));
+        return self.response;
+    }
+
+    fn mockChat(
+        ptr: *anyopaque,
+        allocator: Allocator,
+        _: providers.ChatRequest,
+        _: []const u8,
+        _: f64,
+    ) anyerror!providers.ChatResponse {
+        const self: *MockStreamingProvider = @ptrCast(@alignCast(ptr));
+        return .{ .content = try allocator.dupe(u8, self.response) };
+    }
+
+    fn mockSupportsNativeTools(_: *anyopaque) bool {
+        return false;
+    }
+
+    fn mockGetName(_: *anyopaque) []const u8 {
+        return "mock_stream";
+    }
+
+    fn mockDeinit(_: *anyopaque) void {}
+
+    fn mockSupportsStreaming(_: *anyopaque) bool {
+        return true;
+    }
+
+    fn mockStreamChat(
+        ptr: *anyopaque,
+        allocator: Allocator,
+        _: providers.ChatRequest,
+        model: []const u8,
+        _: f64,
+        callback: providers.StreamCallback,
+        callback_ctx: *anyopaque,
+    ) anyerror!providers.StreamChatResult {
+        const self: *MockStreamingProvider = @ptrCast(@alignCast(ptr));
+        const mid = self.response.len / 2;
+        if (mid > 0) callback(callback_ctx, providers.StreamChunk.textDelta(self.response[0..mid]));
+        callback(callback_ctx, providers.StreamChunk.textDelta(self.response[mid..]));
+        callback(callback_ctx, providers.StreamChunk.finalChunk());
+        return .{
+            .content = try allocator.dupe(u8, self.response),
+            .model = try allocator.dupe(u8, model),
+        };
+    }
+};
+
+const DeltaCollector = struct {
+    allocator: Allocator,
+    data: std.ArrayListUnmanaged(u8) = .empty,
+
+    fn onEvent(ctx_ptr: *anyopaque, event: streaming.Event) void {
+        if (event.stage != .chunk or event.text.len == 0) return;
+        const self: *DeltaCollector = @ptrCast(@alignCast(ctx_ptr));
+        self.data.appendSlice(self.allocator, event.text) catch {};
+    }
+
+    fn deinit(self: *DeltaCollector) void {
+        self.data.deinit(self.allocator);
+    }
+};
+
+const ProbeTool = struct {
+    pub const tool_name = "probe";
+    pub const tool_description = "Test probe tool";
+    pub const tool_params = "{}";
+    const vtable = tools_mod.ToolVTable(@This());
+
+    fn tool(self: *@This()) Tool {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+
+    pub fn execute(_: *@This(), allocator: Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+        return .{ .success = true, .output = try allocator.dupe(u8, "probe ok") };
+    }
+};
+
+const SummaryFailureProvider = struct {
+    call_count: usize = 0,
+
+    const vtable = Provider.VTable{
+        .chatWithSystem = chatWithSystem,
+        .chat = chat,
+        .supportsNativeTools = supportsNativeTools,
+        .getName = getName,
+        .deinit = deinitFn,
+    };
+
+    fn provider(self: *SummaryFailureProvider) Provider {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+
+    fn chatWithSystem(
+        _: *anyopaque,
+        allocator: Allocator,
+        _: ?[]const u8,
+        _: []const u8,
+        _: []const u8,
+        _: f64,
+    ) anyerror![]const u8 {
+        return allocator.dupe(u8, "");
+    }
+
+    fn chat(
+        ptr: *anyopaque,
+        allocator: Allocator,
+        _: providers.ChatRequest,
+        _: []const u8,
+        _: f64,
+    ) anyerror!providers.ChatResponse {
+        const self: *SummaryFailureProvider = @ptrCast(@alignCast(ptr));
+        self.call_count += 1;
+
+        if (self.call_count == 1) {
+            const tool_calls = try allocator.alloc(providers.ToolCall, 1);
+            tool_calls[0] = .{
+                .id = try allocator.dupe(u8, "call-probe"),
+                .name = try allocator.dupe(u8, "probe"),
+                .arguments = try allocator.dupe(u8, "{}"),
+            };
+            return .{
+                .content = try allocator.dupe(u8, "running"),
+                .tool_calls = tool_calls,
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        return error.ProviderError;
+    }
+
+    fn supportsNativeTools(_: *anyopaque) bool {
+        return true;
+    }
+
+    fn getName(_: *anyopaque) []const u8 {
+        return "summary_failure";
+    }
+
+    fn deinitFn(_: *anyopaque) void {}
+};
+
 /// Create a test SessionManager with mock provider.
 fn testSessionManager(allocator: Allocator, mock: *MockProvider, cfg: *const Config) SessionManager {
     return testSessionManagerWithMemory(allocator, mock, cfg, null, null);
@@ -396,6 +832,252 @@ test "SessionManager init/deinit — no leaks" {
     const cfg = testConfig();
     var sm = testSessionManager(testing.allocator, &mock, &cfg);
     sm.deinit();
+}
+
+test "usage ledger appends records when retention limits are disabled" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(base);
+    const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
+    defer testing.allocator.free(config_path);
+    const ledger_path = try std.fmt.allocPrint(testing.allocator, "{s}/{s}", .{ base, TOKEN_USAGE_LEDGER_FILENAME });
+    defer testing.allocator.free(ledger_path);
+
+    var cfg = testConfig();
+    cfg.workspace_dir = base;
+    cfg.config_path = config_path;
+    cfg.diagnostics.token_usage_ledger_enabled = true;
+    cfg.diagnostics.token_usage_ledger_window_hours = 0;
+    cfg.diagnostics.token_usage_ledger_max_lines = 0;
+    cfg.diagnostics.token_usage_ledger_max_bytes = 0;
+
+    var mock = MockProvider{ .response = "ok" };
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    sm.appendUsageRecord(.{
+        .ts = 101,
+        .provider = "p1",
+        .model = "m1",
+        .usage = .{ .prompt_tokens = 1, .completion_tokens = 1, .total_tokens = 2 },
+        .success = true,
+    });
+    sm.appendUsageRecord(.{
+        .ts = 102,
+        .provider = "p1",
+        .model = "m1",
+        .usage = .{ .prompt_tokens = 2, .completion_tokens = 2, .total_tokens = 4 },
+        .success = true,
+    });
+
+    const file = try std.fs.openFileAbsolute(ledger_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(testing.allocator, 64 * 1024);
+    defer testing.allocator.free(content);
+
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, content, "\n"));
+    try testing.expect(std.mem.indexOf(u8, content, "\"ts\":101") != null);
+    try testing.expect(std.mem.indexOf(u8, content, "\"ts\":102") != null);
+}
+
+test "usage ledger resets when max line limit is reached" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(base);
+    const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
+    defer testing.allocator.free(config_path);
+    const ledger_path = try std.fmt.allocPrint(testing.allocator, "{s}/{s}", .{ base, TOKEN_USAGE_LEDGER_FILENAME });
+    defer testing.allocator.free(ledger_path);
+
+    var cfg = testConfig();
+    cfg.workspace_dir = base;
+    cfg.config_path = config_path;
+    cfg.diagnostics.token_usage_ledger_enabled = true;
+    cfg.diagnostics.token_usage_ledger_window_hours = 0;
+    cfg.diagnostics.token_usage_ledger_max_lines = 2;
+    cfg.diagnostics.token_usage_ledger_max_bytes = 0;
+
+    var mock = MockProvider{ .response = "ok" };
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    sm.appendUsageRecord(.{
+        .ts = 1,
+        .provider = "p1",
+        .model = "m1",
+        .usage = .{ .prompt_tokens = 1, .completion_tokens = 2, .total_tokens = 3 },
+        .success = true,
+    });
+    sm.appendUsageRecord(.{
+        .ts = 2,
+        .provider = "p1",
+        .model = "m1",
+        .usage = .{ .prompt_tokens = 2, .completion_tokens = 3, .total_tokens = 5 },
+        .success = true,
+    });
+    sm.appendUsageRecord(.{
+        .ts = 3,
+        .provider = "p2",
+        .model = "m2",
+        .usage = .{ .prompt_tokens = 3, .completion_tokens = 4, .total_tokens = 7 },
+        .success = true,
+    });
+
+    const file = try std.fs.openFileAbsolute(ledger_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(testing.allocator, 64 * 1024);
+    defer testing.allocator.free(content);
+
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, content, "\n"));
+    try testing.expect(std.mem.indexOf(u8, content, "\"ts\":3") != null);
+    try testing.expect(std.mem.indexOf(u8, content, "\"total_tokens\":7") != null);
+    try testing.expect(std.mem.indexOf(u8, content, "\"success\":true") != null);
+}
+
+test "usage ledger resets when window expires" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(base);
+    const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
+    defer testing.allocator.free(config_path);
+    const ledger_path = try std.fmt.allocPrint(testing.allocator, "{s}/{s}", .{ base, TOKEN_USAGE_LEDGER_FILENAME });
+    defer testing.allocator.free(ledger_path);
+
+    var cfg = testConfig();
+    cfg.workspace_dir = base;
+    cfg.config_path = config_path;
+    cfg.diagnostics.token_usage_ledger_enabled = true;
+    cfg.diagnostics.token_usage_ledger_window_hours = 1;
+    cfg.diagnostics.token_usage_ledger_max_lines = 0;
+    cfg.diagnostics.token_usage_ledger_max_bytes = 0;
+
+    var mock = MockProvider{ .response = "ok" };
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    sm.appendUsageRecord(.{
+        .ts = 10,
+        .provider = "p1",
+        .model = "m1",
+        .usage = .{ .prompt_tokens = 1, .completion_tokens = 1, .total_tokens = 2 },
+        .success = true,
+    });
+
+    sm.usage_ledger_state_initialized = true;
+    sm.usage_ledger_window_started_at = std.time.timestamp() - 2 * 60 * 60;
+
+    sm.appendUsageRecord(.{
+        .ts = 11,
+        .provider = "p2",
+        .model = "m2",
+        .usage = .{ .prompt_tokens = 2, .completion_tokens = 2, .total_tokens = 4 },
+        .success = true,
+    });
+
+    const file = try std.fs.openFileAbsolute(ledger_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(testing.allocator, 64 * 1024);
+    defer testing.allocator.free(content);
+
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, content, "\n"));
+    try testing.expect(std.mem.indexOf(u8, content, "\"ts\":11") != null);
+    try testing.expect(std.mem.indexOf(u8, content, "\"total_tokens\":4") != null);
+    try testing.expect(std.mem.indexOf(u8, content, "\"success\":true") != null);
+}
+
+test "usage ledger resets when byte limit would be exceeded" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(base);
+    const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
+    defer testing.allocator.free(config_path);
+    const ledger_path = try std.fmt.allocPrint(testing.allocator, "{s}/{s}", .{ base, TOKEN_USAGE_LEDGER_FILENAME });
+    defer testing.allocator.free(ledger_path);
+
+    var cfg = testConfig();
+    cfg.workspace_dir = base;
+    cfg.config_path = config_path;
+    cfg.diagnostics.token_usage_ledger_enabled = true;
+    cfg.diagnostics.token_usage_ledger_window_hours = 0;
+    cfg.diagnostics.token_usage_ledger_max_lines = 0;
+    cfg.diagnostics.token_usage_ledger_max_bytes = 140;
+
+    var mock = MockProvider{ .response = "ok" };
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    sm.appendUsageRecord(.{
+        .ts = 21,
+        .provider = "p1",
+        .model = "m1",
+        .usage = .{ .prompt_tokens = 1, .completion_tokens = 2, .total_tokens = 3 },
+        .success = true,
+    });
+    sm.appendUsageRecord(.{
+        .ts = 22,
+        .provider = "p2",
+        .model = "m2",
+        .usage = .{ .prompt_tokens = 2, .completion_tokens = 3, .total_tokens = 5 },
+        .success = true,
+    });
+
+    const file = try std.fs.openFileAbsolute(ledger_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(testing.allocator, 64 * 1024);
+    defer testing.allocator.free(content);
+
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, content, "\n"));
+    try testing.expect(std.mem.indexOf(u8, content, "\"ts\":22") != null);
+    try testing.expect(std.mem.indexOf(u8, content, "\"total_tokens\":5") != null);
+    try testing.expect(std.mem.indexOf(u8, content, "\"success\":true") != null);
+}
+
+test "usage ledger records failed response flag" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(base);
+    const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
+    defer testing.allocator.free(config_path);
+    const ledger_path = try std.fmt.allocPrint(testing.allocator, "{s}/{s}", .{ base, TOKEN_USAGE_LEDGER_FILENAME });
+    defer testing.allocator.free(ledger_path);
+
+    var cfg = testConfig();
+    cfg.workspace_dir = base;
+    cfg.config_path = config_path;
+    cfg.diagnostics.token_usage_ledger_enabled = true;
+    cfg.diagnostics.token_usage_ledger_window_hours = 0;
+    cfg.diagnostics.token_usage_ledger_max_lines = 0;
+    cfg.diagnostics.token_usage_ledger_max_bytes = 0;
+
+    var mock = MockProvider{ .response = "ok" };
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    sm.appendUsageRecord(.{
+        .ts = 31,
+        .provider = "p1",
+        .model = "m1",
+        .usage = .{ .prompt_tokens = 0, .completion_tokens = 0, .total_tokens = 0 },
+        .success = false,
+    });
+
+    const file = try std.fs.openFileAbsolute(ledger_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(testing.allocator, 64 * 1024);
+    defer testing.allocator.free(content);
+
+    try testing.expect(std.mem.indexOf(u8, content, "\"ts\":31") != null);
+    try testing.expect(std.mem.indexOf(u8, content, "\"success\":false") != null);
 }
 
 test "getOrCreate creates new session for unknown key" {
@@ -454,8 +1136,50 @@ test "session has correct initial state" {
 
     const s = try sm.getOrCreate("test:init");
     try testing.expectEqual(@as(u64, 0), s.turn_count);
+    try testing.expect(!s.turn_running.load(.acquire));
     try testing.expect(!s.agent.has_system_prompt);
     try testing.expectEqual(@as(usize, 0), s.agent.historyLen());
+}
+
+test "requestTurnInterrupt signals only active sessions" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("interrupt:1");
+    var none = sm.requestTurnInterrupt("interrupt:1");
+    defer none.deinit(testing.allocator);
+    try testing.expect(!none.requested);
+
+    session.turn_running.store(true, .release);
+    defer session.turn_running.store(false, .release);
+    var yes = sm.requestTurnInterrupt("interrupt:1");
+    defer yes.deinit(testing.allocator);
+    try testing.expect(yes.requested);
+    try testing.expect(session.agent.interrupt_requested.load(.acquire));
+}
+
+test "requestTurnInterrupt returns active tool snapshot when available" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("interrupt:tool");
+    session.turn_running.store(true, .release);
+    defer session.turn_running.store(false, .release);
+
+    session.agent.tool_state_mu.lock();
+    if (session.agent.active_tool_name) |old| testing.allocator.free(old);
+    session.agent.active_tool_name = try testing.allocator.dupe(u8, "shell");
+    session.agent.tool_state_mu.unlock();
+
+    var res = sm.requestTurnInterrupt("interrupt:tool");
+    defer res.deinit(testing.allocator);
+    try testing.expect(res.requested);
+    try testing.expect(res.active_tool != null);
+    try testing.expectEqualStrings("shell", res.active_tool.?);
 }
 
 // ---------------------------------------------------------------------------
@@ -471,6 +1195,40 @@ test "processMessage returns mock response" {
     const resp = try sm.processMessage("user:1", "hi", null);
     defer testing.allocator.free(resp);
     try testing.expectEqualStrings("Hello from mock", resp);
+}
+
+test "processMessageStreaming forwards provider deltas" {
+    var mock = MockStreamingProvider{ .response = "streaming reply" };
+    const cfg = testConfig();
+    var noop = observability.NoopObserver{};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        mock.provider(),
+        &.{},
+        null,
+        noop.observer(),
+        null,
+        null,
+    );
+    defer sm.deinit();
+
+    var collector = DeltaCollector{ .allocator = testing.allocator };
+    defer collector.deinit();
+
+    const resp = try sm.processMessageStreaming(
+        "stream:1",
+        "hi",
+        null,
+        .{
+            .callback = DeltaCollector.onEvent,
+            .ctx = @ptrCast(&collector),
+        },
+    );
+    defer testing.allocator.free(resp);
+
+    try testing.expectEqualStrings("streaming reply", resp);
+    try testing.expectEqualStrings("streaming reply", collector.data.items);
 }
 
 test "processMessage refreshes system prompt when conversation context is cleared" {
@@ -561,6 +1319,326 @@ test "processMessage preserves session across calls" {
 
     // History should have grown (user msg + assistant response added)
     try testing.expect(session.agent.historyLen() > history_before);
+}
+
+test "restored session reconstructs token count from persisted assistant replies" {
+    var mock = MockProvider{ .response = "assistant reply" };
+    const cfg = testConfig();
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+
+    var noop = observability.NoopObserver{};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        mock.provider(),
+        &.{},
+        sqlite_mem.memory(),
+        noop.observer(),
+        sqlite_mem.sessionStore(),
+        null,
+    );
+    defer sm.deinit();
+
+    const session_key = "telegram:main:chat-1";
+    const reply = try sm.processMessage(session_key, "hello", .{
+        .channel = "telegram",
+        .is_group = false,
+        .group_id = null,
+    });
+    defer testing.allocator.free(reply);
+
+    const expected_tokens = agent_mod.estimate_text_tokens("assistant reply");
+    const first_session = try sm.getOrCreate(session_key);
+    try testing.expectEqual(@as(u64, expected_tokens), first_session.agent.total_tokens);
+
+    first_session.last_active = 0;
+    try testing.expectEqual(@as(usize, 1), sm.evictIdle(1));
+
+    const restored_session = try sm.getOrCreate(session_key);
+    try testing.expectEqual(@as(u64, expected_tokens), restored_session.agent.total_tokens);
+
+    const status = try restored_session.agent.handleSlashCommand("/status");
+    defer {
+        if (status) |resp| testing.allocator.free(resp);
+    }
+    try testing.expect(status != null);
+
+    var expected_line_buf: [64]u8 = undefined;
+    const expected_line = try std.fmt.bufPrint(&expected_line_buf, "Tokens used: {d}", .{expected_tokens});
+    try testing.expect(std.mem.indexOf(u8, status.?, expected_line) != null);
+}
+
+test "restored session token reconstruction ignores usage footer decorations" {
+    var mock = MockProvider{ .response = "assistant reply" };
+    const cfg = testConfig();
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+
+    var noop = observability.NoopObserver{};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        mock.provider(),
+        &.{},
+        sqlite_mem.memory(),
+        noop.observer(),
+        sqlite_mem.sessionStore(),
+        null,
+    );
+    defer sm.deinit();
+
+    const session_key = "telegram:main:chat-usage";
+    const session = try sm.getOrCreate(session_key);
+    session.agent.usage_mode = .tokens;
+
+    const reply = try sm.processMessage(session_key, "hello", .{
+        .channel = "telegram",
+        .is_group = false,
+        .group_id = null,
+    });
+    defer testing.allocator.free(reply);
+    try testing.expect(std.mem.indexOf(u8, reply, "[usage] total_tokens=") != null);
+
+    const entries = try sqlite_mem.loadMessages(testing.allocator, session_key);
+    defer memory_mod.freeMessages(testing.allocator, entries);
+    try testing.expectEqual(@as(usize, 2), entries.len);
+    try testing.expectEqualStrings("assistant", entries[1].role);
+    try testing.expectEqualStrings("assistant reply", entries[1].content);
+
+    const expected_tokens = agent_mod.estimate_text_tokens("assistant reply");
+    session.last_active = 0;
+    try testing.expectEqual(@as(usize, 1), sm.evictIdle(1));
+
+    const restored_session = try sm.getOrCreate(session_key);
+    try testing.expectEqual(@as(u64, expected_tokens), restored_session.agent.total_tokens);
+}
+
+test "persisted session falls back to rendered response when degraded turn has no final assistant history entry" {
+    var provider = SummaryFailureProvider{};
+    var probe_tool = ProbeTool{};
+    const tools = [_]Tool{probe_tool.tool()};
+    const cfg = testConfig();
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+
+    var noop = observability.NoopObserver{};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        provider.provider(),
+        &tools,
+        sqlite_mem.memory(),
+        noop.observer(),
+        sqlite_mem.sessionStore(),
+        null,
+    );
+    defer sm.deinit();
+
+    const session_key = "telegram:main:chat-fallback";
+    const session = try sm.getOrCreate(session_key);
+    session.agent.max_tool_iterations = 1;
+
+    const response = try sm.processMessage(session_key, "hello", .{
+        .channel = "telegram",
+        .is_group = false,
+        .group_id = null,
+    });
+    defer testing.allocator.free(response);
+
+    try testing.expect(std.mem.indexOf(u8, response, "Could not produce a summary") != null);
+    try testing.expect(session.agent.history.items.len > 0);
+    try testing.expect(session.agent.history.items[session.agent.history.items.len - 1].role != .assistant);
+
+    const entries = try sqlite_mem.loadMessages(testing.allocator, session_key);
+    defer memory_mod.freeMessages(testing.allocator, entries);
+    try testing.expectEqual(@as(usize, 2), entries.len);
+    try testing.expectEqualStrings("assistant", entries[1].role);
+    try testing.expectEqualStrings(response, entries[1].content);
+    try testing.expect(!std.mem.eql(u8, entries[1].content, "running"));
+
+    const live_total_tokens = session.agent.total_tokens;
+    try testing.expect(live_total_tokens > 0);
+    session.last_active = 0;
+    try testing.expectEqual(@as(usize, 1), sm.evictIdle(1));
+
+    const restored_session = try sm.getOrCreate(session_key);
+    try testing.expectEqual(live_total_tokens, restored_session.agent.total_tokens);
+}
+
+test "restored session token reconstruction stays aligned across response cache hits" {
+    var mock = MockProvider{ .response = "assistant reply" };
+    const cfg = testConfig();
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+
+    var response_cache = try memory_mod.ResponseCache.init(":memory:", 60, 1000);
+    defer response_cache.deinit();
+
+    var noop = observability.NoopObserver{};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        mock.provider(),
+        &.{},
+        sqlite_mem.memory(),
+        noop.observer(),
+        sqlite_mem.sessionStore(),
+        &response_cache,
+    );
+    defer sm.deinit();
+
+    const session_key = "telegram:main:chat-cache";
+    const first = try sm.processMessage(session_key, "hello", .{
+        .channel = "telegram",
+        .is_group = false,
+        .group_id = null,
+    });
+    defer testing.allocator.free(first);
+
+    const second = try sm.processMessage(session_key, "hello", .{
+        .channel = "telegram",
+        .is_group = false,
+        .group_id = null,
+    });
+    defer testing.allocator.free(second);
+    try testing.expectEqualStrings(first, second);
+
+    const expected_tokens = agent_mod.estimate_text_tokens("assistant reply");
+    const live_session = try sm.getOrCreate(session_key);
+    try testing.expectEqual(@as(u64, expected_tokens), live_session.agent.total_tokens);
+    try testing.expectEqual(@as(u32, 0), live_session.agent.last_turn_usage.total_tokens);
+
+    live_session.last_active = 0;
+    try testing.expectEqual(@as(usize, 1), sm.evictIdle(1));
+
+    const restored_session = try sm.getOrCreate(session_key);
+    try testing.expectEqual(@as(u64, expected_tokens), restored_session.agent.total_tokens);
+}
+
+fn expectResetTurnPersistsFreshSession(command: []const u8) !void {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+
+    var noop = observability.NoopObserver{};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        mock.provider(),
+        &.{},
+        sqlite_mem.memory(),
+        noop.observer(),
+        sqlite_mem.sessionStore(),
+        null,
+    );
+    defer sm.deinit();
+
+    const session_key = "telegram:main:chat-reset-usage";
+    const store = sqlite_mem.sessionStore();
+
+    const first = try sm.processMessage(session_key, "before reset", .{
+        .channel = "telegram",
+        .is_group = false,
+        .group_id = null,
+    });
+    defer testing.allocator.free(first);
+
+    const token_cost = @as(u64, agent_mod.estimate_text_tokens("ok"));
+    const session = try sm.getOrCreate(session_key);
+    try testing.expectEqual(token_cost, session.agent.total_tokens);
+
+    const reset_reply = try sm.processMessage(session_key, command, .{
+        .channel = "telegram",
+        .is_group = false,
+        .group_id = null,
+    });
+    defer testing.allocator.free(reset_reply);
+    try testing.expectEqual(token_cost, session.agent.total_tokens);
+
+    const entries = try store.loadMessages(testing.allocator, session_key);
+    defer memory_mod.freeMessages(testing.allocator, entries);
+    try testing.expectEqual(@as(usize, 2), entries.len);
+    try testing.expectEqualStrings("user", entries[0].role);
+    try testing.expectEqualStrings(agent_mod.commands.bareSessionResetPrompt(command).?, entries[0].content);
+    try testing.expectEqualStrings("assistant", entries[1].role);
+    try testing.expectEqualStrings("ok", entries[1].content);
+    try testing.expectEqual(@as(?u64, token_cost), try store.loadUsage(session_key));
+
+    session.last_active = 0;
+    try testing.expectEqual(@as(usize, 1), sm.evictIdle(1));
+
+    const restored = try sm.getOrCreate(session_key);
+    try testing.expectEqual(token_cost, restored.agent.total_tokens);
+    try testing.expectEqual(@as(usize, 2), restored.agent.historyLen());
+    try testing.expectEqualStrings(entries[0].content, restored.agent.history.items[0].content);
+    try testing.expectEqualStrings("ok", restored.agent.history.items[1].content);
+}
+
+test "processMessage bare /new persists fresh-session turn across reload" {
+    try expectResetTurnPersistsFreshSession("/new");
+}
+
+test "processMessage bare /reset with mention persists fresh-session turn across reload" {
+    try expectResetTurnPersistsFreshSession("/reset@nullclaw_bot:");
+}
+
+test "processMessage slash-prefixed prompt that is not a local command persists across reload" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+
+    var noop = observability.NoopObserver{};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        mock.provider(),
+        &.{},
+        sqlite_mem.memory(),
+        noop.observer(),
+        sqlite_mem.sessionStore(),
+        null,
+    );
+    defer sm.deinit();
+
+    const session_key = "telegram:main:slash-path";
+    const slash_prompt = "/etc/hosts";
+    const response = try sm.processMessage(session_key, slash_prompt, .{
+        .channel = "telegram",
+        .is_group = false,
+        .group_id = null,
+    });
+    defer testing.allocator.free(response);
+
+    const expected_tokens = @as(u64, agent_mod.estimate_text_tokens("ok"));
+    const store = sqlite_mem.sessionStore();
+    const entries = try store.loadMessages(testing.allocator, session_key);
+    defer memory_mod.freeMessages(testing.allocator, entries);
+    try testing.expectEqual(@as(usize, 2), entries.len);
+    try testing.expectEqualStrings("user", entries[0].role);
+    try testing.expectEqualStrings(slash_prompt, entries[0].content);
+    try testing.expectEqualStrings("assistant", entries[1].role);
+    try testing.expectEqualStrings("ok", entries[1].content);
+    try testing.expectEqual(@as(?u64, expected_tokens), try store.loadUsage(session_key));
+
+    const live_session = try sm.getOrCreate(session_key);
+    try testing.expectEqual(expected_tokens, live_session.agent.total_tokens);
+    live_session.last_active = 0;
+    try testing.expectEqual(@as(usize, 1), sm.evictIdle(1));
+
+    const restored = try sm.getOrCreate(session_key);
+    try testing.expectEqual(expected_tokens, restored.agent.total_tokens);
+    try testing.expectEqual(@as(usize, 2), restored.agent.historyLen());
+    try testing.expectEqualStrings(slash_prompt, restored.agent.history.items[0].content);
+    try testing.expectEqualStrings("ok", restored.agent.history.items[1].content);
 }
 
 test "processMessage different keys — independent sessions" {
@@ -826,6 +1904,22 @@ test "evictIdle with no sessions returns 0" {
     try testing.expectEqual(@as(usize, 0), sm.evictIdle(60));
 }
 
+test "evictIdle preserves sessions with active turns" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("busy:1");
+    session.last_active = std.time.timestamp() - 1000;
+    session.turn_running.store(true, .release);
+    defer session.turn_running.store(false, .release);
+
+    const evicted = sm.evictIdle(5);
+    try testing.expectEqual(@as(usize, 0), evicted);
+    try testing.expect(sm.sessions.contains("busy:1"));
+}
+
 // ---------------------------------------------------------------------------
 // 4. Thread safety tests
 // ---------------------------------------------------------------------------
@@ -841,7 +1935,7 @@ test "concurrent getOrCreate same key — single Session created" {
     var handles: [num_threads]std.Thread = undefined;
 
     for (0..num_threads) |t| {
-        handles[t] = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, struct {
+        handles[t] = try std.Thread.spawn(.{ .stack_size = thread_stacks.COORDINATION_STACK_SIZE }, struct {
             fn run(mgr: *SessionManager, out: **Session) void {
                 out.* = mgr.getOrCreate("shared:key") catch unreachable;
             }
@@ -871,7 +1965,7 @@ test "concurrent getOrCreate different keys — separate Sessions" {
 
     for (0..num_threads) |t| {
         keys[t] = std.fmt.bufPrint(&key_bufs[t], "key:{d}", .{t}) catch "?";
-        handles[t] = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, struct {
+        handles[t] = try std.Thread.spawn(.{ .stack_size = thread_stacks.COORDINATION_STACK_SIZE }, struct {
             fn run(mgr: *SessionManager, key: []const u8, out: **Session) void {
                 out.* = mgr.getOrCreate(key) catch unreachable;
             }
@@ -902,7 +1996,9 @@ test "concurrent processMessage different keys — no crash" {
 
     for (0..num_threads) |t| {
         keys[t] = std.fmt.bufPrint(&key_bufs[t], "conc:{d}", .{t}) catch "?";
-        handles[t] = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, struct {
+        // Match the runtime worker stack budget used for threaded session
+        // turns so this test exercises concurrency rather than a tiny stack.
+        handles[t] = try std.Thread.spawn(.{ .stack_size = thread_stacks.SESSION_TURN_STACK_SIZE }, struct {
             fn run(mgr: *SessionManager, key: []const u8, alloc: Allocator) void {
                 for (0..3) |_| {
                     const resp = mgr.processMessage(key, "hello", null) catch return;
@@ -937,7 +2033,9 @@ test "concurrent processMessage with sqlite memory does not panic" {
 
     for (0..num_threads) |t| {
         keys[t] = std.fmt.bufPrint(&key_bufs[t], "sqlite-conc:{d}", .{t}) catch "?";
-        handles[t] = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, struct {
+        // This path still executes a full session turn, so keep it aligned
+        // with the runtime stack budget for threaded message processing.
+        handles[t] = try std.Thread.spawn(.{ .stack_size = thread_stacks.SESSION_TURN_STACK_SIZE }, struct {
             fn run(mgr: *SessionManager, key: []const u8, alloc: Allocator, failed_flag: *std.atomic.Value(bool)) void {
                 for (0..5) |_| {
                     const resp = mgr.processMessage(key, "hello sqlite", null) catch {
@@ -983,4 +2081,52 @@ test "session initial state includes last_consolidated" {
     try testing.expectEqual(@as(u64, 0), s.turn_count);
     try testing.expect(s.created_at > 0);
     try testing.expect(s.last_active > 0);
+}
+
+// ---------------------------------------------------------------------------
+// 6. reloadSkillsAll tests
+// ---------------------------------------------------------------------------
+
+test "reloadSkillsAll with no sessions returns zero counts" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const result = sm.reloadSkillsAll();
+    try testing.expectEqual(@as(usize, 0), result.sessions_seen);
+    try testing.expectEqual(@as(usize, 0), result.sessions_reloaded);
+    try testing.expectEqual(@as(usize, 0), result.failures);
+}
+
+test "reloadSkillsAll invalidates system prompt on all sessions" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const s1 = try sm.getOrCreate("reload:a");
+    const s2 = try sm.getOrCreate("reload:b");
+    s1.agent.has_system_prompt = true;
+    s2.agent.has_system_prompt = true;
+
+    const result = sm.reloadSkillsAll();
+    try testing.expectEqual(@as(usize, 2), result.sessions_seen);
+    try testing.expectEqual(@as(usize, 2), result.sessions_reloaded);
+    try testing.expect(!s1.agent.has_system_prompt);
+    try testing.expect(!s2.agent.has_system_prompt);
+}
+
+test "reloadSkillsAll does not affect session count" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    _ = try sm.getOrCreate("reload:c");
+    _ = try sm.getOrCreate("reload:d");
+    try testing.expectEqual(@as(usize, 2), sm.sessionCount());
+
+    _ = sm.reloadSkillsAll();
+    try testing.expectEqual(@as(usize, 2), sm.sessionCount());
 }

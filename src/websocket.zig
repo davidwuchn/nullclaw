@@ -58,6 +58,11 @@ pub const WsClient = struct {
     tls: *TlsState,
     write_mu: std.Thread.Mutex,
 
+    pub const Message = struct {
+        opcode: Opcode,
+        payload: []u8,
+    };
+
     /// Connect to wss://host:port/path.
     /// `extra_headers`: additional HTTP request headers (without trailing CRLF).
     pub fn connect(
@@ -95,16 +100,29 @@ pub const WsClient = struct {
         tls_state.stream_reader = stream.reader(read_buf);
         tls_state.stream_writer = stream.writer(write_buf);
 
+        var ca_bundle = std.crypto.Certificate.Bundle{};
+        var has_ca_bundle = false;
+        if (ca_bundle.rescan(allocator)) |_| {
+            has_ca_bundle = true;
+        } else |err| {
+            // Preserve current behavior on platforms/environments where system CAs
+            // are unavailable, but prefer verified TLS whenever possible.
+            log.warn("WS TLS: system CA bundle unavailable, fallback to no verification: {}", .{err});
+        }
+        defer if (has_ca_bundle) ca_bundle.deinit(allocator);
+
+        const tls_options: std.crypto.tls.Client.Options = .{
+            .host = .{ .explicit = host },
+            .ca = if (has_ca_bundle) .{ .bundle = ca_bundle } else .no_verification,
+            .read_buffer = tls_read_buf,
+            .write_buffer = tls_write_buf,
+            .allow_truncation_attacks = true,
+        };
+
         tls_state.tls_client = std.crypto.tls.Client.init(
             tls_state.stream_reader.interface(),
             &tls_state.stream_writer.interface,
-            .{
-                .host = .{ .explicit = host },
-                .ca = .no_verification,
-                .read_buffer = tls_read_buf,
-                .write_buffer = tls_write_buf,
-                .allow_truncation_attacks = true,
-            },
+            tls_options,
         ) catch return error.TlsInitializationFailed;
 
         // HTTP Upgrade handshake
@@ -132,15 +150,34 @@ pub const WsClient = struct {
         try tls_state.tls_client.writer.flush();
         try tls_state.stream_writer.interface.flush();
 
-        // Read HTTP 101 response
+        // Read HTTP 101 response headers byte-by-byte to avoid consuming
+        // any WebSocket frame data that follows the headers in the same TLS
+        // record. Servers like Mattermost (behind Caddy) may send the first
+        // WS frame immediately after the 101 response.
         var resp_buf: [4096]u8 = undefined;
         var resp_len: usize = 0;
+        var headers_complete = false;
         while (resp_len < resp_buf.len) {
-            var rd: [1][]u8 = .{resp_buf[resp_len..]};
-            const n = tls_state.tls_client.reader.readVec(&rd) catch
+            // Use take(1) which always fills the internal buffer first,
+            // then returns a pointer into it — consuming exactly one byte.
+            const byte_ptr = tls_state.tls_client.reader.take(1) catch
                 return error.WsHandshakeFailed;
-            resp_len += n;
-            if (std.mem.indexOf(u8, resp_buf[0..resp_len], "\r\n\r\n") != null) break;
+            resp_buf[resp_len] = byte_ptr[0];
+            resp_len += 1;
+            // Check for end-of-headers marker
+            if (resp_len >= 4 and
+                resp_buf[resp_len - 4] == '\r' and
+                resp_buf[resp_len - 3] == '\n' and
+                resp_buf[resp_len - 2] == '\r' and
+                resp_buf[resp_len - 1] == '\n')
+            {
+                headers_complete = true;
+                break;
+            }
+        }
+        if (!headers_complete) {
+            log.err("WS handshake: header block exceeded {d} bytes", .{resp_buf.len});
+            return error.WsHandshakeFailed;
         }
         const resp = resp_buf[0..resp_len];
         if (!std.mem.startsWith(u8, resp, "HTTP/1.1 101")) {
@@ -238,8 +275,7 @@ pub const WsClient = struct {
                         log.warn("WS auto-pong failed: {}", .{err});
                     };
                 }
-                if (plen > 0) self.allocator.free(payload);
-                return Frame{ .opcode = .ping, .fin = true, .payload = @constCast(&[_]u8{}) };
+                return Frame{ .opcode = .ping, .fin = true, .payload = payload };
             },
             .close => {
                 if (plen > 0) self.allocator.free(payload);
@@ -315,6 +351,13 @@ pub const WsClient = struct {
         try self.writeFrameLocked(.text, text);
     }
 
+    /// Send a binary frame (acquires write_mu).
+    pub fn writeBinary(self: *WsClient, payload: []const u8) !void {
+        self.write_mu.lock();
+        defer self.write_mu.unlock();
+        try self.writeFrameLocked(.binary, payload);
+    }
+
     /// Send a close frame (acquires write_mu, ignores errors).
     pub fn writeClose(self: *WsClient) void {
         self.write_mu.lock();
@@ -353,6 +396,67 @@ pub const WsClient = struct {
                 },
                 .ping => {}, // auto-handled inside readFrame
                 .binary => {}, // Discord uses text only
+                else => {},
+            }
+        }
+    }
+
+    /// Read a complete text or binary message, aggregating continuation frames.
+    /// Returns heap-allocated payload (caller frees) or null on graceful close.
+    pub fn readMessage(self: *WsClient) !?Message {
+        var message: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer message.deinit(self.allocator);
+        var message_opcode: ?Opcode = null;
+
+        while (true) {
+            const maybe_frame = try self.readFrame();
+            if (maybe_frame == null) {
+                message.deinit(self.allocator);
+                return null;
+            }
+            const frame = maybe_frame.?;
+            defer if (frame.payload.len > 0) self.allocator.free(frame.payload);
+
+            switch (frame.opcode) {
+                .text, .binary => {
+                    if (message_opcode == null) {
+                        message_opcode = frame.opcode;
+                    } else if (message_opcode.? != frame.opcode) {
+                        message.deinit(self.allocator);
+                        return error.WsProtocolError;
+                    }
+                    try message.appendSlice(self.allocator, frame.payload);
+                    if (message.items.len > 4 * 1024 * 1024) {
+                        message.deinit(self.allocator);
+                        return error.MessageTooLarge;
+                    }
+                    if (frame.fin) {
+                        const payload = try message.toOwnedSlice(self.allocator);
+                        return .{
+                            .opcode = message_opcode.?,
+                            .payload = payload,
+                        };
+                    }
+                },
+                .continuation => {
+                    if (message_opcode == null) {
+                        message.deinit(self.allocator);
+                        return error.WsProtocolError;
+                    }
+                    try message.appendSlice(self.allocator, frame.payload);
+                    if (message.items.len > 4 * 1024 * 1024) {
+                        message.deinit(self.allocator);
+                        return error.MessageTooLarge;
+                    }
+                    if (frame.fin) {
+                        const payload = try message.toOwnedSlice(self.allocator);
+                        return .{
+                            .opcode = message_opcode.?,
+                            .payload = payload,
+                        };
+                    }
+                },
+                .ping => {}, // auto-handled inside readFrame
                 else => {},
             }
         }

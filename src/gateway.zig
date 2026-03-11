@@ -6,7 +6,7 @@
 //!   - Body size limits (64KB max)
 //!   - Request timeouts (30s)
 //!   - Bearer token authentication (PairingGuard)
-//!   - Endpoints: /health, /ready, /pair, /webhook, /whatsapp, /telegram, /line, /lark, /slack/events
+//!   - Endpoints: /health, /ready, /pair, /webhook, /whatsapp, /telegram, /line, /lark, /qq, /slack/events
 //!
 //! Uses std.http.Server (built-in, no external deps).
 
@@ -17,9 +17,12 @@ const Config = @import("config.zig").Config;
 const config_types = @import("config_types.zig");
 const session_mod = @import("session.zig");
 const providers = @import("providers/root.zig");
+const http_util = @import("http_util.zig");
 const tools_mod = @import("tools/root.zig");
 const memory_mod = @import("memory/root.zig");
+const bootstrap_mod = @import("bootstrap/root.zig");
 const subagent_mod = @import("subagent.zig");
+const subagent_runner = @import("subagent_runner.zig");
 const observability = @import("observability.zig");
 const agent_routing = @import("agent_routing.zig");
 const security = @import("security/policy.zig");
@@ -29,6 +32,8 @@ const bus_mod = @import("bus.zig");
 
 /// Maximum request body size (64KB) — prevents memory exhaustion.
 pub const MAX_BODY_SIZE: usize = 65_536;
+const MAX_HEADER_SIZE: usize = 8_192;
+const MAX_HTTP_REQUEST_SIZE: usize = MAX_HEADER_SIZE + MAX_BODY_SIZE;
 
 /// Request timeout (30s) — prevents slow-loris attacks.
 pub const REQUEST_TIMEOUT_SECS: u64 = 30;
@@ -38,6 +43,142 @@ pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 
 /// How often the rate limiter sweeps stale IP entries (5 min).
 const RATE_LIMITER_SWEEP_INTERVAL_SECS: u64 = 300;
+const MAX_OBSERVED_TOOL_EVENTS: usize = 512;
+
+const GatewayObservedToolEventKind = enum { start, result };
+
+const GatewayObservedToolEvent = struct {
+    seq: u64,
+    kind: GatewayObservedToolEventKind,
+    tool: []u8,
+    success: bool = false,
+};
+
+const GatewayTurnToolEvent = struct {
+    kind: GatewayObservedToolEventKind,
+    tool: []const u8,
+    success: bool = false,
+};
+
+/// Thread-safe observer that records tool call events within the gateway.
+/// Used to enrich webhook responses with tool execution summaries.
+const GatewayThreadObserver = struct {
+    allocator: std.mem.Allocator,
+    mutex: std.Thread.Mutex = .{},
+    next_seq: u64 = 0,
+    events: std.ArrayListUnmanaged(GatewayObservedToolEvent) = .empty,
+
+    const vtable = observability.Observer.VTable{
+        .record_event = recordEvent,
+        .record_metric = recordMetric,
+        .flush = flush,
+        .name = name,
+    };
+
+    pub fn init(allocator: std.mem.Allocator) GatewayThreadObserver {
+        return .{ .allocator = allocator };
+    }
+
+    pub fn deinit(self: *GatewayThreadObserver) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.events.items) |event| {
+            self.allocator.free(event.tool);
+        }
+        self.events.deinit(self.allocator);
+    }
+
+    pub fn observer(self: *GatewayThreadObserver) observability.Observer {
+        return .{
+            .ptr = @ptrCast(self),
+            .vtable = &vtable,
+        };
+    }
+
+    pub fn currentSeq(self: *GatewayThreadObserver) u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.next_seq;
+    }
+
+    pub fn collectSince(
+        self: *GatewayThreadObserver,
+        allocator: std.mem.Allocator,
+        seq: u64,
+    ) ![]GatewayTurnToolEvent {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var count: usize = 0;
+        for (self.events.items) |event| {
+            if (event.seq > seq) count += 1;
+        }
+
+        const out = try allocator.alloc(GatewayTurnToolEvent, count);
+        errdefer allocator.free(out);
+        var out_idx: usize = 0;
+        errdefer {
+            for (out[0..out_idx]) |event| {
+                allocator.free(event.tool);
+            }
+        }
+        for (self.events.items) |event| {
+            if (event.seq <= seq) continue;
+
+            out[out_idx] = .{
+                .kind = event.kind,
+                .tool = try allocator.dupe(u8, event.tool),
+                .success = event.success,
+            };
+            out_idx += 1;
+        }
+
+        return out;
+    }
+
+    fn recordEvent(ptr: *anyopaque, event: *const observability.ObserverEvent) void {
+        const self: *GatewayThreadObserver = @ptrCast(@alignCast(ptr));
+        switch (event.*) {
+            .tool_call_start => |e| self.appendEvent(.start, e.tool, false),
+            .tool_call => |e| self.appendEvent(.result, e.tool, e.success),
+            else => {},
+        }
+    }
+
+    fn recordMetric(_: *anyopaque, _: *const observability.ObserverMetric) void {}
+    fn flush(_: *anyopaque) void {}
+    fn name(_: *anyopaque) []const u8 {
+        return "gateway_thread";
+    }
+
+    fn appendEvent(
+        self: *GatewayThreadObserver,
+        kind: GatewayObservedToolEventKind,
+        tool: []const u8,
+        success: bool,
+    ) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const owned_tool = self.allocator.dupe(u8, tool) catch return;
+
+        self.next_seq += 1;
+        self.events.append(self.allocator, .{
+            .seq = self.next_seq,
+            .kind = kind,
+            .tool = owned_tool,
+            .success = success,
+        }) catch {
+            self.allocator.free(owned_tool);
+            return;
+        };
+
+        while (self.events.items.len > MAX_OBSERVED_TOOL_EVENTS) {
+            const oldest = self.events.orderedRemove(0);
+            self.allocator.free(oldest.tool);
+        }
+    }
+};
 
 // ── Rate Limiter ─────────────────────────────────────────────────
 
@@ -231,6 +372,7 @@ pub const GatewayState = struct {
     lark_app_secret: []const u8 = "",
     lark_account_id: []const u8 = "default",
     lark_allow_from: []const []const u8 = &.{},
+    qq_channels: std.ArrayListUnmanaged(channels.qq.QQChannel) = .empty,
     pairing_guard: ?PairingGuard,
     event_bus: ?*bus_mod.Bus = null,
 
@@ -252,6 +394,10 @@ pub const GatewayState = struct {
     }
 
     pub fn deinit(self: *GatewayState) void {
+        for (self.qq_channels.items) |*qq_ch| {
+            qq_ch.channel().stop();
+        }
+        self.qq_channels.deinit(self.allocator);
         self.rate_limiter.deinit(self.allocator);
         self.idempotency.deinit(self.allocator);
         if (self.pairing_guard) |*guard| {
@@ -567,6 +713,55 @@ pub fn jsonWrapResponse(allocator: std.mem.Allocator, response: []const u8) ![]u
     return buf.toOwnedSlice(allocator);
 }
 
+/// Build a JSON array summarizing tool events from a turn.
+fn buildThreadEventsJson(
+    allocator: std.mem.Allocator,
+    tool_events: []const GatewayTurnToolEvent,
+) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+
+    try w.writeByte('[');
+
+    var tool_results: usize = 0;
+    var failed_results: usize = 0;
+    for (tool_events) |event| {
+        if (event.kind != .result) continue;
+        tool_results += 1;
+        if (!event.success) failed_results += 1;
+    }
+
+    if (tool_results > 0) {
+        try w.writeAll("{\"type\":\"tool_summary\",\"total\":");
+        try w.print("{d}", .{tool_results});
+        try w.writeAll(",\"failed\":");
+        try w.print("{d}", .{failed_results});
+        try w.writeByte('}');
+    }
+
+    try w.writeByte(']');
+    return buf.toOwnedSlice(allocator);
+}
+
+/// Build a webhook success response with tool events:
+/// `{"status":"ok","response":"<escaped>","thread_events":[...]}`.
+fn buildWebhookSuccessResponse(
+    allocator: std.mem.Allocator,
+    response_text: []const u8,
+    thread_events_json: []const u8,
+) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeAll("{\"status\":\"ok\",\"response\":\"");
+    try jsonEscapeInto(w, response_text);
+    try w.writeAll("\",\"thread_events\":");
+    try w.writeAll(thread_events_json);
+    try w.writeByte('}');
+    return buf.toOwnedSlice(allocator);
+}
+
 /// Build a JSON challenge response: `{"challenge":"<escaped>"}`.
 /// Returns an owned slice. Caller must free.
 fn jsonWrapChallenge(allocator: std.mem.Allocator, challenge: []const u8) ![]u8 {
@@ -768,6 +963,65 @@ fn selectLarkConfig(
     }
 
     return &cfg.channels.lark[0];
+}
+
+fn findQqConfigByAccountId(cfg: *const Config, account_id: []const u8) ?*const config_types.QQConfig {
+    for (cfg.channels.qq) |*qq_cfg| {
+        if (std.ascii.eqlIgnoreCase(qq_cfg.account_id, account_id)) return qq_cfg;
+    }
+    return null;
+}
+
+fn findQqConfigByAppId(cfg: *const Config, app_id: []const u8) ?*const config_types.QQConfig {
+    for (cfg.channels.qq) |*qq_cfg| {
+        if (std.mem.eql(u8, qq_cfg.app_id, app_id)) return qq_cfg;
+    }
+    return null;
+}
+
+fn selectQqConfig(
+    cfg_opt: ?*const Config,
+    target: []const u8,
+    app_id_header: ?[]const u8,
+) ?*const config_types.QQConfig {
+    if (!build_options.enable_channel_qq) return null;
+    const cfg = cfg_opt orelse return null;
+    if (cfg.channels.qq.len == 0) return null;
+
+    if (parseQueryParam(target, "account_id")) |account_id| {
+        if (findQqConfigByAccountId(cfg, account_id)) |qq_cfg| {
+            return qq_cfg;
+        }
+    }
+    if (parseQueryParam(target, "account")) |account_id| {
+        if (findQqConfigByAccountId(cfg, account_id)) |qq_cfg| {
+            return qq_cfg;
+        }
+    }
+
+    if (app_id_header) |raw_app_id| {
+        const app_id = std.mem.trim(u8, raw_app_id, " \t\r\n");
+        if (app_id.len > 0) {
+            if (findQqConfigByAppId(cfg, app_id)) |qq_cfg| {
+                return qq_cfg;
+            }
+        }
+    }
+
+    if (cfg.channels.qqPrimary()) |primary| {
+        if (findQqConfigByAccountId(cfg, primary.account_id)) |qq_cfg| {
+            return qq_cfg;
+        }
+    }
+
+    return &cfg.channels.qq[0];
+}
+
+fn findQqRuntimeChannel(state: *GatewayState, account_id: []const u8) ?*channels.qq.QQChannel {
+    for (state.qq_channels.items) |*qq_ch| {
+        if (std.ascii.eqlIgnoreCase(qq_ch.config.account_id, account_id)) return qq_ch;
+    }
+    return null;
 }
 
 fn webhookBasePath(target: []const u8) []const u8 {
@@ -1218,6 +1472,91 @@ pub fn extractBody(raw: []const u8) ?[]const u8 {
     return body;
 }
 
+fn headerEndOffset(raw: []const u8) ?usize {
+    const separator = "\r\n\r\n";
+    const pos = std.mem.indexOf(u8, raw, separator) orelse return null;
+    return pos + separator.len;
+}
+
+fn expectedHttpRequestSize(raw: []const u8) !?usize {
+    const header_end = headerEndOffset(raw) orelse {
+        if (raw.len > MAX_HEADER_SIZE) return error.RequestTooLarge;
+        return null;
+    };
+    if (header_end > MAX_HEADER_SIZE) return error.RequestTooLarge;
+
+    const header_slice = raw[0..header_end];
+    const content_length_raw = extractHeader(header_slice, "Content-Length") orelse return header_end;
+    const trimmed = std.mem.trim(u8, content_length_raw, " \t");
+    if (trimmed.len == 0) return error.InvalidContentLength;
+
+    const content_length = std.fmt.parseInt(usize, trimmed, 10) catch return error.InvalidContentLength;
+    if (content_length > MAX_BODY_SIZE) return error.RequestTooLarge;
+
+    const total = std.math.add(usize, header_end, content_length) catch return error.RequestTooLarge;
+    if (total > MAX_HTTP_REQUEST_SIZE) return error.RequestTooLarge;
+    return total;
+}
+
+fn configureRequestReadTimeout(stream: *std.net.Stream) void {
+    if (!@hasDecl(std.posix.SO, "RCVTIMEO")) return;
+
+    const timeout = std.posix.timeval{
+        .sec = @intCast(REQUEST_TIMEOUT_SECS),
+        .usec = 0,
+    };
+    std.posix.setsockopt(
+        stream.handle,
+        std.posix.SOL.SOCKET,
+        std.posix.SO.RCVTIMEO,
+        &std.mem.toBytes(timeout),
+    ) catch {};
+}
+
+fn readHttpRequestFromReader(allocator: std.mem.Allocator, reader: anytype) ![]u8 {
+    var request_buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer request_buf.deinit(allocator);
+
+    var expected_total: ?usize = null;
+    var chunk: [2048]u8 = undefined;
+
+    while (true) {
+        const n = reader.read(&chunk) catch |err| switch (err) {
+            error.WouldBlock, error.ConnectionTimedOut => return error.RequestTimeout,
+            else => return err,
+        };
+        if (n == 0) return error.IncompleteRequest;
+
+        try request_buf.appendSlice(allocator, chunk[0..n]);
+        if (request_buf.items.len > MAX_HTTP_REQUEST_SIZE) return error.RequestTooLarge;
+
+        if (expected_total == null) {
+            expected_total = try expectedHttpRequestSize(request_buf.items);
+        }
+
+        if (expected_total) |total| {
+            if (request_buf.items.len >= total) {
+                request_buf.items.len = total;
+                return request_buf.toOwnedSlice(allocator);
+            }
+        }
+    }
+}
+
+fn readHttpRequest(allocator: std.mem.Allocator, stream: *std.net.Stream) ![]u8 {
+    return readHttpRequestFromReader(allocator, stream);
+}
+
+fn writeJsonResponse(stream: *std.net.Stream, status: []const u8, body: []const u8) void {
+    var resp_buf: [2048]u8 = undefined;
+    const resp = std.fmt.bufPrint(
+        &resp_buf,
+        "HTTP/1.1 {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+        .{ status, body.len, body },
+    ) catch return;
+    _ = stream.write(resp) catch {};
+}
+
 /// Process an incoming message by spawning `nullclaw agent -m "..."`.
 /// Returns the agent's response text. Caller owns the returned memory.
 pub fn processIncomingMessage(allocator: std.mem.Allocator, message: []const u8) ![]u8 {
@@ -1343,6 +1682,7 @@ const webhook_route_descriptors = [_]WebhookRouteDescriptor{
     .{ .path = "/slack/events", .handler = handleSlackWebhookRoute },
     .{ .path = "/line", .handler = handleLineWebhookRoute },
     .{ .path = "/lark", .handler = handleLarkWebhookRoute },
+    .{ .path = "/qq", .handler = handleQqWebhookRoute },
 };
 
 fn findWebhookRouteDescriptor(path: []const u8) ?*const WebhookRouteDescriptor {
@@ -2075,8 +2415,116 @@ fn handleLarkWebhookRoute(ctx: *WebhookHandlerContext) void {
     ctx.response_body = "{\"status\":\"ok\"}";
 }
 
+fn handleQqWebhookRoute(ctx: *WebhookHandlerContext) void {
+    if (!build_options.enable_channel_qq) {
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"qq channel disabled in this build\"}";
+        return;
+    }
+
+    if (!std.mem.eql(u8, ctx.method, "POST")) {
+        ctx.response_status = "405 Method Not Allowed";
+        ctx.response_body = "{\"error\":\"method not allowed\"}";
+        return;
+    }
+    if (!ctx.state.rate_limiter.allowWebhook(ctx.state.allocator, "qq")) {
+        ctx.response_status = "429 Too Many Requests";
+        ctx.response_body = "{\"error\":\"rate limited\"}";
+        return;
+    }
+
+    const body = extractBody(ctx.raw_request) orelse {
+        ctx.response_body = "{\"status\":\"received\"}";
+        return;
+    };
+    const parsed_probe = std.json.parseFromSlice(std.json.Value, ctx.req_allocator, body, .{}) catch {
+        ctx.response_status = "400 Bad Request";
+        ctx.response_body = "{\"error\":\"invalid json payload\"}";
+        return;
+    };
+    defer parsed_probe.deinit();
+
+    const app_id_header = extractHeader(ctx.raw_request, "X-Bot-Appid");
+    const qq_cfg = selectQqConfig(ctx.config_opt, ctx.target, app_id_header) orelse {
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"qq not configured\"}";
+        return;
+    };
+
+    if (qq_cfg.receive_mode != .webhook) {
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"qq webhook mode not enabled\"}";
+        return;
+    }
+
+    if (app_id_header) |raw_app_id| {
+        const app_id = std.mem.trim(u8, raw_app_id, " \t\r\n");
+        if (app_id.len > 0 and !std.mem.eql(u8, app_id, qq_cfg.app_id)) {
+            ctx.response_status = "401 Unauthorized";
+            ctx.response_body = "{\"error\":\"invalid X-Bot-Appid\"}";
+            return;
+        }
+    }
+
+    var qq_channel = findQqRuntimeChannel(ctx.state, qq_cfg.account_id) orelse blk: {
+        ctx.state.qq_channels.append(ctx.state.allocator, channels.qq.QQChannel.initFromConfig(ctx.state.allocator, qq_cfg.*)) catch {
+            ctx.response_status = "500 Internal Server Error";
+            ctx.response_body = "{\"error\":\"qq channel init failed\"}";
+            return;
+        };
+        break :blk &ctx.state.qq_channels.items[ctx.state.qq_channels.items.len - 1];
+    };
+
+    if (qq_channel.buildWebhookValidationResponse(ctx.req_allocator, body) catch null) |challenge_resp| {
+        ctx.response_body = challenge_resp;
+        return;
+    }
+
+    const inbound_opt = qq_channel.parseWebhookPayload(ctx.req_allocator, body) catch {
+        ctx.response_body = "{\"status\":\"ok\"}";
+        return;
+    };
+
+    if (inbound_opt) |inbound| {
+        defer inbound.deinit(qq_channel.allocator);
+
+        if (ctx.state.event_bus) |eb| {
+            _ = publishToBus(
+                eb,
+                ctx.state.allocator,
+                "qq",
+                inbound.sender_id,
+                inbound.chat_id,
+                inbound.content,
+                inbound.session_key,
+                inbound.metadata_json,
+            );
+            ctx.response_body = "{\"status\":\"received\"}";
+            return;
+        }
+
+        if (ctx.session_mgr_opt) |sm| {
+            const reply: ?[]const u8 = sm.processMessage(inbound.session_key, inbound.content, null) catch |err| blk: {
+                qq_channel.sendMessage(inbound.chat_id, userFacingAgentError(err)) catch {};
+                break :blk null;
+            };
+            if (reply) |r| {
+                defer ctx.root_allocator.free(r);
+                qq_channel.sendMessage(inbound.chat_id, r) catch {};
+            }
+        }
+    }
+
+    ctx.response_body = "{\"status\":\"ok\"}";
+}
+
+fn applyRuntimeProviderOverrides(config: *const Config) !void {
+    try http_util.setProxyOverride(config.http_request.proxy);
+    try providers.setApiErrorLimitOverride(config.diagnostics.api_error_max_chars);
+}
+
 /// Run the HTTP gateway. Binds to host:port and serves HTTP requests.
-/// Endpoints: GET /health, GET /ready, POST /pair, POST /webhook, GET|POST /whatsapp, POST /telegram, POST /slack/events, POST /line, POST /lark
+/// Endpoints: GET /health, GET /ready, POST /pair, POST /webhook, GET|POST /whatsapp, POST /telegram, POST /slack/events, POST /line, POST /lark, POST /qq
 /// If config_ptr is null, loads config internally (for backward compatibility).
 pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr: ?*const Config, event_bus: ?*bus_mod.Bus) !void {
     health.markComponentOk("gateway");
@@ -2102,14 +2550,17 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
     var session_mgr_opt: ?session_mod.SessionManager = null;
     var tools_slice: []const tools_mod.Tool = &.{};
     var mem_rt: ?memory_mod.MemoryRuntime = null;
+    var bootstrap_provider_opt: ?bootstrap_mod.BootstrapProvider = null;
     var subagent_manager_opt: ?*subagent_mod.SubagentManager = null;
     var sec_tracker_opt: ?security.RateTracker = null;
     var sec_policy_opt: ?security.SecurityPolicy = null;
-    var noop_obs_gateway = observability.NoopObserver{};
+    var gateway_thread_observer = GatewayThreadObserver.init(allocator);
+    defer gateway_thread_observer.deinit();
     const needs_local_agent = event_bus == null;
 
     if (config_opt) |cfg_ptr| {
         const cfg = cfg_ptr;
+        try applyRuntimeProviderOverrides(cfg);
         state.rate_limiter = GatewayRateLimiter.init(
             cfg.gateway.pair_rate_limit_per_minute,
             cfg.gateway.webhook_rate_limit_per_minute,
@@ -2148,6 +2599,11 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
             state.lark_allow_from = lark_cfg.allow_from;
             state.lark_account_id = lark_cfg.account_id;
         }
+        if (build_options.enable_channel_qq) {
+            for (cfg.channels.qq) |qq_cfg| {
+                try state.qq_channels.append(allocator, channels.qq.QQChannel.initFromConfig(allocator, qq_cfg));
+            }
+        }
 
         // In daemon mode (`event_bus` is present), inbound processing is delegated to
         // the bus + channel runtime. Avoid creating a second local agent runtime here.
@@ -2157,10 +2613,11 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                 .autonomy = cfg.autonomy.level,
                 .workspace_dir = cfg.workspace_dir,
                 .workspace_only = cfg.autonomy.workspace_only,
-                .allowed_commands = if (cfg.autonomy.allowed_commands.len > 0) cfg.autonomy.allowed_commands else &security.default_allowed_commands,
+                .allowed_commands = security.resolveAllowedCommands(cfg.autonomy.level, cfg.autonomy.allowed_commands),
                 .max_actions_per_hour = cfg.autonomy.max_actions_per_hour,
                 .require_approval_for_medium_risk = cfg.autonomy.require_approval_for_medium_risk,
                 .block_high_risk_commands = cfg.autonomy.block_high_risk_commands,
+                .allow_raw_url_chars = cfg.autonomy.allow_raw_url_chars,
                 .tracker = if (sec_tracker_opt) |*tracker| tracker else null,
             };
 
@@ -2172,27 +2629,45 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
 
                 // Optional memory backend.
                 mem_rt = memory_mod.initRuntime(allocator, &cfg.memory, cfg.workspace_dir);
+                const mem_opt: ?memory_mod.Memory = if (mem_rt) |rt| rt.memory else null;
+
+                bootstrap_provider_opt = bootstrap_mod.createProvider(
+                    allocator,
+                    cfg.memory.backend,
+                    mem_opt,
+                    cfg.workspace_dir,
+                ) catch null;
 
                 const subagent_manager = allocator.create(subagent_mod.SubagentManager) catch null;
                 if (subagent_manager) |mgr| {
                     mgr.* = subagent_mod.SubagentManager.init(allocator, cfg, event_bus, .{});
+                    mgr.task_runner = subagent_runner.runTaskWithTools;
                     subagent_manager_opt = mgr;
                 }
 
                 // Tools.
                 tools_slice = tools_mod.allTools(allocator, cfg.workspace_dir, .{
                     .http_enabled = cfg.http_request.enabled,
+                    .http_allowed_domains = cfg.http_request.allowed_domains,
+                    .http_max_response_size = cfg.http_request.max_response_size,
+                    .http_timeout_secs = cfg.http_request.timeout_secs,
+                    .web_search_base_url = cfg.http_request.search_base_url,
+                    .web_search_provider = cfg.http_request.search_provider,
+                    .web_search_fallback_providers = cfg.http_request.search_fallback_providers,
                     .browser_enabled = cfg.browser.enabled,
                     .screenshot_enabled = true,
                     .agents = cfg.agents,
+                    .configured_providers = cfg.providers,
                     .fallback_api_key = resolved_api_key,
                     .allowed_paths = cfg.autonomy.allowed_paths,
+                    .tools_config = cfg.tools,
                     .policy = if (sec_policy_opt) |*policy| policy else null,
                     .subagent_manager = subagent_manager_opt,
+                    .bootstrap_provider = bootstrap_provider_opt,
+                    .backend_name = cfg.memory.backend,
                 }) catch &.{};
 
-                const mem_opt: ?memory_mod.Memory = if (mem_rt) |rt| rt.memory else null;
-                var sm = session_mod.SessionManager.init(allocator, cfg, provider_i, tools_slice, mem_opt, noop_obs_gateway.observer(), if (mem_rt) |rt| rt.session_store else null, if (mem_rt) |*rt| rt.response_cache else null);
+                var sm = session_mod.SessionManager.init(allocator, cfg, provider_i, tools_slice, mem_opt, gateway_thread_observer.observer(), if (mem_rt) |rt| rt.session_store else null, if (mem_rt) |*rt| rt.response_cache else null);
                 if (sec_policy_opt) |*policy| {
                     sm.policy = policy;
                 }
@@ -2203,11 +2678,15 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                 session_mgr_opt = sm;
             }
         }
+    } else {
+        try http_util.setProxyOverride(null);
+        try providers.setApiErrorLimitOverride(null);
     }
     if (state.pairing_guard == null) {
         state.pairing_guard = try PairingGuard.init(allocator, true, &.{});
     }
     defer if (provider_bundle_opt) |*bundle| bundle.deinit();
+    defer if (bootstrap_provider_opt) |bp| bp.deinit();
     defer if (mem_rt) |*rt| rt.deinit();
     defer if (subagent_manager_opt) |mgr| {
         mgr.deinit();
@@ -2230,6 +2709,10 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
     try stdout.print("Gateway listening on {s}:{d}\n", .{ host, port });
     try stdout.flush();
     if (config_opt) |cfg| {
+        if (cfg.autonomy.level == .yolo) {
+            try stdout.print("\x1b[1;31m[WARNING] YOLO mode active — all security checks bypassed\x1b[0m\n", .{});
+            try stdout.flush();
+        }
         // In daemon mode the parent already prints model/provider.
         if (config_ptr == null) cfg.printModelConfig();
     }
@@ -2244,17 +2727,23 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
     while (true) {
         var conn = server.accept() catch continue;
         defer conn.stream.close();
+        configureRequestReadTimeout(&conn.stream);
 
         // Per-request arena — all request-scoped allocations freed in one shot
         var arena = std.heap.ArenaAllocator.init(allocator);
         defer arena.deinit();
         const req_allocator = arena.allocator();
 
-        // Read request line + headers from TCP stream
-        var req_buf: [4096]u8 = undefined;
-        const n = conn.stream.read(&req_buf) catch continue;
-        if (n == 0) continue;
-        const raw = req_buf[0..n];
+        // Read full HTTP request (headers + optional body).
+        const raw = readHttpRequest(req_allocator, &conn.stream) catch |err| {
+            switch (err) {
+                error.RequestTooLarge => writeJsonResponse(&conn.stream, "413 Payload Too Large", "{\"error\":\"request too large\"}"),
+                error.InvalidContentLength => writeJsonResponse(&conn.stream, "400 Bad Request", "{\"error\":\"invalid content-length\"}"),
+                error.RequestTimeout => writeJsonResponse(&conn.stream, "408 Request Timeout", "{\"error\":\"request timeout\"}"),
+                else => {},
+            }
+            continue;
+        };
 
         // Parse first line: "METHOD /path HTTP/1.1\r\n"
         const first_line_end = std.mem.indexOf(u8, raw, "\r\n") orelse continue;
@@ -2350,13 +2839,16 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                                 _ = publishToBus(eb, state.allocator, "webhook", bearer orelse "anon", session_key, msg_text, session_key, null);
                                 response_body = "{\"status\":\"received\"}";
                             } else if (session_mgr_opt) |*sm| {
+                                const start_seq = gateway_thread_observer.currentSeq();
                                 const reply: ?[]const u8 = sm.processMessage(session_key, msg_text, null) catch |err| blk: {
                                     response_body = userFacingAgentErrorJson(err);
                                     break :blk null;
                                 };
                                 if (reply) |r| {
                                     defer allocator.free(r);
-                                    const json_resp = jsonWrapResponse(req_allocator, r) catch null;
+                                    const tool_events = gateway_thread_observer.collectSince(req_allocator, start_seq) catch &.{};
+                                    const thread_events_json = buildThreadEventsJson(req_allocator, tool_events) catch "[]";
+                                    const json_resp = buildWebhookSuccessResponse(req_allocator, r, thread_events_json) catch null;
                                     response_body = json_resp orelse "{\"status\":\"received\"}";
                                 } else {
                                     response_body = "{\"status\":\"received\"}";
@@ -2427,9 +2919,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
         }
 
         // Send HTTP response
-        var resp_buf: [2048]u8 = undefined;
-        const resp = std.fmt.bufPrint(&resp_buf, "HTTP/1.1 {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ response_status, response_body.len, response_body }) catch continue;
-        _ = conn.stream.write(resp) catch continue;
+        writeJsonResponse(&conn.stream, response_status, response_body);
     }
 }
 
@@ -2506,6 +2996,7 @@ test "findWebhookRouteDescriptor resolves known webhook paths" {
     try std.testing.expect(findWebhookRouteDescriptor("/slack/events") != null);
     try std.testing.expect(findWebhookRouteDescriptor("/line") != null);
     try std.testing.expect(findWebhookRouteDescriptor("/lark") != null);
+    try std.testing.expect(findWebhookRouteDescriptor("/qq") != null);
     try std.testing.expect(findWebhookRouteDescriptor("/health") == null);
 }
 
@@ -3019,6 +3510,113 @@ test "selectLarkConfig picks account by verification token" {
     try std.testing.expectEqualStrings("backup", selected.?.account_id);
 }
 
+test "selectQqConfig picks account by X-Bot-Appid header" {
+    const qq_accounts = [_]config_types.QQConfig{
+        .{
+            .account_id = "main",
+            .app_id = "app-main",
+            .app_secret = "secret-main",
+        },
+        .{
+            .account_id = "backup",
+            .app_id = "app-backup",
+            .app_secret = "secret-backup",
+        },
+    };
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .qq = &qq_accounts,
+        },
+    };
+
+    const selected = selectQqConfig(&cfg, "/qq", "app-backup");
+    if (!build_options.enable_channel_qq) {
+        try std.testing.expect(selected == null);
+        return;
+    }
+    try std.testing.expect(selected != null);
+    try std.testing.expectEqualStrings("backup", selected.?.account_id);
+}
+
+test "selectQqConfig falls back to primary account" {
+    const qq_accounts = [_]config_types.QQConfig{
+        .{
+            .account_id = "z-last",
+            .app_id = "app-z",
+            .app_secret = "secret-z",
+        },
+        .{
+            .account_id = "default",
+            .app_id = "app-default",
+            .app_secret = "secret-default",
+        },
+    };
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .qq = &qq_accounts,
+        },
+    };
+
+    const selected = selectQqConfig(&cfg, "/qq", null);
+    if (!build_options.enable_channel_qq) {
+        try std.testing.expect(selected == null);
+        return;
+    }
+    try std.testing.expect(selected != null);
+    try std.testing.expectEqualStrings("default", selected.?.account_id);
+}
+
+test "handleQqWebhookRoute rejects invalid json payload" {
+    if (!build_options.enable_channel_qq) return;
+
+    const qq_accounts = [_]config_types.QQConfig{
+        .{
+            .account_id = "main",
+            .app_id = "app-main",
+            .app_secret = "secret-main",
+            .receive_mode = .webhook,
+        },
+    };
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .qq = &qq_accounts,
+        },
+    };
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+
+    const raw_request =
+        "POST /qq HTTP/1.1\r\n" ++
+        "Host: localhost\r\n" ++
+        "X-Bot-Appid: app-main\r\n" ++
+        "Content-Type: application/json\r\n\r\n" ++
+        "{invalid";
+    var ctx = WebhookHandlerContext{
+        .root_allocator = std.testing.allocator,
+        .req_allocator = std.testing.allocator,
+        .raw_request = raw_request,
+        .method = "POST",
+        .target = "/qq",
+        .config_opt = &cfg,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+
+    handleQqWebhookRoute(&ctx);
+    try std.testing.expectEqualStrings("400 Bad Request", ctx.response_status);
+    try std.testing.expectEqualStrings("{\"error\":\"invalid json payload\"}", ctx.response_body);
+}
+
 test "whatsappSessionKey builds direct key by sender" {
     const body = "{\"from\":\"15550001111\",\"text\":{\"body\":\"hi\"}}";
     var key_buf: [256]u8 = undefined;
@@ -3449,6 +4047,115 @@ test "extractBody returns null for no body" {
 test "extractBody returns null for no separator" {
     const raw = "GET /health HTTP/1.1\r\nHost: localhost\r\n";
     try std.testing.expect(extractBody(raw) == null);
+}
+
+test "expectedHttpRequestSize returns null when headers are incomplete" {
+    const raw = "GET /health HTTP/1.1\r\nHost: localhost\r\n";
+    try std.testing.expect(try expectedHttpRequestSize(raw) == null);
+}
+
+test "expectedHttpRequestSize rejects oversized incomplete headers" {
+    const raw = try std.testing.allocator.alloc(u8, MAX_HEADER_SIZE + 1);
+    defer std.testing.allocator.free(raw);
+    for (raw) |*byte| byte.* = 'a';
+    try std.testing.expectError(error.RequestTooLarge, expectedHttpRequestSize(raw));
+}
+
+test "expectedHttpRequestSize returns header length for requests without body" {
+    const raw = "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    try std.testing.expectEqual(raw.len, (try expectedHttpRequestSize(raw)).?);
+}
+
+test "expectedHttpRequestSize includes content length payload" {
+    const raw = "POST /webhook HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello";
+    try std.testing.expectEqual(raw.len, (try expectedHttpRequestSize(raw)).?);
+}
+
+test "expectedHttpRequestSize rejects invalid content length" {
+    const raw = "POST /webhook HTTP/1.1\r\nHost: localhost\r\nContent-Length: abc\r\n\r\nhello";
+    try std.testing.expectError(error.InvalidContentLength, expectedHttpRequestSize(raw));
+}
+
+test "expectedHttpRequestSize rejects oversized content length" {
+    const raw = "POST /webhook HTTP/1.1\r\nHost: localhost\r\nContent-Length: 999999\r\n\r\n";
+    try std.testing.expectError(error.RequestTooLarge, expectedHttpRequestSize(raw));
+}
+
+test "readHttpRequestFromReader assembles fragmented request" {
+    const ChunkedReader = struct {
+        chunks: []const []const u8,
+        chunk_idx: usize = 0,
+        offset_in_chunk: usize = 0,
+
+        fn read(self: *@This(), out: []u8) !usize {
+            while (self.chunk_idx < self.chunks.len and self.offset_in_chunk >= self.chunks[self.chunk_idx].len) {
+                self.chunk_idx += 1;
+                self.offset_in_chunk = 0;
+            }
+            if (self.chunk_idx >= self.chunks.len) return 0;
+
+            const chunk = self.chunks[self.chunk_idx];
+            const remaining = chunk[self.offset_in_chunk..];
+            const n = @min(out.len, remaining.len);
+            std.mem.copyForwards(u8, out[0..n], remaining[0..n]);
+            self.offset_in_chunk += n;
+            return n;
+        }
+    };
+
+    const expected = "POST /pair HTTP/1.1\r\nHost: localhost\r\nContent-Length: 11\r\n\r\nhello world";
+    const chunks = [_][]const u8{
+        "POST /pair HTTP/1.1\r\nHo",
+        "st: localhost\r\nContent-Length: 11\r\n\r\nhel",
+        "lo world",
+    };
+    var reader = ChunkedReader{ .chunks = chunks[0..] };
+
+    const raw = try readHttpRequestFromReader(std.testing.allocator, &reader);
+    defer std.testing.allocator.free(raw);
+    try std.testing.expectEqualStrings(expected, raw);
+}
+
+test "readHttpRequestFromReader returns IncompleteRequest for truncated body" {
+    const ChunkedReader = struct {
+        chunks: []const []const u8,
+        chunk_idx: usize = 0,
+        offset_in_chunk: usize = 0,
+
+        fn read(self: *@This(), out: []u8) !usize {
+            while (self.chunk_idx < self.chunks.len and self.offset_in_chunk >= self.chunks[self.chunk_idx].len) {
+                self.chunk_idx += 1;
+                self.offset_in_chunk = 0;
+            }
+            if (self.chunk_idx >= self.chunks.len) return 0;
+
+            const chunk = self.chunks[self.chunk_idx];
+            const remaining = chunk[self.offset_in_chunk..];
+            const n = @min(out.len, remaining.len);
+            std.mem.copyForwards(u8, out[0..n], remaining[0..n]);
+            self.offset_in_chunk += n;
+            return n;
+        }
+    };
+
+    const chunks = [_][]const u8{
+        "POST /pair HTTP/1.1\r\nHost: localhost\r\nContent-Length: 8\r\n\r\nabc",
+    };
+    var reader = ChunkedReader{ .chunks = chunks[0..] };
+    try std.testing.expectError(error.IncompleteRequest, readHttpRequestFromReader(std.testing.allocator, &reader));
+}
+
+test "readHttpRequestFromReader maps WouldBlock to RequestTimeout" {
+    const TimeoutReader = struct {
+        const ReadError = error{ WouldBlock, ConnectionTimedOut };
+
+        fn read(_: *@This(), _: []u8) ReadError!usize {
+            return error.WouldBlock;
+        }
+    };
+
+    var reader = TimeoutReader{};
+    try std.testing.expectError(error.RequestTimeout, readHttpRequestFromReader(std.testing.allocator, &reader));
 }
 
 test "userFacingAgentError maps ProviderDoesNotSupportVision" {
@@ -4057,6 +4764,111 @@ test "jsonWrapResponse with clean input" {
     const result = try jsonWrapResponse(std.testing.allocator, "simple reply");
     defer std.testing.allocator.free(result);
     try std.testing.expectEqualStrings("{\"status\":\"ok\",\"response\":\"simple reply\"}", result);
+}
+
+// ── GatewayThreadObserver tests ─────────────────────────────────
+
+test "GatewayThreadObserver init/deinit no leaks" {
+    var obs = GatewayThreadObserver.init(std.testing.allocator);
+    obs.deinit();
+}
+
+test "GatewayThreadObserver records tool events and collectSince works" {
+    var obs = GatewayThreadObserver.init(std.testing.allocator);
+    defer obs.deinit();
+
+    const seq_before = obs.currentSeq();
+    const start_event = observability.ObserverEvent{ .tool_call_start = .{ .tool = "shell" } };
+    obs.observer().recordEvent(&start_event);
+
+    const done_event = observability.ObserverEvent{ .tool_call = .{ .tool = "shell", .duration_ms = 50, .success = true } };
+    obs.observer().recordEvent(&done_event);
+
+    const events = try obs.collectSince(std.testing.allocator, seq_before);
+    defer {
+        for (events) |e| std.testing.allocator.free(e.tool);
+        std.testing.allocator.free(events);
+    }
+    try std.testing.expectEqual(@as(usize, 2), events.len);
+    try std.testing.expectEqualStrings("shell", events[0].tool);
+    try std.testing.expect(events[0].kind == .start);
+    try std.testing.expect(events[1].kind == .result);
+    try std.testing.expect(events[1].success);
+}
+
+test "GatewayThreadObserver collectSince filters by sequence" {
+    var obs = GatewayThreadObserver.init(std.testing.allocator);
+    defer obs.deinit();
+
+    const event1 = observability.ObserverEvent{ .tool_call = .{ .tool = "shell", .duration_ms = 10, .success = true } };
+    obs.observer().recordEvent(&event1);
+    const mid_seq = obs.currentSeq();
+
+    const event2 = observability.ObserverEvent{ .tool_call = .{ .tool = "web_fetch", .duration_ms = 20, .success = false } };
+    obs.observer().recordEvent(&event2);
+
+    const events = try obs.collectSince(std.testing.allocator, mid_seq);
+    defer {
+        for (events) |e| std.testing.allocator.free(e.tool);
+        std.testing.allocator.free(events);
+    }
+    try std.testing.expectEqual(@as(usize, 1), events.len);
+    try std.testing.expectEqualStrings("web_fetch", events[0].tool);
+    try std.testing.expect(!events[0].success);
+}
+
+test "GatewayThreadObserver collectSince OOM frees partial output" {
+    var obs = GatewayThreadObserver.init(std.testing.allocator);
+    defer obs.deinit();
+
+    const event1 = observability.ObserverEvent{ .tool_call = .{ .tool = "shell", .duration_ms = 10, .success = true } };
+    obs.observer().recordEvent(&event1);
+    const event2 = observability.ObserverEvent{ .tool_call = .{ .tool = "web_fetch", .duration_ms = 20, .success = false } };
+    obs.observer().recordEvent(&event2);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    // collectSince allocations: out array + first tool dupe + second tool dupe
+    failing.fail_index = failing.alloc_index + 2;
+    try std.testing.expectError(error.OutOfMemory, obs.collectSince(failing.allocator(), 0));
+}
+
+// ── buildThreadEventsJson / buildWebhookSuccessResponse tests ───
+
+test "buildThreadEventsJson empty events" {
+    const result = try buildThreadEventsJson(std.testing.allocator, &.{});
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("[]", result);
+}
+
+test "buildThreadEventsJson with tool results" {
+    const events = [_]GatewayTurnToolEvent{
+        .{ .kind = .start, .tool = "shell", .success = false },
+        .{ .kind = .result, .tool = "shell", .success = true },
+        .{ .kind = .result, .tool = "web_fetch", .success = false },
+    };
+    const result = try buildThreadEventsJson(std.testing.allocator, &events);
+    defer std.testing.allocator.free(result);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, result, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .array);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.array.items.len);
+    const summary = parsed.value.array.items[0].object;
+    try std.testing.expectEqualStrings("tool_summary", summary.get("type").?.string);
+    try std.testing.expectEqual(@as(i64, 2), summary.get("total").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), summary.get("failed").?.integer);
+}
+
+test "buildWebhookSuccessResponse includes thread_events" {
+    const result = try buildWebhookSuccessResponse(std.testing.allocator, "hello", "[]");
+    defer std.testing.allocator.free(result);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, result, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value == .object);
+    try std.testing.expectEqualStrings("ok", parsed.value.object.get("status").?.string);
+    try std.testing.expectEqualStrings("hello", parsed.value.object.get("response").?.string);
+    try std.testing.expect(parsed.value.object.get("thread_events").? == .array);
 }
 
 // ── jsonWrapChallenge tests ─────────────────────────────────────

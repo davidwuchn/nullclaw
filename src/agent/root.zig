@@ -18,6 +18,7 @@ const tools_mod = @import("../tools/root.zig");
 const Tool = tools_mod.Tool;
 const memory_mod = @import("../memory/root.zig");
 const Memory = memory_mod.Memory;
+const bootstrap_mod = @import("../bootstrap/root.zig");
 const capabilities_mod = @import("../capabilities.zig");
 const multimodal = @import("../multimodal.zig");
 const platform = @import("../platform.zig");
@@ -25,6 +26,7 @@ const observability = @import("../observability.zig");
 const Observer = observability.Observer;
 const ObserverEvent = observability.ObserverEvent;
 const SecurityPolicy = @import("../security/policy.zig").SecurityPolicy;
+const verbose_mod = @import("../verbose.zig");
 
 const cache = memory_mod.cache;
 pub const dispatcher = @import("dispatcher.zig");
@@ -46,6 +48,10 @@ const DEFAULT_MAX_TOOL_ITERATIONS: u32 = 25;
 
 /// Maximum non-system messages before trimming.
 const DEFAULT_MAX_HISTORY: u32 = 50;
+
+pub fn estimate_text_tokens(text: []const u8) u32 {
+    return @intCast((text.len + 3) / 4);
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Agent
@@ -210,11 +216,22 @@ pub const Agent = struct {
         }
     };
 
+    pub const UsageRecord = struct {
+        ts: i64,
+        provider: []const u8,
+        model: []const u8,
+        usage: providers.TokenUsage,
+        success: bool,
+    };
+
+    pub const UsageRecordCallback = *const fn (ctx: *anyopaque, record: UsageRecord) void;
+
     allocator: std.mem.Allocator,
     provider: Provider,
     tools: []const Tool,
     tool_specs: []const ToolSpec,
     mem: ?Memory,
+    bootstrap: ?bootstrap_mod.BootstrapProvider = null,
     session_store: ?memory_mod.SessionStore = null,
     response_cache: ?*cache.ResponseCache = null,
     /// Optional MemoryRuntime pointer for diagnostics (e.g. /doctor command).
@@ -227,12 +244,26 @@ pub const Agent = struct {
     default_provider: []const u8 = "openrouter",
     default_provider_owned: bool = false,
     default_model: []const u8 = "anthropic/claude-sonnet-4",
+    model_routes: []const config_types.ModelRouteConfig = &.{},
+    model_pinned_by_user: bool = false,
+    last_route_trace: ?[]u8 = null,
+    degraded_routes: std.ArrayListUnmanaged(DegradedRoute) = .empty,
     configured_providers: []const config_types.ProviderEntry = &.{},
     fallback_providers: []const []const u8 = &.{},
     model_fallbacks: []const config_types.ModelFallbackEntry = &.{},
     temperature: f64,
     workspace_dir: []const u8,
     allowed_paths: []const []const u8 = &.{},
+    multimodal_unrestricted: bool = false,
+    /// List of models that do not support image/vision input.
+    /// When image markers are detected and the model is in this list,
+    /// the agent will skip processing images instead of returning an error.
+    vision_disabled_models: []const []const u8 = &.{},
+    /// When true, automatically adds the current model to vision_disabled_models
+    /// upon receiving a "model does not support vision" error.
+    auto_disable_vision_on_error: bool = true,
+    /// Models auto-detected as not supporting vision (built at runtime).
+    detected_vision_disabled: std.ArrayListUnmanaged([]const u8) = .empty,
     max_tool_iterations: u32,
     max_history_messages: u32,
     auto_save: bool,
@@ -270,12 +301,17 @@ pub const Agent = struct {
     activation_mode: ActivationMode = .mention,
     send_mode: SendMode = .inherit,
     last_turn_usage: providers.TokenUsage = .{},
+    status_show_emojis: bool = true,
     message_timeout_secs: u64 = 0,
     log_tool_calls: bool = false,
     log_llm_io: bool = false,
     compaction_keep_recent: u32 = compaction.DEFAULT_COMPACTION_KEEP_RECENT,
     compaction_max_summary_chars: u32 = compaction.DEFAULT_COMPACTION_MAX_SUMMARY_CHARS,
     compaction_max_source_chars: u32 = compaction.DEFAULT_COMPACTION_MAX_SOURCE_CHARS,
+
+    /// Per-turn MCP tool filter groups (slice into config-owned memory; not freed by Agent).
+    /// Empty = no filtering; all tool specs are sent as-is.
+    tool_filter_groups: []const config_types.ToolFilterGroup = &.{},
 
     /// Optional security policy for autonomy checks and rate limiting.
     policy: ?*const SecurityPolicy = null,
@@ -284,6 +320,16 @@ pub const Agent = struct {
     stream_callback: ?providers.StreamCallback = null,
     /// Context pointer passed to stream_callback.
     stream_ctx: ?*anyopaque = null,
+    /// Optional callback invoked for each LLM response usage record.
+    usage_record_callback: ?UsageRecordCallback = null,
+    /// Context pointer passed to usage_record_callback.
+    usage_record_ctx: ?*anyopaque = null,
+    /// Cross-thread interrupt flag used to stop in-flight tool loops.
+    interrupt_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Tracks currently running tool and effective interruptions for user-facing reporting.
+    tool_state_mu: std.Thread.Mutex = .{},
+    active_tool_name: ?[]u8 = null,
+    interrupted_tools: std.ArrayListUnmanaged([]u8) = .empty,
     /// Conversation context for the current turn (Signal-specific for now).
     conversation_context: ?prompt.ConversationContext = null,
 
@@ -299,6 +345,8 @@ pub const Agent = struct {
     system_prompt_has_conversation_context: bool = false,
     /// Fingerprint of workspace prompt files for the currently injected system prompt.
     workspace_prompt_fingerprint: ?u64 = null,
+    /// Model name used when building the currently cached system prompt.
+    system_prompt_model_name: ?[]u8 = null,
 
     /// Whether compaction was performed during the last turn.
     last_turn_compacted: bool = false,
@@ -346,22 +394,34 @@ pub const Agent = struct {
             };
         }
 
+        const bootstrap_provider: ?bootstrap_mod.BootstrapProvider = bootstrap_mod.createProvider(
+            allocator,
+            cfg.memory.backend,
+            mem,
+            cfg.workspace_dir,
+        ) catch null;
+
         return .{
             .allocator = allocator,
             .provider = provider_i,
             .tools = tools,
             .tool_specs = specs,
             .mem = mem,
+            .bootstrap = bootstrap_provider,
             .observer = observer_i,
             .model_name = default_model,
             .default_provider = cfg.default_provider,
             .default_model = default_model,
+            .model_routes = cfg.model_routes,
             .configured_providers = cfg.providers,
             .fallback_providers = cfg.reliability.fallback_providers,
             .model_fallbacks = cfg.reliability.model_fallbacks,
             .temperature = cfg.default_temperature,
             .workspace_dir = cfg.workspace_dir,
             .allowed_paths = cfg.autonomy.allowed_paths,
+            .multimodal_unrestricted = cfg.autonomy.level == .yolo,
+            .vision_disabled_models = cfg.agent.vision_disabled_models,
+            .auto_disable_vision_on_error = cfg.agent.auto_disable_vision_on_error,
             .max_tool_iterations = cfg.agent.max_tool_iterations,
             .max_history_messages = cfg.agent.max_history_messages,
             .auto_save = cfg.memory.auto_save,
@@ -370,12 +430,23 @@ pub const Agent = struct {
             .max_tokens = resolved_max_tokens,
             .max_tokens_override = cfg.max_tokens,
             .reasoning_effort = cfg.reasoning_effort,
+            .status_show_emojis = cfg.agent.status_show_emojis,
             .message_timeout_secs = cfg.agent.message_timeout_secs,
             .log_tool_calls = cfg.diagnostics.log_tool_calls,
             .log_llm_io = cfg.diagnostics.log_llm_io,
             .compaction_keep_recent = cfg.agent.compaction_keep_recent,
             .compaction_max_summary_chars = cfg.agent.compaction_max_summary_chars,
             .compaction_max_source_chars = cfg.agent.compaction_max_source_chars,
+            .tool_filter_groups = cfg.agent.tool_filter_groups,
+            .exec_security = switch (cfg.autonomy.level) {
+                .full, .yolo => .full,
+                .read_only => .deny,
+                .supervised => .allowlist,
+            },
+            .exec_ask = switch (cfg.autonomy.level) {
+                .full, .read_only, .yolo => .off,
+                .supervised => .on_miss,
+            },
             .history = .empty,
             .total_tokens = 0,
             .has_system_prompt = false,
@@ -384,23 +455,208 @@ pub const Agent = struct {
     }
 
     pub fn deinit(self: *Agent) void {
+        if (self.bootstrap) |bp| bp.deinit();
         if (self.model_name_owned) self.allocator.free(self.model_name);
         if (self.default_provider_owned) self.allocator.free(self.default_provider);
+        if (self.system_prompt_model_name) |model| self.allocator.free(model);
+        if (self.last_route_trace) |trace| self.allocator.free(trace);
         if (self.exec_node_id_owned and self.exec_node_id != null) self.allocator.free(self.exec_node_id.?);
         if (self.tts_provider_owned and self.tts_provider != null) self.allocator.free(self.tts_provider.?);
         if (self.pending_exec_command_owned and self.pending_exec_command != null) self.allocator.free(self.pending_exec_command.?);
         if (self.focus_target_owned and self.focus_target != null) self.allocator.free(self.focus_target.?);
         if (self.dock_target_owned and self.dock_target != null) self.allocator.free(self.dock_target.?);
+        self.tool_state_mu.lock();
+        if (self.active_tool_name) |name| self.allocator.free(name);
+        self.active_tool_name = null;
+        for (self.interrupted_tools.items) |name| self.allocator.free(name);
+        self.interrupted_tools.deinit(self.allocator);
+        self.tool_state_mu.unlock();
         for (self.history.items) |*msg| {
             msg.deinit(self.allocator);
         }
         self.history.deinit(self.allocator);
+        for (self.detected_vision_disabled.items) |model| {
+            self.allocator.free(model);
+        }
+        self.detected_vision_disabled.deinit(self.allocator);
+        for (self.degraded_routes.items) |*entry| {
+            entry.deinit(self.allocator);
+        }
+        self.degraded_routes.deinit(self.allocator);
         self.allocator.free(self.tool_specs);
+    }
+
+    pub fn requestInterrupt(self: *Agent) void {
+        self.interrupt_requested.store(true, .release);
+    }
+
+    pub fn clearInterruptRequest(self: *Agent) void {
+        self.interrupt_requested.store(false, .release);
+    }
+
+    fn isInterruptRequested(self: *const Agent) bool {
+        return self.interrupt_requested.load(.acquire);
+    }
+
+    fn setActiveToolName(self: *Agent, name: []const u8) !void {
+        self.tool_state_mu.lock();
+        defer self.tool_state_mu.unlock();
+        if (self.active_tool_name) |old| self.allocator.free(old);
+        self.active_tool_name = try self.allocator.dupe(u8, name);
+    }
+
+    fn clearActiveToolName(self: *Agent) void {
+        self.tool_state_mu.lock();
+        defer self.tool_state_mu.unlock();
+        if (self.active_tool_name) |old| self.allocator.free(old);
+        self.active_tool_name = null;
+    }
+
+    fn noteInterruptedTool(self: *Agent, name: []const u8) !void {
+        self.tool_state_mu.lock();
+        defer self.tool_state_mu.unlock();
+        for (self.interrupted_tools.items) |existing| {
+            if (std.ascii.eqlIgnoreCase(existing, name)) return;
+        }
+        try self.interrupted_tools.append(self.allocator, try self.allocator.dupe(u8, name));
+    }
+
+    fn takeInterruptedToolsSummary(self: *Agent) !?[]u8 {
+        self.tool_state_mu.lock();
+        defer self.tool_state_mu.unlock();
+        if (self.interrupted_tools.items.len == 0) return null;
+
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(self.allocator);
+        for (self.interrupted_tools.items, 0..) |name, i| {
+            if (i > 0) try out.appendSlice(self.allocator, ", ");
+            try out.appendSlice(self.allocator, name);
+        }
+
+        for (self.interrupted_tools.items) |name| self.allocator.free(name);
+        self.interrupted_tools.clearRetainingCapacity();
+
+        return try out.toOwnedSlice(self.allocator);
+    }
+
+    pub fn snapshotActiveToolName(self: *Agent, allocator: std.mem.Allocator) !?[]u8 {
+        self.tool_state_mu.lock();
+        defer self.tool_state_mu.unlock();
+        if (self.active_tool_name) |name| {
+            return try allocator.dupe(u8, name);
+        }
+        return null;
+    }
+
+    fn interruptedReply(self: *Agent) ![]const u8 {
+        self.clearInterruptRequest();
+        const summary = try self.takeInterruptedToolsSummary();
+        defer if (summary) |s| self.allocator.free(s);
+        const msg = if (summary) |tools|
+            try std.fmt.allocPrint(self.allocator, "Interrupted by /stop. Interrupted tools: {s}.", .{tools})
+        else
+            try self.allocator.dupe(u8, "Interrupted by /stop. Halting tool execution for this turn.");
+        errdefer self.allocator.free(msg);
+        try self.history.append(self.allocator, .{
+            .role = .assistant,
+            .content = try self.allocator.dupe(u8, msg),
+        });
+        const complete_event = ObserverEvent{ .turn_complete = {} };
+        self.observer.recordEvent(&complete_event);
+        return msg;
     }
 
     /// Estimate total tokens in conversation history.
     pub fn tokenEstimate(self: *const Agent) u64 {
         return compaction.tokenEstimate(self.history.items);
+    }
+
+    /// Rough token estimate for provider-ready messages.
+    /// Uses a char-based heuristic (1 token ~= 4 chars) plus structural overhead.
+    fn estimatePromptTokens(messages: []const ChatMessage) u64 {
+        var total_chars: u64 = 0;
+        for (messages) |msg| {
+            if (msg.name) |name| total_chars +|= name.len;
+            if (msg.tool_call_id) |tool_call_id| total_chars +|= tool_call_id.len;
+            if (msg.content_parts) |parts| {
+                // content_parts are the provider-facing payload; avoid double counting
+                // mirrored plain `content` unless parts are unexpectedly empty.
+                if (parts.len == 0) total_chars +|= msg.content.len;
+                for (parts) |part| switch (part) {
+                    .text => |text| total_chars +|= text.len,
+                    .image_url => |img| total_chars +|= img.url.len + 32,
+                    .image_base64 => |img| total_chars +|= img.data.len + img.media_type.len + 32,
+                };
+            } else {
+                total_chars +|= msg.content.len;
+            }
+        }
+
+        const structural_chars: u64 = @as(u64, @intCast(messages.len)) * 32;
+        return (total_chars + structural_chars + 3) / 4;
+    }
+
+    fn estimateToolSpecsTokens(tool_specs: []const ToolSpec) u64 {
+        var total_chars: u64 = 0;
+        for (tool_specs) |spec| {
+            total_chars +|= spec.name.len;
+            total_chars +|= spec.description.len;
+            total_chars +|= spec.parameters_json.len;
+        }
+
+        const structural_chars: u64 = @as(u64, @intCast(tool_specs.len)) * 48;
+        return (total_chars + structural_chars + 3) / 4;
+    }
+
+    /// Clamp completion tokens to fit within the configured context budget.
+    /// Keeps a safety headroom to reduce ContextLengthExceeded errors on strict providers.
+    fn effectiveMaxTokensForMessages(
+        self: *const Agent,
+        messages: []const ChatMessage,
+        include_tool_specs: bool,
+    ) u32 {
+        return self.effectiveMaxTokensForMessagesWithToolSpecs(
+            messages,
+            if (include_tool_specs) self.tool_specs else null,
+        );
+    }
+
+    /// Variant of effectiveMaxTokensForMessages that accepts the exact tool schema set
+    /// used for this request. This avoids overestimating prompt size when MCP schemas
+    /// are filtered per turn.
+    fn effectiveMaxTokensForMessagesWithToolSpecs(
+        self: *const Agent,
+        messages: []const ChatMessage,
+        tool_specs_for_estimate: ?[]const ToolSpec,
+    ) u32 {
+        return self.effectiveMaxTokensForTurn(messages, tool_specs_for_estimate, self.token_limit, self.max_tokens);
+    }
+
+    fn effectiveMaxTokensForTurn(
+        self: *const Agent,
+        messages: []const ChatMessage,
+        tool_specs_for_estimate: ?[]const ToolSpec,
+        token_limit: u64,
+        max_tokens: u32,
+    ) u32 {
+        _ = self;
+        if (token_limit == 0) return max_tokens;
+
+        var prompt_estimate = estimatePromptTokens(messages);
+        if (tool_specs_for_estimate) |tool_specs| {
+            prompt_estimate +|= estimateToolSpecsTokens(tool_specs);
+        }
+
+        if (prompt_estimate >= token_limit) return 1;
+
+        const available = token_limit - prompt_estimate;
+        const reserve = @min(@as(u64, 256), available / 4);
+        if (available <= reserve) return 1;
+
+        const completion_budget = available - reserve;
+        const completion_budget_u32: u32 = @intCast(@min(completion_budget, @as(u64, std.math.maxInt(u32))));
+        if (completion_budget_u32 == 0) return 1;
+        return @max(@as(u32, 1), @min(max_tokens, completion_budget_u32));
     }
 
     /// Auto-compact history when it exceeds thresholds.
@@ -412,6 +668,7 @@ pub const Agent = struct {
             .token_limit = self.token_limit,
             .max_history_messages = self.max_history_messages,
             .workspace_dir = self.workspace_dir,
+            .bootstrap_provider = self.bootstrap,
         });
     }
 
@@ -466,6 +723,20 @@ pub const Agent = struct {
 
     fn composeFinalReply(self: *const Agent, base_text: []const u8, reasoning_content: ?[]const u8, usage: providers.TokenUsage) ![]const u8 {
         return commands.composeFinalReply(self, base_text, reasoning_content, usage);
+    }
+
+    fn selectDisplayText(response_text: []const u8, parsed_text: []const u8, parsed_calls_len: usize) []const u8 {
+        if (parsed_calls_len > 0) return parsed_text;
+        if (parsed_text.len > 0) {
+            // Some malformed/unclosed tool-call payloads can survive into parsed_text
+            // via parser recovery fallbacks. Suppress them from user-visible output.
+            if (dispatcher.containsToolCallMarkup(parsed_text)) return "";
+            return parsed_text;
+        }
+        // If tool-call markup exists but parsing produced no valid calls/text,
+        // never show the raw payload to the user.
+        if (dispatcher.containsToolCallMarkup(response_text)) return "";
+        return response_text;
     }
 
     fn shouldForceActionFollowThrough(text: []const u8) bool {
@@ -526,6 +797,433 @@ pub const Agent = struct {
             if (matched) return true;
         }
         return false;
+    }
+
+    fn hasModelRouteHint(self: *const Agent, hint: []const u8) bool {
+        for (self.model_routes) |route| {
+            if (std.mem.eql(u8, route.hint, hint)) return true;
+        }
+        return false;
+    }
+
+    fn findModelRouteByHint(self: *const Agent, hint: []const u8) ?config_types.ModelRouteConfig {
+        for (self.model_routes) |route| {
+            if (std.mem.eql(u8, route.hint, hint)) return route;
+        }
+        return null;
+    }
+
+    fn degradedRouteMatches(entry: *const DegradedRoute, route: config_types.ModelRouteConfig) bool {
+        return std.mem.eql(u8, entry.hint, route.hint) and
+            std.mem.eql(u8, entry.provider, route.provider) and
+            std.mem.eql(u8, entry.model, route.model);
+    }
+
+    fn pruneExpiredDegradedRoutes(self: *Agent, now_ms: i64) void {
+        var i: usize = 0;
+        while (i < self.degraded_routes.items.len) {
+            if (self.degraded_routes.items[i].until_ms <= now_ms) {
+                var expired = self.degraded_routes.orderedRemove(i);
+                expired.deinit(self.allocator);
+                continue;
+            }
+            i += 1;
+        }
+    }
+
+    fn findActiveDegradedRoute(self: *Agent, route: config_types.ModelRouteConfig, now_ms: i64) ?*DegradedRoute {
+        self.pruneExpiredDegradedRoutes(now_ms);
+        for (self.degraded_routes.items) |*entry| {
+            if (entry.until_ms > now_ms and degradedRouteMatches(entry, route)) return entry;
+        }
+        return null;
+    }
+
+    fn hasDegradedRouteHint(self: *const Agent, hint: []const u8, now_ms: i64) bool {
+        for (self.model_routes) |route| {
+            if (!std.mem.eql(u8, route.hint, hint)) continue;
+            for (self.degraded_routes.items) |entry| {
+                if (entry.until_ms > now_ms and degradedRouteMatches(&entry, route)) return true;
+            }
+        }
+        return false;
+    }
+
+    fn findUsableModelRouteByHint(self: *Agent, hint: []const u8, now_ms: i64) ?config_types.ModelRouteConfig {
+        self.pruneExpiredDegradedRoutes(now_ms);
+        for (self.model_routes) |route| {
+            if (!std.mem.eql(u8, route.hint, hint)) continue;
+            if (self.findActiveDegradedRoute(route, now_ms) == null) return route;
+        }
+        return null;
+    }
+
+    fn hasUsableModelRouteHint(self: *Agent, hint: []const u8, now_ms: i64) bool {
+        return self.findUsableModelRouteByHint(hint, now_ms) != null;
+    }
+
+    fn routeCostClassLabel(route: config_types.ModelRouteConfig) []const u8 {
+        return @tagName(route.cost_class);
+    }
+
+    fn routeQuotaClassLabel(route: config_types.ModelRouteConfig) []const u8 {
+        return @tagName(route.quota_class);
+    }
+
+    fn routeMetadataScoreNudge(route: config_types.ModelRouteConfig) i32 {
+        const cost_nudge: i32 = switch (route.cost_class) {
+            .free => 8,
+            .cheap => 4,
+            .standard => 0,
+            .premium => -4,
+        };
+        const quota_nudge: i32 = switch (route.quota_class) {
+            .unlimited => 6,
+            .normal => 0,
+            .constrained => -6,
+        };
+        return cost_nudge + quota_nudge;
+    }
+
+    fn routeTiePriority(hint: []const u8) u8 {
+        if (std.mem.eql(u8, hint, "balanced")) return 0;
+        if (std.mem.eql(u8, hint, "fast")) return 1;
+        if (std.mem.eql(u8, hint, "deep")) return 2;
+        if (std.mem.eql(u8, hint, "reasoning")) return 3;
+        if (std.mem.eql(u8, hint, "vision")) return 4;
+        return 255;
+    }
+
+    fn maybePromoteRoute(best: *?RouteSelection, candidate: RouteSelection) void {
+        if (best.*) |current| {
+            if (candidate.score < current.score) return;
+            if (candidate.score == current.score and routeTiePriority(candidate.hint) >= routeTiePriority(current.hint)) {
+                return;
+            }
+        }
+        best.* = candidate;
+    }
+
+    fn firstMatchingKeyword(haystack: []const u8, keywords: []const []const u8) ?[]const u8 {
+        for (keywords) |keyword| {
+            if (containsAsciiIgnoreCase(haystack, keyword)) return keyword;
+        }
+        return null;
+    }
+
+    fn isAmbiguousPrompt(user_message: []const u8) bool {
+        const ambiguous_keywords = [_][]const u8{
+            "what should",
+            "should we",
+            "should i",
+            "what do you think",
+            "thoughts",
+            "advice",
+            "not sure",
+            "unclear",
+        };
+        inline for (ambiguous_keywords) |keyword| {
+            if (containsAsciiIgnoreCase(user_message, keyword)) return true;
+        }
+        return user_message.len <= 220 and std.mem.indexOfScalar(u8, user_message, '?') != null;
+    }
+
+    fn activeDegradedRouteForStatus(
+        self: *const Agent,
+        route: config_types.ModelRouteConfig,
+        now_ms: i64,
+    ) ?*const DegradedRoute {
+        for (self.degraded_routes.items) |*entry| {
+            if (entry.until_ms > now_ms and degradedRouteMatches(entry, route)) return entry;
+        }
+        return null;
+    }
+
+    const RouteSelection = struct {
+        hint: []const u8,
+        route: config_types.ModelRouteConfig,
+        reason: []const u8,
+        matched_keyword: ?[]const u8 = null,
+        score: i32 = 0,
+    };
+
+    const DegradedRoute = struct {
+        hint: []const u8,
+        provider: []const u8,
+        model: []const u8,
+        reason: []u8,
+        until_ms: i64,
+
+        fn deinit(self: *DegradedRoute, allocator: std.mem.Allocator) void {
+            allocator.free(self.reason);
+        }
+    };
+
+    const auto_route_degrade_cooldown_ms: i64 = 5 * 60 * 1000;
+
+    fn routeSelectionForHint(
+        self: *Agent,
+        hint: []const u8,
+        reason: []const u8,
+        matched_keyword: ?[]const u8,
+        score: i32,
+        now_ms: i64,
+    ) ?RouteSelection {
+        const route = self.findUsableModelRouteByHint(hint, now_ms) orelse return null;
+        return .{
+            .hint = hint,
+            .route = route,
+            .reason = reason,
+            .matched_keyword = matched_keyword,
+            .score = score,
+        };
+    }
+
+    fn apiErrorSuggestsQuotaExhaustion(self: *Agent) bool {
+        const detail = providers.snapshotLastApiErrorDetail(self.allocator) catch return false;
+        defer if (detail) |owned| self.allocator.free(owned);
+        const snapshot = detail orelse return false;
+        return providers.reliable.isRateLimited(snapshot) or
+            containsAsciiIgnoreCase(snapshot, "quota") or
+            containsAsciiIgnoreCase(snapshot, "credit") or
+            containsAsciiIgnoreCase(snapshot, "billing") or
+            containsAsciiIgnoreCase(snapshot, "insufficient_quota") or
+            containsAsciiIgnoreCase(snapshot, "out of credits");
+    }
+
+    fn routeShouldBeDegraded(self: *Agent, err: anyerror) bool {
+        if (err == error.RateLimited) return true;
+        const err_name = @errorName(err);
+        if (providers.reliable.isRateLimited(err_name)) return true;
+        return self.apiErrorSuggestsQuotaExhaustion();
+    }
+
+    fn routeDegradeReason(self: *Agent, err: anyerror) ![]u8 {
+        if (try providers.snapshotLastApiErrorDetail(self.allocator)) |detail| {
+            return detail;
+        }
+        return try self.allocator.dupe(u8, @errorName(err));
+    }
+
+    fn markRouteDegraded(self: *Agent, selection: RouteSelection, err: anyerror) !void {
+        if (!self.routeShouldBeDegraded(err)) return;
+        const now_ms = std.time.milliTimestamp();
+        const reason = try self.routeDegradeReason(err);
+        errdefer self.allocator.free(reason);
+
+        if (self.findActiveDegradedRoute(selection.route, now_ms)) |entry| {
+            entry.deinit(self.allocator);
+            entry.reason = reason;
+            entry.until_ms = now_ms + auto_route_degrade_cooldown_ms;
+            return;
+        }
+
+        try self.degraded_routes.append(self.allocator, .{
+            .hint = selection.route.hint,
+            .provider = selection.route.provider,
+            .model = selection.route.model,
+            .reason = reason,
+            .until_ms = now_ms + auto_route_degrade_cooldown_ms,
+        });
+    }
+
+    pub fn clearLastRouteTrace(self: *Agent) void {
+        if (self.last_route_trace) |trace| self.allocator.free(trace);
+        self.last_route_trace = null;
+    }
+
+    fn setLastRouteTrace(self: *Agent, selection: RouteSelection) !void {
+        self.clearLastRouteTrace();
+        const route_ref = try std.fmt.allocPrint(
+            self.allocator,
+            "{s}/{s}",
+            .{ selection.route.provider, selection.route.model },
+        );
+        defer self.allocator.free(route_ref);
+
+        if (selection.matched_keyword) |keyword| {
+            self.last_route_trace = try std.fmt.allocPrint(
+                self.allocator,
+                "{s} -> {s} ({s}: \"{s}\"; score {d})",
+                .{ selection.hint, route_ref, selection.reason, keyword, selection.score },
+            );
+            return;
+        }
+
+        self.last_route_trace = try std.fmt.allocPrint(
+            self.allocator,
+            "{s} -> {s} ({s}; score {d})",
+            .{ selection.hint, route_ref, selection.reason, selection.score },
+        );
+    }
+
+    fn selectRouteHintForTurn(self: *Agent, user_message: []const u8) ?[]const u8 {
+        const selection = self.routeSelectionForTurn(user_message) orelse return null;
+        return selection.hint;
+    }
+
+    fn routeSelectionForTurn(self: *Agent, user_message: []const u8) ?RouteSelection {
+        if (self.model_pinned_by_user or self.model_routes.len == 0) return null;
+        const now_ms = std.time.milliTimestamp();
+
+        if (std.mem.indexOf(u8, user_message, "[IMAGE:") != null and self.hasUsableModelRouteHint("vision", now_ms)) {
+            return self.routeSelectionForHint(
+                "vision",
+                "image input with configured vision route",
+                null,
+                100,
+                now_ms,
+            );
+        }
+
+        const deep_keywords = [_][]const u8{
+            "root cause",
+            "investigate",
+            "compare",
+            "tradeoff",
+            "architecture",
+            "architectural",
+            "refactor",
+            "migration",
+            "migrate",
+            "design",
+            "plan",
+            "debug deeply",
+            "why does",
+            "why is",
+        };
+        const fast_keywords = [_][]const u8{
+            "status",
+            "list",
+            "show",
+            "current",
+            "version",
+            "pwd",
+            "ls",
+            "whoami",
+            "doctor",
+            "health",
+            "check",
+        };
+        const structured_fast_keywords = [_][]const u8{
+            "extract",
+            "count",
+            "classify",
+            "label",
+            "normalize",
+            "convert",
+            "format",
+            "return only",
+            "respond with",
+            "yes or no",
+            "true or false",
+        };
+
+        const deep_keyword = firstMatchingKeyword(user_message, &deep_keywords);
+        const fast_keyword = if (user_message.len <= 120) firstMatchingKeyword(user_message, &fast_keywords) else null;
+        const structured_fast_keyword = if (user_message.len <= 220)
+            firstMatchingKeyword(user_message, &structured_fast_keywords)
+        else
+            null;
+        const long_context = user_message.len > 600 or self.history.items.len >= 24;
+        const ambiguous_prompt = isAmbiguousPrompt(user_message);
+
+        var best: ?RouteSelection = null;
+
+        if (self.findUsableModelRouteByHint("fast", now_ms)) |route| {
+            var fast_score: i32 = 12 + routeMetadataScoreNudge(route);
+            var fast_reason: []const u8 = "fallback fast route";
+            var fast_matched_keyword: ?[]const u8 = null;
+            if (fast_keyword) |keyword| {
+                fast_score += 45;
+                fast_reason = "high-confidence short operational prompt";
+                fast_matched_keyword = keyword;
+            }
+            if (structured_fast_keyword) |keyword| {
+                fast_score += 55;
+                fast_reason = "high-confidence structured prompt";
+                fast_matched_keyword = keyword;
+            }
+            if (long_context) fast_score -= 15;
+            maybePromoteRoute(&best, .{
+                .hint = "fast",
+                .route = route,
+                .reason = fast_reason,
+                .matched_keyword = fast_matched_keyword,
+                .score = fast_score,
+            });
+        }
+
+        if (self.findUsableModelRouteByHint("balanced", now_ms)) |route| {
+            var balanced_score: i32 = 30 + routeMetadataScoreNudge(route);
+            var balanced_reason: []const u8 = "default balanced route";
+            if (ambiguous_prompt) {
+                balanced_score += 12;
+                balanced_reason = "ambiguous prompt kept on balanced route";
+            }
+            if (deep_keyword != null) balanced_score -= 10;
+            if (structured_fast_keyword != null or fast_keyword != null) balanced_score -= 8;
+            maybePromoteRoute(&best, .{
+                .hint = "balanced",
+                .route = route,
+                .reason = balanced_reason,
+                .score = balanced_score,
+            });
+        }
+
+        if (self.findUsableModelRouteByHint("deep", now_ms)) |route| {
+            var deep_score: i32 = 10 + routeMetadataScoreNudge(route);
+            var deep_reason: []const u8 = "fallback deep route";
+            var deep_matched_keyword: ?[]const u8 = null;
+            if (deep_keyword) |keyword| {
+                deep_score += 50;
+                deep_reason = "matched deep-task keyword";
+                deep_matched_keyword = keyword;
+            }
+            if (long_context) {
+                deep_score += 35;
+                if (deep_matched_keyword == null) deep_reason = "long prompt or deep conversation context";
+            }
+            if (user_message.len <= 120 and deep_keyword == null) deep_score -= 4;
+            maybePromoteRoute(&best, .{
+                .hint = "deep",
+                .route = route,
+                .reason = deep_reason,
+                .matched_keyword = deep_matched_keyword,
+                .score = deep_score,
+            });
+        }
+
+        if (self.findUsableModelRouteByHint("reasoning", now_ms)) |route| {
+            var reasoning_score: i32 = 8 + routeMetadataScoreNudge(route);
+            var reasoning_reason: []const u8 = "fallback reasoning route";
+            var reasoning_matched_keyword: ?[]const u8 = null;
+            if (deep_keyword) |keyword| {
+                reasoning_score += 45;
+                reasoning_reason = "matched deep-task keyword";
+                reasoning_matched_keyword = keyword;
+            }
+            if (long_context) {
+                reasoning_score += 30;
+                if (reasoning_matched_keyword == null) reasoning_reason = "long prompt or deep conversation context";
+            }
+            if (user_message.len <= 120 and deep_keyword == null) reasoning_score -= 4;
+            maybePromoteRoute(&best, .{
+                .hint = "reasoning",
+                .route = route,
+                .reason = reasoning_reason,
+                .matched_keyword = reasoning_matched_keyword,
+                .score = reasoning_score,
+            });
+        }
+
+        return best;
+    }
+
+    fn routeModelNameForTurn(self: *Agent, allocator: std.mem.Allocator, user_message: []const u8) !?[]u8 {
+        const selection = self.routeSelectionForTurn(user_message) orelse return null;
+        try self.setLastRouteTrace(selection);
+        return try std.fmt.allocPrint(allocator, "{s}/{s}", .{ selection.route.provider, selection.route.model });
     }
 
     fn isExecToolName(tool_name: []const u8) bool {
@@ -624,6 +1322,60 @@ pub const Agent = struct {
             try w.writeAll(" (no configured fallbacks)");
         }
 
+        try w.writeAll("\nAuto-routing: ");
+        if (self.model_routes.len == 0) {
+            try w.writeAll("not configured");
+        } else {
+            try w.writeAll("configured");
+            if (self.model_pinned_by_user) {
+                try w.writeAll(" (currently pinned off for this session)");
+            }
+            if (self.last_route_trace) |trace| {
+                try w.print("\nLast auto-route: {s}", .{trace});
+            } else if (self.model_pinned_by_user) {
+                try w.writeAll("\nLast auto-route: inactive while the model is pinned");
+            } else {
+                try w.writeAll("\nLast auto-route: no decision recorded yet");
+            }
+        }
+
+        const now_ms = std.time.milliTimestamp();
+        if (self.model_routes.len > 0) {
+            try w.writeAll("\nAuto routes:");
+            for (self.model_routes) |route| {
+                try w.print(
+                    "\n  - {s} -> {s}/{s} (cost={s}, quota={s})",
+                    .{
+                        route.hint,
+                        route.provider,
+                        route.model,
+                        routeCostClassLabel(route),
+                        routeQuotaClassLabel(route),
+                    },
+                );
+                if (self.activeDegradedRouteForStatus(route, now_ms)) |entry| {
+                    const remaining_ms = @max(@as(i64, 0), entry.until_ms - now_ms);
+                    const remaining_secs: u64 = @intCast(@divFloor(remaining_ms + 999, 1000));
+                    try w.print(" [degraded: {s}; {d}s remaining]", .{ entry.reason, remaining_secs });
+                }
+            }
+        }
+
+        var wrote_degraded_routes = false;
+        for (self.degraded_routes.items) |entry| {
+            if (entry.until_ms <= now_ms) continue;
+            if (!wrote_degraded_routes) {
+                try w.writeAll("\nDegraded routes:");
+                wrote_degraded_routes = true;
+            }
+            const remaining_ms = @max(@as(i64, 0), entry.until_ms - now_ms);
+            const remaining_secs: u64 = @intCast(@divFloor(remaining_ms + 999, 1000));
+            try w.print(
+                "\n  - {s} -> {s}/{s} ({s}; {d}s cooldown remaining)",
+                .{ entry.hint, entry.provider, entry.model, entry.reason, remaining_secs },
+            );
+        }
+
         try w.writeAll("\nSwitch: /model <name>");
         return try out.toOwnedSlice(self.allocator);
     }
@@ -634,33 +1386,130 @@ pub const Agent = struct {
         return commands.handleSlashCommand(self, message);
     }
 
+    /// Returns true if `name` matches `pattern` using simple `*` glob.
+    /// `*` matches any sequence of characters (including none).
+    fn globMatch(pattern: []const u8, name: []const u8) bool {
+        // Fast paths
+        if (std.mem.eql(u8, pattern, "*")) return true;
+        const star = std.mem.indexOfScalar(u8, pattern, '*') orelse {
+            return std.mem.eql(u8, pattern, name);
+        };
+        const prefix = pattern[0..star];
+        const suffix = pattern[star + 1 ..];
+        if (!std.mem.startsWith(u8, name, prefix)) return false;
+        if (suffix.len == 0) return true;
+        // suffix must appear at end (handles single-`*` patterns only)
+        if (name.len < prefix.len + suffix.len) return false;
+        return std.mem.endsWith(u8, name, suffix);
+    }
+
+    /// Filter `self.tool_specs` for the current turn based on `tool_filter_groups`.
+    ///
+    /// Returns a slice allocated from `arena` containing only the specs that should
+    /// be included for this turn.  The returned slice borrows pointers from
+    /// `self.tool_specs` — it must NOT outlive `self.tool_specs`.
+    ///
+    /// Rules:
+    ///   - If no filter groups are configured, returns `self.tool_specs` directly (no copy).
+    ///   - A tool whose name does NOT start with "mcp_" is always included.
+    ///   - `always` groups unconditionally include matching MCP tools.
+    ///   - `dynamic` groups include matching MCP tools when the user message contains
+    ///     at least one of the group's keywords (case-insensitive substring match).
+    fn filterToolSpecsForTurn(
+        self: *const Agent,
+        arena: std.mem.Allocator,
+        user_message: []const u8,
+    ) ![]const ToolSpec {
+        if (self.tool_filter_groups.len == 0) return self.tool_specs;
+
+        var result: std.ArrayListUnmanaged(ToolSpec) = .empty;
+
+        for (self.tool_specs) |spec| {
+            // Non-MCP tools are always included.
+            if (!std.mem.startsWith(u8, spec.name, "mcp_")) {
+                try result.append(arena, spec);
+                continue;
+            }
+
+            var include = false;
+            for (self.tool_filter_groups) |group| {
+                // Check if any pattern in this group matches the tool name.
+                var pattern_matched = false;
+                for (group.tools) |pattern| {
+                    if (globMatch(pattern, spec.name)) {
+                        pattern_matched = true;
+                        break;
+                    }
+                }
+                if (!pattern_matched) continue;
+
+                switch (group.mode) {
+                    .always => {
+                        include = true;
+                        break;
+                    },
+                    .dynamic => {
+                        // Case-insensitive ASCII substring match for configured keywords.
+                        for (group.keywords) |kw| {
+                            if (containsAsciiIgnoreCase(user_message, kw)) {
+                                include = true;
+                                break;
+                            }
+                            if (include) break;
+                        }
+                        if (include) break;
+                    },
+                }
+            }
+
+            if (include) try result.append(arena, spec);
+        }
+
+        return result.toOwnedSlice(arena);
+    }
+
     /// Execute a single conversation turn: send messages to LLM, parse tool calls,
     /// execute tools, and loop until a final text response is produced.
     pub fn turn(self: *Agent, user_message: []const u8) ![]const u8 {
         self.context_was_compacted = false;
         commands.refreshSubagentToolContext(self);
 
+        const turn_input = commands.planTurnInput(user_message);
         const effective_user_message = blk: {
-            if (commands.bareSessionResetPrompt(user_message)) |fresh_prompt| {
-                // Preserve slash side-effects (/new|/reset session clear), but route bare command
-                // through a fresh-session prompt instead of returning command text.
-                if (try self.handleSlashCommand(user_message)) |slash_response| {
+            if (turn_input.invoke_local_handler) {
+                const slash_response = (try self.handleSlashCommand(user_message)) orelse return error.SlashCommandDispatchMismatch;
+                if (turn_input.llm_user_message) |llm_user_message| {
+                    // Bare /new and /reset clear session state first, then continue as a fresh LLM turn.
                     self.allocator.free(slash_response);
+                    break :blk llm_user_message;
                 }
-                break :blk fresh_prompt;
+                return slash_response;
             }
-
-            // Handle regular slash commands before sending to LLM (saves tokens).
-            if (try self.handleSlashCommand(user_message)) |response| {
-                return response;
-            }
-            break :blk user_message;
+            break :blk turn_input.llm_user_message orelse user_message;
         };
 
+        const turn_route_selection = self.routeSelectionForTurn(effective_user_message);
+        if (turn_route_selection) |selection| {
+            try self.setLastRouteTrace(selection);
+        }
+        const turn_model_name = if (turn_route_selection) |selection|
+            try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ selection.route.provider, selection.route.model })
+        else
+            self.model_name;
+        const turn_model_name_owned = !std.mem.eql(u8, turn_model_name, self.model_name);
+        defer if (turn_model_name_owned) self.allocator.free(turn_model_name);
+
         // Inject system prompt on first turn (or when tracked workspace files changed).
-        const workspace_fp: ?u64 = prompt.workspacePromptFingerprint(self.allocator, self.workspace_dir) catch null;
+        const workspace_fp: ?u64 = prompt.workspacePromptFingerprint(self.allocator, self.workspace_dir, self.bootstrap) catch null;
         if (self.has_system_prompt and workspace_fp != null and self.workspace_prompt_fingerprint != workspace_fp) {
             self.has_system_prompt = false;
+        }
+        if (self.has_system_prompt) {
+            if (self.system_prompt_model_name) |cached_model| {
+                if (!std.mem.eql(u8, cached_model, turn_model_name)) {
+                    self.has_system_prompt = false;
+                }
+            }
         }
 
         const turn_has_conversation_context = self.conversation_context != null;
@@ -679,22 +1528,14 @@ pub const Agent = struct {
             ) catch null;
             defer if (capabilities_section) |section| self.allocator.free(section);
 
-            const system_prompt = try prompt.buildSystemPrompt(self.allocator, .{
+            const full_system = try prompt.buildSystemPrompt(self.allocator, .{
                 .workspace_dir = self.workspace_dir,
-                .model_name = self.model_name,
+                .model_name = turn_model_name,
                 .tools = self.tools,
                 .capabilities_section = capabilities_section,
                 .conversation_context = self.conversation_context,
+                .bootstrap_provider = self.bootstrap,
             });
-            defer self.allocator.free(system_prompt);
-
-            // Append tool instructions
-            const tool_instructions = try dispatcher.buildToolInstructions(self.allocator, self.tools);
-            defer self.allocator.free(tool_instructions);
-
-            const full_system = try self.allocator.alloc(u8, system_prompt.len + tool_instructions.len);
-            @memcpy(full_system[0..system_prompt.len], system_prompt);
-            @memcpy(full_system[system_prompt.len..], tool_instructions);
 
             // Keep exactly one canonical system prompt at history[0].
             // This allows /model to invalidate and refresh the prompt in place.
@@ -718,6 +1559,8 @@ pub const Agent = struct {
             self.has_system_prompt = true;
             self.system_prompt_has_conversation_context = turn_has_conversation_context;
             self.workspace_prompt_fingerprint = workspace_fp;
+            if (self.system_prompt_model_name) |cached_model| self.allocator.free(cached_model);
+            self.system_prompt_model_name = try self.allocator.dupe(u8, turn_model_name);
         }
 
         // Auto-save user message to memory (nanoTimestamp key to avoid collisions within the same second)
@@ -757,7 +1600,7 @@ pub const Agent = struct {
                 self.history.items[0].content
             else
                 null;
-            const key_hex = cache.ResponseCache.cacheKeyHex(&key_buf, self.model_name, system_prompt, effective_user_message);
+            const key_hex = cache.ResponseCache.cacheKeyHex(&key_buf, turn_model_name, system_prompt, effective_user_message);
             if (rc.get(self.allocator, key_hex) catch null) |cached_response| {
                 errdefer self.allocator.free(cached_response);
                 const history_copy = try self.allocator.dupe(u8, cached_response);
@@ -766,6 +1609,7 @@ pub const Agent = struct {
                     .role = .assistant,
                     .content = history_copy,
                 });
+                self.last_turn_usage = .{};
                 return cached_response;
             }
         }
@@ -773,10 +1617,15 @@ pub const Agent = struct {
         // Record agent event
         const start_event = ObserverEvent{ .llm_request = .{
             .provider = self.provider.getName(),
-            .model = self.model_name,
+            .model = turn_model_name,
             .messages_count = self.history.items.len,
         } };
         self.observer.recordEvent(&start_event);
+
+        const turn_token_limit = context_tokens.resolveContextTokens(self.token_limit_override, turn_model_name);
+        const turn_max_tokens_raw = max_tokens_resolver.resolveMaxTokens(self.max_tokens_override, turn_model_name);
+        const turn_token_limit_cap: u32 = @intCast(@min(turn_token_limit, @as(u64, std.math.maxInt(u32))));
+        const turn_max_tokens = @min(turn_max_tokens_raw, turn_token_limit_cap);
 
         // Tool call loop — reuse a single arena across iterations (retains pages)
         var iter_arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -785,46 +1634,99 @@ pub const Agent = struct {
         var iteration: u32 = 0;
         var forced_follow_through_count: u32 = 0;
         while (iteration < self.max_tool_iterations) : (iteration += 1) {
+            if (self.isInterruptRequested()) {
+                return self.interruptedReply();
+            }
+
             _ = iter_arena.reset(.retain_capacity);
             const arena = iter_arena.allocator();
 
             // Build messages slice for provider (arena-owned; freed at end of iteration)
-            const messages = try self.buildProviderMessages(arena);
+            const messages = try self.buildProviderMessages(arena, turn_model_name);
 
             const timer_start = std.time.milliTimestamp();
-            const is_streaming = self.stream_callback != null and self.provider.supportsStreaming();
+            const is_streaming = self.stream_callback != null and self.stream_ctx != null and self.provider.supportsStreaming();
             const native_tools_enabled = !is_streaming and self.provider.supportsNativeTools();
+
+            // Filter tool specs for this turn (arena-owned; may be self.tool_specs directly if no groups).
+            const turn_tool_specs = try self.filterToolSpecsForTurn(arena, effective_user_message);
+            const request_max_tokens = self.effectiveMaxTokensForTurn(
+                messages,
+                if (native_tools_enabled) turn_tool_specs else null,
+                turn_token_limit,
+                turn_max_tokens,
+            );
 
             // Call provider: streaming (no retries, no native tools) or blocking with retry
             var response: ChatResponse = undefined;
             var response_attempt: u32 = 1;
             if (is_streaming) {
-                self.logLlmRequest(iteration + 1, 1, messages, native_tools_enabled, true);
+                self.logLlmRequest(iteration + 1, 1, turn_model_name, messages, native_tools_enabled, true);
                 const stream_result = self.provider.streamChat(
                     self.allocator,
                     .{
                         .messages = messages,
-                        .model = self.model_name,
+                        .model = turn_model_name,
                         .temperature = self.temperature,
-                        .max_tokens = self.max_tokens,
+                        .max_tokens = request_max_tokens,
                         .tools = null,
                         .timeout_secs = self.message_timeout_secs,
                         .reasoning_effort = self.reasoning_effort,
                     },
-                    self.model_name,
+                    turn_model_name,
                     self.temperature,
                     self.stream_callback.?,
                     self.stream_ctx.?,
-                ) catch |err| {
+                ) catch |err| retry_stream: {
                     const fail_duration: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - timer_start)));
                     const fail_event = ObserverEvent{ .llm_response = .{
                         .provider = self.provider.getName(),
-                        .model = self.model_name,
+                        .model = turn_model_name,
                         .duration_ms = fail_duration,
                         .success = false,
                         .error_message = @errorName(err),
                     } };
                     self.observer.recordEvent(&fail_event);
+
+                    // Auto-disable vision on first "model does not support vision" error
+                    if (self.auto_disable_vision_on_error and err == error.ProviderDoesNotSupportVision) {
+                        if (self.verbose_level == .on or self.verbose_level == .full) {
+                            log.info("Auto-disabling vision for model {s}", .{turn_model_name});
+                        }
+                        try self.markVisionDisabled(turn_model_name);
+                        const retry_msgs = try self.buildProviderMessages(arena, turn_model_name);
+                        const retry_max_tokens = self.effectiveMaxTokensForTurn(
+                            retry_msgs,
+                            if (native_tools_enabled) turn_tool_specs else null,
+                            turn_token_limit,
+                            turn_max_tokens,
+                        );
+                        response_attempt = 2;
+                        self.logLlmRequest(iteration + 1, 2, turn_model_name, retry_msgs, native_tools_enabled, true);
+                        break :retry_stream self.provider.streamChat(
+                            self.allocator,
+                            .{
+                                .messages = retry_msgs,
+                                .model = turn_model_name,
+                                .temperature = self.temperature,
+                                .max_tokens = retry_max_tokens,
+                                .tools = null,
+                                .timeout_secs = self.message_timeout_secs,
+                                .reasoning_effort = self.reasoning_effort,
+                            },
+                            turn_model_name,
+                            self.temperature,
+                            self.stream_callback.?,
+                            self.stream_ctx.?,
+                        ) catch |retry_err| {
+                            if (turn_route_selection) |selection| try self.markRouteDegraded(selection, retry_err);
+                            self.emitUsageFailure(turn_model_name);
+                            return retry_err;
+                        };
+                    }
+
+                    if (turn_route_selection) |selection| try self.markRouteDegraded(selection, err);
+                    self.emitUsageFailure(turn_model_name);
                     return err;
                 };
                 response = ChatResponse{
@@ -834,31 +1736,66 @@ pub const Agent = struct {
                     .model = stream_result.model,
                 };
             } else {
-                self.logLlmRequest(iteration + 1, 1, messages, native_tools_enabled, false);
+                self.logLlmRequest(iteration + 1, 1, turn_model_name, messages, native_tools_enabled, false);
                 response = self.provider.chat(
                     self.allocator,
                     .{
                         .messages = messages,
-                        .model = self.model_name,
+                        .model = turn_model_name,
                         .temperature = self.temperature,
-                        .max_tokens = self.max_tokens,
-                        .tools = if (native_tools_enabled) self.tool_specs else null,
+                        .max_tokens = request_max_tokens,
+                        .tools = if (native_tools_enabled) turn_tool_specs else null,
                         .timeout_secs = self.message_timeout_secs,
                         .reasoning_effort = self.reasoning_effort,
                     },
-                    self.model_name,
+                    turn_model_name,
                     self.temperature,
                 ) catch |err| retry_blk: {
                     // Record the failed attempt
                     const fail_duration: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - timer_start)));
                     const fail_event = ObserverEvent{ .llm_response = .{
                         .provider = self.provider.getName(),
-                        .model = self.model_name,
+                        .model = turn_model_name,
                         .duration_ms = fail_duration,
                         .success = false,
                         .error_message = @errorName(err),
                     } };
                     self.observer.recordEvent(&fail_event);
+
+                    // Auto-disable vision on first "model does not support vision" error
+                    if (self.auto_disable_vision_on_error and err == error.ProviderDoesNotSupportVision) {
+                        if (self.verbose_level == .on or self.verbose_level == .full) {
+                            log.info("Auto-disabling vision for model {s}", .{turn_model_name});
+                        }
+                        try self.markVisionDisabled(turn_model_name);
+                        const retry_msgs = try self.buildProviderMessages(arena, turn_model_name);
+                        const retry_max_tokens = self.effectiveMaxTokensForTurn(
+                            retry_msgs,
+                            if (native_tools_enabled) turn_tool_specs else null,
+                            turn_token_limit,
+                            turn_max_tokens,
+                        );
+                        response_attempt = 2;
+                        self.logLlmRequest(iteration + 1, 2, turn_model_name, retry_msgs, native_tools_enabled, false);
+                        break :retry_blk self.provider.chat(
+                            self.allocator,
+                            .{
+                                .messages = retry_msgs,
+                                .model = turn_model_name,
+                                .temperature = self.temperature,
+                                .max_tokens = retry_max_tokens,
+                                .tools = if (native_tools_enabled) turn_tool_specs else null,
+                                .timeout_secs = self.message_timeout_secs,
+                                .reasoning_effort = self.reasoning_effort,
+                            },
+                            turn_model_name,
+                            self.temperature,
+                        ) catch |retry_err| {
+                            if (turn_route_selection) |selection| try self.markRouteDegraded(selection, retry_err);
+                            self.emitUsageFailure(turn_model_name);
+                            return retry_err;
+                        };
+                    }
 
                     // Context exhaustion: compact immediately before first retry
                     const err_name = @errorName(err);
@@ -867,65 +1804,87 @@ pub const Agent = struct {
                         self.forceCompressHistory())
                     {
                         self.context_was_compacted = true;
-                        const recovery_msgs = self.buildProviderMessages(arena) catch |prep_err| return prep_err;
+                        const recovery_msgs = self.buildProviderMessages(arena, turn_model_name) catch |prep_err| return prep_err;
+                        const recovery_max_tokens = self.effectiveMaxTokensForTurn(
+                            recovery_msgs,
+                            if (native_tools_enabled) turn_tool_specs else null,
+                            turn_token_limit,
+                            turn_max_tokens,
+                        );
                         response_attempt = 2;
-                        self.logLlmRequest(iteration + 1, 2, recovery_msgs, native_tools_enabled, false);
+                        self.logLlmRequest(iteration + 1, 2, turn_model_name, recovery_msgs, native_tools_enabled, false);
                         break :retry_blk self.provider.chat(
                             self.allocator,
                             .{
                                 .messages = recovery_msgs,
-                                .model = self.model_name,
+                                .model = turn_model_name,
                                 .temperature = self.temperature,
-                                .max_tokens = self.max_tokens,
-                                .tools = if (native_tools_enabled) self.tool_specs else null,
+                                .max_tokens = recovery_max_tokens,
+                                .tools = if (native_tools_enabled) turn_tool_specs else null,
                                 .timeout_secs = self.message_timeout_secs,
                                 .reasoning_effort = self.reasoning_effort,
                             },
-                            self.model_name,
+                            turn_model_name,
                             self.temperature,
-                        ) catch return err;
+                        ) catch |retry_after_compact_err| {
+                            if (turn_route_selection) |selection| try self.markRouteDegraded(selection, retry_after_compact_err);
+                            self.emitUsageFailure(turn_model_name);
+                            return retry_after_compact_err;
+                        };
                     }
 
                     // Retry once
                     std.Thread.sleep(500 * std.time.ns_per_ms);
                     response_attempt = 2;
-                    self.logLlmRequest(iteration + 1, 2, messages, native_tools_enabled, false);
+                    self.logLlmRequest(iteration + 1, 2, turn_model_name, messages, native_tools_enabled, false);
                     break :retry_blk self.provider.chat(
                         self.allocator,
                         .{
                             .messages = messages,
-                            .model = self.model_name,
+                            .model = turn_model_name,
                             .temperature = self.temperature,
-                            .max_tokens = self.max_tokens,
-                            .tools = if (native_tools_enabled) self.tool_specs else null,
+                            .max_tokens = request_max_tokens,
+                            .tools = if (native_tools_enabled) turn_tool_specs else null,
                             .timeout_secs = self.message_timeout_secs,
                             .reasoning_effort = self.reasoning_effort,
                         },
-                        self.model_name,
+                        turn_model_name,
                         self.temperature,
                     ) catch |retry_err| {
                         // Context exhaustion recovery: if we have enough history,
                         // force-compress and retry once more
                         if (self.history.items.len > compaction.CONTEXT_RECOVERY_MIN_HISTORY and self.forceCompressHistory()) {
                             self.context_was_compacted = true;
-                            const recovery_msgs = self.buildProviderMessages(arena) catch |prep_err| return prep_err;
+                            const recovery_msgs = self.buildProviderMessages(arena, turn_model_name) catch |prep_err| return prep_err;
+                            const recovery_max_tokens = self.effectiveMaxTokensForTurn(
+                                recovery_msgs,
+                                if (native_tools_enabled) turn_tool_specs else null,
+                                turn_token_limit,
+                                turn_max_tokens,
+                            );
                             response_attempt = 3;
-                            self.logLlmRequest(iteration + 1, 3, recovery_msgs, native_tools_enabled, false);
+                            self.logLlmRequest(iteration + 1, 3, turn_model_name, recovery_msgs, native_tools_enabled, false);
                             break :retry_blk self.provider.chat(
                                 self.allocator,
                                 .{
                                     .messages = recovery_msgs,
-                                    .model = self.model_name,
+                                    .model = turn_model_name,
                                     .temperature = self.temperature,
-                                    .max_tokens = self.max_tokens,
-                                    .tools = if (native_tools_enabled) self.tool_specs else null,
+                                    .max_tokens = recovery_max_tokens,
+                                    .tools = if (native_tools_enabled) turn_tool_specs else null,
                                     .timeout_secs = self.message_timeout_secs,
                                     .reasoning_effort = self.reasoning_effort,
                                 },
-                                self.model_name,
+                                turn_model_name,
                                 self.temperature,
-                            ) catch return retry_err;
+                            ) catch |retry_after_compact_err| {
+                                if (turn_route_selection) |selection| try self.markRouteDegraded(selection, retry_after_compact_err);
+                                self.emitUsageFailure(turn_model_name);
+                                return retry_after_compact_err;
+                            };
                         }
+                        if (turn_route_selection) |selection| try self.markRouteDegraded(selection, retry_err);
+                        self.emitUsageFailure(turn_model_name);
                         return retry_err;
                     };
                 };
@@ -935,18 +1894,32 @@ pub const Agent = struct {
             const duration_ms: u64 = @as(u64, @intCast(@max(0, std.time.milliTimestamp() - timer_start)));
             const resp_event = ObserverEvent{ .llm_response = .{
                 .provider = self.provider.getName(),
-                .model = self.model_name,
+                .model = turn_model_name,
                 .duration_ms = duration_ms,
                 .success = true,
                 .error_message = null,
             } };
             self.observer.recordEvent(&resp_event);
 
-            // Track tokens
-            self.total_tokens += response.usage.total_tokens;
-            self.last_turn_usage = response.usage;
-
             const response_text = response.contentOrEmpty();
+
+            // Track tokens with provider-agnostic fallback when total is omitted.
+            var normalized_usage = response.usage;
+            if (normalized_usage.total_tokens == 0 and
+                (normalized_usage.prompt_tokens > 0 or normalized_usage.completion_tokens > 0))
+            {
+                normalized_usage.total_tokens = normalized_usage.prompt_tokens +| normalized_usage.completion_tokens;
+            }
+            // Some providers/channels omit usage entirely; keep status counters useful.
+            if (normalized_usage.total_tokens == 0 and normalized_usage.prompt_tokens == 0 and normalized_usage.completion_tokens == 0 and response_text.len > 0) {
+                normalized_usage.completion_tokens = estimate_text_tokens(response_text);
+                normalized_usage.total_tokens = normalized_usage.completion_tokens;
+            }
+            response.usage = normalized_usage;
+
+            self.total_tokens += normalized_usage.total_tokens;
+            self.last_turn_usage = normalized_usage;
+            self.emitUsageRecord(&response, true);
             const use_native = response.hasToolCalls();
 
             // Determine tool calls: structured (native) first, then XML fallback.
@@ -1004,12 +1977,16 @@ pub const Agent = struct {
                 free_parsed_calls = true;
                 parsed_text = xml_parsed.text;
                 free_parsed_text = true;
-                // For XML path, store the raw response text as history
-                assistant_history_content = response_text;
+                // For XML path, never preserve model-fabricated <tool_result> markup in history.
+                assistant_history_content = try dispatcher.stripToolResultMarkup(self.allocator, response_text);
+                free_assistant_history = true;
             }
 
-            // Determine display text
-            const display_text = if (parsed_text.len > 0) parsed_text else response_text;
+            // Determine display text.
+            // When tool calls are present, only show parsed plain text (if any).
+            // Never fall back to raw response_text here, otherwise markup like
+            // <tool_call>...</tool_call> can leak to users.
+            const display_text = selectDisplayText(response_text, parsed_text, parsed_calls.len);
 
             if (parsed_calls.len == 0) {
                 // Guardrail: if the model promises "I'll try/check now" but emits no
@@ -1099,9 +2076,9 @@ pub const Agent = struct {
                         self.history.items[0].content
                     else
                         null;
-                    const store_key_hex = cache.ResponseCache.cacheKeyHex(&store_key_buf, self.model_name, sys_prompt, effective_user_message);
+                    const store_key_hex = cache.ResponseCache.cacheKeyHex(&store_key_buf, turn_model_name, sys_prompt, effective_user_message);
                     const token_count: u32 = @intCast(@min(self.last_turn_usage.total_tokens, std.math.maxInt(u32)));
-                    rc.put(self.allocator, store_key_hex, self.model_name, final_text, token_count) catch {};
+                    rc.put(self.allocator, store_key_hex, turn_model_name, final_text, token_count) catch {};
                 }
 
                 return final_text;
@@ -1145,6 +2122,11 @@ pub const Agent = struct {
             }
 
             for (parsed_calls, 0..) |call, idx| {
+                if (self.isInterruptRequested()) {
+                    self.freeResponseFields(&response);
+                    return self.interruptedReply();
+                }
+
                 if (self.log_tool_calls) {
                     log.info(
                         "tool-call start session=0x{x} index={d} name={s} id={s}",
@@ -1178,6 +2160,7 @@ pub const Agent = struct {
                     .tool = call.name,
                     .duration_ms = tool_duration,
                     .success = result.success,
+                    .detail = if (result.success) null else result.output,
                 } };
                 self.observer.recordEvent(&tool_event);
 
@@ -1228,15 +2211,16 @@ pub const Agent = struct {
             return fallback;
         };
         defer self.allocator.free(summary_messages);
+        const summary_max_tokens = self.effectiveMaxTokensForMessages(summary_messages, false);
 
-        self.logLlmRequest(self.max_tool_iterations + 1, 1, summary_messages, false, false);
+        self.logLlmRequest(self.max_tool_iterations + 1, 1, self.model_name, summary_messages, false, false);
         var summary_response = self.provider.chat(
             self.allocator,
             .{
                 .messages = summary_messages,
                 .model = self.model_name,
                 .temperature = self.temperature,
-                .max_tokens = self.max_tokens,
+                .max_tokens = summary_max_tokens,
                 .tools = null, // force text-only
                 .timeout_secs = self.message_timeout_secs,
                 .reasoning_effort = self.reasoning_effort,
@@ -1356,6 +2340,15 @@ pub const Agent = struct {
     }
 
     fn executeTool(self: *Agent, tool_allocator: std.mem.Allocator, call: ParsedToolCall) ToolExecutionResult {
+        if (self.isInterruptRequested()) {
+            return .{
+                .name = call.name,
+                .output = "Interrupted by /stop",
+                .success = false,
+                .tool_call_id = call.tool_call_id,
+            };
+        }
+
         // Policy gate: check autonomy and rate limit
         if (self.policy) |pol| {
             if (!pol.canAct()) {
@@ -1377,8 +2370,10 @@ pub const Agent = struct {
             }
         }
 
+        const trimmed_call_name = std.mem.trim(u8, call.name, " \t\r\n");
+
         for (self.tools) |t| {
-            if (std.mem.eql(u8, t.name(), call.name)) {
+            if (std.ascii.eqlIgnoreCase(t.name(), trimmed_call_name)) {
                 // Parse arguments JSON to ObjectMap ONCE
                 const parsed = std.json.parseFromSlice(
                     std.json.Value,
@@ -1418,7 +2413,16 @@ pub const Agent = struct {
                     }
                 }
 
+                self.setActiveToolName(trimmed_call_name) catch {};
+                defer self.clearActiveToolName();
+                tools_mod.process_util.setThreadInterruptFlag(&self.interrupt_requested);
+                defer tools_mod.process_util.setThreadInterruptFlag(null);
+                @import("../http_util.zig").setThreadInterruptFlag(&self.interrupt_requested);
+                defer @import("../http_util.zig").setThreadInterruptFlag(null);
                 const result = t.execute(tool_allocator, args) catch |err| {
+                    if (verbose_mod.isVerbose()) {
+                        log.info("tool result: name={s} error={s}", .{ call.name, @errorName(err) });
+                    }
                     return .{
                         .name = call.name,
                         .output = @errorName(err),
@@ -1426,6 +2430,16 @@ pub const Agent = struct {
                         .tool_call_id = call.tool_call_id,
                     };
                 };
+                const was_interrupted = !result.success and
+                    ((result.error_msg != null and std.mem.indexOf(u8, result.error_msg.?, "Interrupted by /stop") != null) or
+                        std.mem.indexOf(u8, result.output, "Interrupted by /stop") != null);
+                if (was_interrupted) {
+                    self.noteInterruptedTool(trimmed_call_name) catch {};
+                }
+                if (verbose_mod.isVerbose()) {
+                    const output_preview = if (result.output.len > 256) result.output[0..256] else result.output;
+                    log.info("tool result: name={s} success={} output_len={d} output={s}...", .{ call.name, result.success, result.output.len, output_preview });
+                }
                 return .{
                     .name = call.name,
                     .output = if (result.success) result.output else (result.error_msg orelse result.output),
@@ -1452,7 +2466,15 @@ pub const Agent = struct {
         return .{ .slice = text[0..LLM_LOG_MAX_BYTES], .truncated = true };
     }
 
-    fn logLlmRequest(self: *Agent, iteration: u32, attempt: u32, messages: []const ChatMessage, native_tools_enabled: bool, is_streaming: bool) void {
+    fn logLlmRequest(
+        self: *Agent,
+        iteration: u32,
+        attempt: u32,
+        model_name: []const u8,
+        messages: []const ChatMessage,
+        native_tools_enabled: bool,
+        is_streaming: bool,
+    ) void {
         if (!self.log_llm_io) return;
         const session_hash: u64 = if (self.memory_session_id) |sid| std.hash.Wyhash.hash(0, sid) else 0;
         log.info(
@@ -1462,7 +2484,7 @@ pub const Agent = struct {
                 iteration,
                 attempt,
                 self.provider.getName(),
-                self.model_name,
+                model_name,
                 messages.len,
                 native_tools_enabled,
                 is_streaming,
@@ -1482,7 +2504,7 @@ pub const Agent = struct {
                     msg.content.len,
                     parts_count,
                     std.json.fmt(preview.slice, .{}),
-                    if (preview.truncated) " [truncated]" else "",
+                    if (preview.truncated) " [log preview truncated]" else "",
                 },
             );
         }
@@ -1494,17 +2516,18 @@ pub const Agent = struct {
         const content = response.contentOrEmpty();
         const preview = llmLogPreview(content);
         log.info(
-            "llm response session=0x{x} iter={d} attempt={d} model={s} bytes={d} tool_calls={d} usage={f} content={f}{s}",
+            "llm response session=0x{x} iter={d} attempt={d} provider={s} model={s} bytes={d} tool_calls={d} usage={f} content={f}{s}",
             .{
                 session_hash,
                 iteration,
                 attempt,
-                if (response.model.len > 0) response.model else self.model_name,
+                self.effectiveProvider(response),
+                self.effectiveModel(response),
                 content.len,
                 response.tool_calls.len,
                 std.json.fmt(response.usage, .{}),
                 std.json.fmt(preview.slice, .{}),
-                if (preview.truncated) " [truncated]" else "",
+                if (preview.truncated) " [log preview truncated]" else "",
             },
         );
 
@@ -1518,7 +2541,7 @@ pub const Agent = struct {
                     attempt,
                     reasoning.len,
                     std.json.fmt(r_preview.slice, .{}),
-                    if (r_preview.truncated) " [truncated]" else "",
+                    if (r_preview.truncated) " [log preview truncated]" else "",
                 },
             );
         }
@@ -1535,23 +2558,94 @@ pub const Agent = struct {
                     if (tc.id.len > 0) tc.id else "-",
                     tc.name,
                     std.json.fmt(args_preview.slice, .{}),
-                    if (args_preview.truncated) " [truncated]" else "",
+                    if (args_preview.truncated) " [log preview truncated]" else "",
                 },
             );
         }
     }
 
+    fn effectiveProvider(self: *const Agent, response: *const ChatResponse) []const u8 {
+        if (response.provider.len > 0) return response.provider;
+        return self.provider.getName();
+    }
+
+    fn effectiveModel(self: *const Agent, response: *const ChatResponse) []const u8 {
+        if (response.model.len > 0) return response.model;
+        return self.model_name;
+    }
+
+    fn emitUsageRecord(self: *Agent, response: *const ChatResponse, success: bool) void {
+        const cb = self.usage_record_callback orelse return;
+        const ctx = self.usage_record_ctx orelse return;
+        cb(ctx, .{
+            .ts = std.time.timestamp(),
+            .provider = self.effectiveProvider(response),
+            .model = self.effectiveModel(response),
+            .usage = response.usage,
+            .success = success,
+        });
+    }
+
+    fn emitUsageFailure(self: *Agent, model_name: []const u8) void {
+        const failed = ChatResponse{
+            .model = model_name,
+            .usage = .{},
+        };
+        self.emitUsageRecord(&failed, false);
+    }
+
+    /// Check if vision is disabled for current model (either configured or auto-detected).
+    fn isVisionDisabled(self: *const Agent, model_name: []const u8) bool {
+        for (self.vision_disabled_models) |model| {
+            if (std.mem.eql(u8, model, model_name)) return true;
+        }
+        for (self.detected_vision_disabled.items) |model| {
+            if (std.mem.eql(u8, model, model_name)) return true;
+        }
+        return false;
+    }
+
+    /// Add model to detected vision disabled list if not already present.
+    fn markVisionDisabled(self: *Agent, model_name: []const u8) !void {
+        const already_disabled = for (self.detected_vision_disabled.items) |model| {
+            if (std.mem.eql(u8, model, model_name)) break true;
+        } else false;
+        if (!already_disabled) {
+            try self.detected_vision_disabled.append(self.allocator, try self.allocator.dupe(u8, model_name));
+        }
+    }
+
     /// Build provider-ready ChatMessage slice from owned history.
     /// Applies multimodal preprocessing and vision capability checks.
-    fn buildProviderMessages(self: *Agent, arena: std.mem.Allocator) ![]ChatMessage {
+    fn buildProviderMessages(self: *Agent, arena: std.mem.Allocator, model_name: []const u8) ![]ChatMessage {
         const m = try arena.alloc(ChatMessage, self.history.items.len);
         for (self.history.items, 0..) |*msg, i| {
             m[i] = msg.toChatMessage();
         }
 
         const image_marker_count = multimodal.countImageMarkersInLastUser(m);
-        if (image_marker_count > 0 and !self.provider.supportsVisionForModel(self.model_name)) {
-            return error.ProviderDoesNotSupportVision;
+        if (image_marker_count == 0) {
+            return m;
+        }
+
+        // Check if vision is disabled (configured or auto-detected)
+        if (self.isVisionDisabled(model_name)) {
+            if (self.verbose_level == .on or self.verbose_level == .full) {
+                log.info("Vision disabled for model {s}, stripping image markers", .{model_name});
+            }
+            return multimodal.stripImageMarkers(arena, m);
+        }
+
+        // Check if provider supports vision for this model
+        if (!self.provider.supportsVisionForModel(model_name)) {
+            if (self.verbose_level == .on or self.verbose_level == .full) {
+                log.info("Model {s} does not support vision, stripping image markers", .{model_name});
+            }
+            // Auto-disable vision if configured
+            if (self.auto_disable_vision_on_error) {
+                try self.markVisionDisabled(model_name);
+            }
+            return multimodal.stripImageMarkers(arena, m);
         }
 
         // Allow local multimodal reads from:
@@ -1570,6 +2664,8 @@ pub const Agent = struct {
 
         return multimodal.prepareMessagesForProvider(arena, m, .{
             .allowed_dirs = allowed,
+            .skip_dir_check = self.multimodal_unrestricted,
+            .allow_remote_fetch = self.multimodal_unrestricted,
         });
     }
 
@@ -1621,6 +2717,7 @@ pub const Agent = struct {
             if (tc.arguments.len > 0) self.allocator.free(tc.arguments);
         }
         if (resp.tool_calls.len > 0) self.allocator.free(resp.tool_calls);
+        if (resp.provider.len > 0) self.allocator.free(resp.provider);
         if (resp.model.len > 0) self.allocator.free(resp.model);
         if (resp.reasoning_content) |rc| {
             if (rc.len > 0) self.allocator.free(rc);
@@ -1628,6 +2725,7 @@ pub const Agent = struct {
         // Mark as consumed to prevent double-free
         resp.content = null;
         resp.tool_calls = &.{};
+        resp.provider = "";
         resp.model = "";
         resp.reasoning_content = null;
     }
@@ -1831,7 +2929,6 @@ test "dispatcher module reexport" {
     _ = dispatcher.ToolExecutionResult;
     _ = dispatcher.parseToolCalls;
     _ = dispatcher.formatToolResults;
-    _ = dispatcher.buildToolInstructions;
     _ = dispatcher.buildAssistantHistoryWithToolCalls;
 }
 
@@ -2162,10 +3259,14 @@ test "Agent buildProviderMessages uses model-aware vision capability" {
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
 
-    try std.testing.expectError(error.ProviderDoesNotSupportVision, agent.buildProviderMessages(arena));
+    const text_model_messages = try agent.buildProviderMessages(arena, agent.model_name);
+    try std.testing.expectEqual(@as(usize, 1), text_model_messages.len);
+    try std.testing.expect(text_model_messages[0].content_parts == null);
+    try std.testing.expect(std.mem.indexOf(u8, text_model_messages[0].content, "[IMAGE:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text_model_messages[0].content, "omitted because the current model does not support vision") != null);
 
     agent.model_name = "vision-model";
-    const messages = try agent.buildProviderMessages(arena);
+    const messages = try agent.buildProviderMessages(arena, agent.model_name);
     try std.testing.expectEqual(@as(usize, 1), messages.len);
     try std.testing.expect(messages[0].content_parts != null);
 }
@@ -2246,7 +3347,7 @@ test "Agent buildProviderMessages allows workspace image paths" {
     var arena_impl = std.heap.ArenaAllocator.init(allocator);
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
-    const messages = try agent.buildProviderMessages(arena);
+    const messages = try agent.buildProviderMessages(arena, agent.model_name);
 
     try std.testing.expectEqual(@as(usize, 1), messages.len);
     try std.testing.expect(messages[0].content_parts != null);
@@ -2351,10 +3452,43 @@ test "Agent clearHistory then add messages" {
 // ── Slash Command Tests ──────────────────────────────────────────
 
 fn makeTestAgent(allocator: std.mem.Allocator) !Agent {
+    const DummyProvider = struct {
+        fn chatWithSystem(_: *anyopaque, allocator_: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator_.dupe(u8, "");
+        }
+
+        fn chat(_: *anyopaque, allocator_: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return .{
+                .content = try allocator_.dupe(u8, "ok"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator_.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "dummy-test-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const dummy_vtable = Provider.VTable{
+        .chatWithSystem = DummyProvider.chatWithSystem,
+        .chat = DummyProvider.chat,
+        .supportsNativeTools = DummyProvider.supportsNativeTools,
+        .getName = DummyProvider.getName,
+        .deinit = DummyProvider.deinitFn,
+    };
+
     var noop = observability.NoopObserver{};
     return Agent{
         .allocator = allocator,
-        .provider = undefined,
+        .provider = .{ .ptr = @ptrFromInt(1), .vtable = &dummy_vtable },
         .tools = &.{},
         .tool_specs = try allocator.alloc(ToolSpec, 0),
         .mem = null,
@@ -2436,6 +3570,274 @@ test "Agent.fromConfig resolves max_tokens from provider lookup when unset" {
     try std.testing.expect(agent.max_tokens_override == null);
 }
 
+test "Agent.fromConfig resolves conservative limits for legacy gpt-4" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "openai/gpt-4",
+        .allocator = allocator,
+    };
+    cfg.max_tokens = null;
+    cfg.agent.token_limit = config_types.DEFAULT_AGENT_TOKEN_LIMIT;
+    cfg.agent.token_limit_explicit = false;
+
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfig(allocator, &cfg, undefined, &.{}, null, noop.observer());
+    defer agent.deinit();
+
+    try std.testing.expectEqual(@as(u64, 8_192), agent.token_limit);
+    try std.testing.expectEqual(@as(u32, 4_096), agent.max_tokens);
+}
+
+test "Agent effective max_tokens reserves prompt headroom" {
+    const allocator = std.testing.allocator;
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "openai/gpt-4",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 10,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .token_limit = 8_192,
+        .max_tokens = 4_096,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    const large_system = try allocator.alloc(u8, 28_000);
+    defer allocator.free(large_system);
+    @memset(large_system, 'a');
+
+    const messages = [_]ChatMessage{
+        .{ .role = .system, .content = large_system },
+        .{ .role = .user, .content = "how are you?" },
+    };
+    const capped = agent.effectiveMaxTokensForMessages(&messages, false);
+    try std.testing.expect(capped < agent.max_tokens);
+    try std.testing.expect(capped > 0);
+}
+
+test "Agent effective max_tokens does not double count plain content with content_parts" {
+    const allocator = std.testing.allocator;
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "openai/gpt-4",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 10,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .token_limit = 1_000,
+        .max_tokens = 512,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    const long_text = try allocator.alloc(u8, 2_000);
+    defer allocator.free(long_text);
+    @memset(long_text, 'a');
+
+    const parts = [_]providers.ContentPart{
+        .{ .text = long_text },
+    };
+    const messages = [_]ChatMessage{
+        .{
+            .role = .user,
+            .content = long_text,
+            .content_parts = &parts,
+        },
+    };
+
+    const capped = agent.effectiveMaxTokensForMessages(&messages, false);
+    try std.testing.expect(capped > 1);
+}
+
+test "Agent effective max_tokens scales with image_base64 size" {
+    const allocator = std.testing.allocator;
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "openai/gpt-4",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 10,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .token_limit = 4_000,
+        .max_tokens = 2_000,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    const small_base64 = try allocator.alloc(u8, 120);
+    defer allocator.free(small_base64);
+    @memset(small_base64, 'a');
+
+    const large_base64 = try allocator.alloc(u8, 12_000);
+    defer allocator.free(large_base64);
+    @memset(large_base64, 'b');
+
+    const small_parts = [_]providers.ContentPart{
+        .{ .text = "describe this image" },
+        .{ .image_base64 = .{ .data = small_base64, .media_type = "image/png" } },
+    };
+    const large_parts = [_]providers.ContentPart{
+        .{ .text = "describe this image" },
+        .{ .image_base64 = .{ .data = large_base64, .media_type = "image/png" } },
+    };
+
+    const small_messages = [_]ChatMessage{
+        .{
+            .role = .user,
+            .content = "describe this image",
+            .content_parts = &small_parts,
+        },
+    };
+    const large_messages = [_]ChatMessage{
+        .{
+            .role = .user,
+            .content = "describe this image",
+            .content_parts = &large_parts,
+        },
+    };
+
+    const capped_small = agent.effectiveMaxTokensForMessages(&small_messages, false);
+    const capped_large = agent.effectiveMaxTokensForMessages(&large_messages, false);
+    try std.testing.expect(capped_large < capped_small);
+}
+
+test "Agent effective max_tokens accounts for native tool schema overhead" {
+    const allocator = std.testing.allocator;
+
+    var noop = observability.NoopObserver{};
+    const tool_specs = try allocator.alloc(ToolSpec, 2);
+
+    var params_a: [2_000]u8 = undefined;
+    @memset(params_a[0..], 'a');
+    var params_b: [2_000]u8 = undefined;
+    @memset(params_b[0..], 'b');
+
+    tool_specs[0] = .{
+        .name = "file_write",
+        .description = "Write file content",
+        .parameters_json = params_a[0..],
+    };
+    tool_specs[1] = .{
+        .name = "file_edit",
+        .description = "Edit file content",
+        .parameters_json = params_b[0..],
+    };
+
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{},
+        .tool_specs = tool_specs,
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "openai/gpt-4",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 10,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .token_limit = 2_000,
+        .max_tokens = 1_000,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    const messages = [_]ChatMessage{
+        .{ .role = .user, .content = "hello" },
+    };
+
+    const without_tools = agent.effectiveMaxTokensForMessages(&messages, false);
+    const with_tools = agent.effectiveMaxTokensForMessages(&messages, true);
+    try std.testing.expect(with_tools < without_tools);
+}
+
+test "Agent effective max_tokens can estimate using filtered tool schemas" {
+    const allocator = std.testing.allocator;
+
+    var noop = observability.NoopObserver{};
+    const tool_specs = try allocator.alloc(ToolSpec, 2);
+
+    var params_a: [3_000]u8 = undefined;
+    @memset(params_a[0..], 'a');
+    var params_b: [3_000]u8 = undefined;
+    @memset(params_b[0..], 'b');
+
+    tool_specs[0] = .{
+        .name = "mcp_vikunja_list_tasks",
+        .description = "List tasks",
+        .parameters_json = params_a[0..],
+    };
+    tool_specs[1] = .{
+        .name = "mcp_browser_open",
+        .description = "Open browser",
+        .parameters_json = params_b[0..],
+    };
+
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = undefined,
+        .tools = &.{},
+        .tool_specs = tool_specs,
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "openai/gpt-4",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 10,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .token_limit = 2_200,
+        .max_tokens = 1_000,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    const messages = [_]ChatMessage{
+        .{ .role = .user, .content = "show my tasks" },
+    };
+
+    const with_all_tools = agent.effectiveMaxTokensForMessagesWithToolSpecs(&messages, tool_specs);
+    const with_filtered_tools = agent.effectiveMaxTokensForMessagesWithToolSpecs(&messages, tool_specs[0..1]);
+    try std.testing.expect(with_filtered_tools > with_all_tools);
+}
+
 test "Agent.fromConfig keeps explicit max_tokens override" {
     const allocator = std.testing.allocator;
     var cfg = Config{
@@ -2474,6 +3876,23 @@ test "Agent.fromConfig clamps max_tokens to token_limit" {
     try std.testing.expectEqual(@as(u32, 4096), agent.max_tokens);
 }
 
+test "Agent.fromConfig applies status_show_emojis flag" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "openai/gpt-4.1-mini",
+        .allocator = allocator,
+    };
+    cfg.agent.status_show_emojis = false;
+
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfig(allocator, &cfg, undefined, &.{}, null, noop.observer());
+    defer agent.deinit();
+
+    try std.testing.expect(!agent.status_show_emojis);
+}
+
 test "slash /new clears history" {
     const allocator = std.testing.allocator;
     var agent = try makeTestAgent(allocator);
@@ -2489,6 +3908,8 @@ test "slash /new clears history" {
         .content = try allocator.dupe(u8, "hello"),
     });
     agent.has_system_prompt = true;
+    agent.total_tokens = 42;
+    agent.last_turn_usage = .{ .prompt_tokens = 10, .completion_tokens = 5, .total_tokens = 15 };
 
     const response = (try agent.handleSlashCommand("/new")).?;
     defer allocator.free(response);
@@ -2496,6 +3917,8 @@ test "slash /new clears history" {
     try std.testing.expectEqualStrings("Session cleared.", response);
     try std.testing.expectEqual(@as(usize, 0), agent.historyLen());
     try std.testing.expect(!agent.has_system_prompt);
+    try std.testing.expectEqual(@as(u64, 0), agent.total_tokens);
+    try std.testing.expectEqual(@as(u32, 0), agent.last_turn_usage.total_tokens);
 }
 
 test "slash /reset clears history and switches model" {
@@ -2704,8 +4127,24 @@ test "slash /status returns agent info" {
     const response = (try agent.handleSlashCommand("/status")).?;
     defer allocator.free(response);
 
+    try std.testing.expect(std.mem.indexOf(u8, response, "🌊 NullClaw ") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "test-model") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "42") != null);
+}
+
+test "slash /status can render without emojis" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.status_show_emojis = false;
+
+    const response = (try agent.handleSlashCommand("/status")).?;
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "🌊") == null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "NullClaw") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "Model:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "🧠") == null);
 }
 
 test "slash /whoami returns current session id" {
@@ -2798,6 +4237,307 @@ test "slash /model keeps explicit token_limit override" {
     try std.testing.expect(std.mem.indexOf(u8, response, "claude-opus-4-6") != null);
     try std.testing.expectEqual(@as(u64, 64_000), agent.token_limit);
     try std.testing.expectEqual(@as(u32, 1024), agent.max_tokens);
+}
+
+test "auto route selects provider-prefixed model ref for fast prompt" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.model_routes = &.{
+        .{ .hint = "fast", .provider = "groq", .model = "llama-3.3-70b" },
+        .{ .hint = "balanced", .provider = "openrouter", .model = "anthropic/claude-sonnet-4" },
+    };
+
+    const routed = (try agent.routeModelNameForTurn(allocator, "show current status")).?;
+    defer allocator.free(routed);
+
+    try std.testing.expectEqualStrings("groq/llama-3.3-70b", routed);
+}
+
+test "auto route selects fast model for short structured prompt" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.model_routes = &.{
+        .{ .hint = "fast", .provider = "groq", .model = "llama-3.3-8b", .cost_class = .free, .quota_class = .unlimited },
+        .{ .hint = "balanced", .provider = "openrouter", .model = "anthropic/claude-sonnet-4", .cost_class = .standard, .quota_class = .normal },
+        .{ .hint = "deep", .provider = "openrouter", .model = "anthropic/claude-opus-4", .cost_class = .premium, .quota_class = .constrained },
+    };
+
+    const routed = (try agent.routeModelNameForTurn(
+        allocator,
+        "Extract the version from 'release-1.2.3' and return only the semver.",
+    )).?;
+    defer allocator.free(routed);
+
+    try std.testing.expectEqualStrings("groq/llama-3.3-8b", routed);
+}
+
+test "auto route keeps ambiguous short prompt on balanced model" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.model_routes = &.{
+        .{ .hint = "fast", .provider = "groq", .model = "llama-3.3-8b", .cost_class = .free, .quota_class = .unlimited },
+        .{ .hint = "balanced", .provider = "openrouter", .model = "anthropic/claude-sonnet-4", .cost_class = .premium, .quota_class = .constrained },
+        .{ .hint = "deep", .provider = "openrouter", .model = "anthropic/claude-opus-4", .cost_class = .premium, .quota_class = .constrained },
+    };
+
+    const routed = (try agent.routeModelNameForTurn(allocator, "What should we do here?")).?;
+    defer allocator.free(routed);
+
+    try std.testing.expectEqualStrings("openrouter/anthropic/claude-sonnet-4", routed);
+}
+
+test "auto route selects deep model for investigation prompt" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.model_routes = &.{
+        .{ .hint = "fast", .provider = "groq", .model = "llama-3.3-8b", .cost_class = .free, .quota_class = .unlimited },
+        .{ .hint = "balanced", .provider = "openrouter", .model = "anthropic/claude-sonnet-4", .cost_class = .standard, .quota_class = .normal },
+        .{ .hint = "deep", .provider = "openrouter", .model = "anthropic/claude-opus-4", .cost_class = .premium, .quota_class = .constrained },
+    };
+
+    const routed = (try agent.routeModelNameForTurn(
+        allocator,
+        "Investigate the root cause of this regression and compare the tradeoffs of the possible fixes.",
+    )).?;
+    defer allocator.free(routed);
+
+    try std.testing.expectEqualStrings("openrouter/anthropic/claude-opus-4", routed);
+}
+
+test "auto route records last route trace for short structured prompt" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.model_routes = &.{
+        .{
+            .hint = "fast",
+            .provider = "groq",
+            .model = "llama-3.3-8b",
+            .cost_class = .free,
+            .quota_class = .unlimited,
+        },
+        .{
+            .hint = "balanced",
+            .provider = "openrouter",
+            .model = "anthropic/claude-sonnet-4",
+            .cost_class = .standard,
+            .quota_class = .normal,
+        },
+    };
+
+    const routed = (try agent.routeModelNameForTurn(
+        allocator,
+        "Extract the version from 'release-1.2.3' and return only the semver.",
+    )).?;
+    defer allocator.free(routed);
+
+    try std.testing.expectEqualStrings("groq/llama-3.3-8b", routed);
+    try std.testing.expect(agent.last_route_trace != null);
+    try std.testing.expect(std.mem.indexOf(u8, agent.last_route_trace.?, "fast -> groq/llama-3.3-8b") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, agent.last_route_trace.?, "high-confidence") != null or
+            std.mem.indexOf(u8, agent.last_route_trace.?, "structured prompt") != null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, agent.last_route_trace.?, "score ") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, agent.last_route_trace.?, "\"version\"") != null or
+            std.mem.indexOf(u8, agent.last_route_trace.?, "\"extract\"") != null or
+            std.mem.indexOf(u8, agent.last_route_trace.?, "\"return only\"") != null,
+    );
+}
+
+test "model status reports last auto-route trace" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.model_routes = &.{
+        .{
+            .hint = "fast",
+            .provider = "groq",
+            .model = "llama-3.3-8b",
+            .cost_class = .free,
+            .quota_class = .unlimited,
+        },
+        .{
+            .hint = "balanced",
+            .provider = "openrouter",
+            .model = "anthropic/claude-sonnet-4",
+            .cost_class = .standard,
+            .quota_class = .normal,
+        },
+    };
+
+    const routed = (try agent.routeModelNameForTurn(
+        allocator,
+        "Extract the version from 'release-1.2.3' and return only the semver.",
+    )).?;
+    defer allocator.free(routed);
+
+    const status = try agent.formatModelStatus();
+    defer allocator.free(status);
+
+    try std.testing.expect(std.mem.indexOf(u8, status, "Auto-routing: configured") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "Last auto-route: fast -> groq/llama-3.3-8b") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "Auto routes:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "cost=free, quota=unlimited") != null);
+}
+
+test "auto route skips degraded fast route after rate limit" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.model_routes = &.{
+        .{ .hint = "fast", .provider = "groq", .model = "llama-3.3-8b" },
+        .{ .hint = "balanced", .provider = "openrouter", .model = "anthropic/claude-sonnet-4" },
+    };
+
+    const selection = agent.routeSelectionForTurn("show current status").?;
+    try agent.markRouteDegraded(selection, error.RateLimited);
+
+    const routed = (try agent.routeModelNameForTurn(allocator, "show current status")).?;
+    defer allocator.free(routed);
+
+    try std.testing.expectEqualStrings("openrouter/anthropic/claude-sonnet-4", routed);
+
+    const status = try agent.formatModelStatus();
+    defer allocator.free(status);
+    try std.testing.expect(std.mem.indexOf(u8, status, "Degraded routes:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, status, "fast -> groq/llama-3.3-8b") != null);
+}
+
+test "auto route degrades route on out-of-credits provider detail" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.model_routes = &.{
+        .{ .hint = "fast", .provider = "groq", .model = "llama-3.3-8b" },
+        .{ .hint = "balanced", .provider = "openrouter", .model = "anthropic/claude-sonnet-4" },
+    };
+
+    providers.clearLastApiErrorDetail();
+    defer providers.clearLastApiErrorDetail();
+    providers.setLastApiErrorDetail("groq", "out of credits");
+
+    const selection = agent.routeSelectionForTurn("show current status").?;
+    try agent.markRouteDegraded(selection, error.AllProvidersFailed);
+
+    const routed = (try agent.routeModelNameForTurn(allocator, "show current status")).?;
+    defer allocator.free(routed);
+
+    try std.testing.expectEqualStrings("openrouter/anthropic/claude-sonnet-4", routed);
+}
+
+test "auto route is disabled when model is pinned" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.model_routes = &.{
+        .{ .hint = "fast", .provider = "groq", .model = "llama-3.3-70b" },
+        .{ .hint = "balanced", .provider = "openrouter", .model = "anthropic/claude-sonnet-4" },
+    };
+    agent.model_pinned_by_user = true;
+
+    try std.testing.expect((try agent.routeModelNameForTurn(allocator, "show current status")) == null);
+}
+
+test "auto route selection benchmark stays below visible overhead" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.model_routes = &.{
+        .{ .hint = "fast", .provider = "groq", .model = "llama-3.3-70b" },
+        .{ .hint = "balanced", .provider = "openrouter", .model = "anthropic/claude-sonnet-4" },
+        .{ .hint = "deep", .provider = "openrouter", .model = "anthropic/claude-opus-4" },
+        .{ .hint = "vision", .provider = "openrouter", .model = "openai/gpt-4.1" },
+    };
+
+    const iterations: usize = 50_000;
+    var timer = try std.time.Timer.start();
+    var i: usize = 0;
+    while (i < iterations) : (i += 1) {
+        const hint = agent.selectRouteHintForTurn("show current status");
+        try std.testing.expect(hint != null);
+        try std.testing.expectEqualStrings("fast", hint.?);
+    }
+    const elapsed_ns = timer.read();
+    const avg_ns = elapsed_ns / iterations;
+
+    // Heuristic routing should stay far below human-visible latency.
+    try std.testing.expect(avg_ns < 200_000);
+}
+
+test "slash /model auto clears pin and invalidates cached prompt model" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.model_routes = &.{
+        .{ .hint = "fast", .provider = "groq", .model = "llama-3.3-70b" },
+        .{ .hint = "balanced", .provider = "openrouter", .model = "anthropic/claude-sonnet-4" },
+    };
+    agent.model_name = "gpt-4o";
+    agent.model_name_owned = false;
+    agent.model_pinned_by_user = true;
+    agent.has_system_prompt = true;
+    agent.system_prompt_has_conversation_context = true;
+    agent.system_prompt_model_name = try allocator.dupe(u8, "groq/llama-3.3-70b");
+
+    const response = (try agent.handleSlashCommand("/model auto")).?;
+    defer allocator.free(response);
+
+    const expected = try std.fmt.allocPrint(
+        allocator,
+        "Automatic model routing enabled. Reverted to the configured default model: {s}",
+        .{agent.default_model},
+    );
+    defer allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, response);
+    try std.testing.expect(!agent.model_pinned_by_user);
+    try std.testing.expectEqualStrings(agent.default_model, agent.model_name);
+    try std.testing.expect(!agent.has_system_prompt);
+    try std.testing.expect(!agent.system_prompt_has_conversation_context);
+    try std.testing.expect(agent.system_prompt_model_name == null);
+}
+
+test "slash /model auto without routes restores default model and explains routing is not configured" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.model_name = "gpt-4o";
+    agent.model_name_owned = false;
+    agent.model_pinned_by_user = true;
+
+    const response = (try agent.handleSlashCommand("/model auto")).?;
+    defer allocator.free(response);
+
+    const expected = try std.fmt.allocPrint(
+        allocator,
+        "Automatic model routing is not configured. Reverted to the configured default model: {s}",
+        .{agent.default_model},
+    );
+    defer allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, response);
+    try std.testing.expect(!agent.model_pinned_by_user);
+    try std.testing.expectEqualStrings(agent.default_model, agent.model_name);
+}
+
+test "slash /model pins explicit selection" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.model_routes = &.{
+        .{ .hint = "fast", .provider = "groq", .model = "llama-3.3-70b" },
+        .{ .hint = "balanced", .provider = "openrouter", .model = "anthropic/claude-sonnet-4" },
+    };
+
+    const response = (try agent.handleSlashCommand("/model gpt-4o")).?;
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "gpt-4o") != null);
+    try std.testing.expect(agent.model_pinned_by_user);
 }
 
 test "slash /model without name shows current" {
@@ -2989,6 +4729,11 @@ test "slash /think updates reasoning effort" {
     var agent = try makeTestAgent(allocator);
     defer agent.deinit();
 
+    const alias_resp = (try agent.handleSlashCommand("/think on")).?;
+    defer allocator.free(alias_resp);
+    try std.testing.expect(std.mem.indexOf(u8, alias_resp, "medium") != null);
+    try std.testing.expectEqualStrings("medium", agent.reasoning_effort.?);
+
     const set_resp = (try agent.handleSlashCommand("/think high")).?;
     defer allocator.free(set_resp);
     try std.testing.expect(std.mem.indexOf(u8, set_resp, "high") != null);
@@ -3088,6 +4833,181 @@ test "slash /stop handled explicitly" {
     try std.testing.expect(std.mem.indexOf(u8, response, "No active background task") != null);
 }
 
+test "slash /abort aliases /stop" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    const response = (try agent.handleSlashCommand("/abort")).?;
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "No active background task") != null);
+}
+
+test "turn returns interruption reply when interrupt requested" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    agent.requestInterrupt();
+    const response = try agent.turn("hello");
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "Interrupted by /stop") != null);
+}
+
+test "interruption reply lists effectively interrupted tools" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    try agent.noteInterruptedTool("shell");
+    try agent.noteInterruptedTool("web_fetch");
+    agent.requestInterrupt();
+
+    const response = try agent.turn("hello");
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "Interrupted tools: shell, web_fetch") != null);
+}
+
+test "hard stop mock interruption lists exactly interrupted tool" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const ProbeTool = struct {
+        const Self = @This();
+        started: *std.atomic.Value(bool),
+
+        pub const tool_name = "hard_stop_probe";
+        pub const tool_description = "Mock long-running tool for hard-stop tests";
+        pub const tool_params = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}";
+        pub const vtable = tools_mod.ToolVTable(Self);
+
+        fn tool(self: *Self) Tool {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        pub fn execute(self: *Self, allocator: std.mem.Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+            self.started.store(true, .release);
+            const proc = tools_mod.process_util;
+            const result = try proc.run(allocator, &.{ "sh", "-c", "sleep 5; echo done" }, .{});
+            defer result.deinit(allocator);
+            if (result.interrupted) {
+                return .{ .success = false, .output = "", .error_msg = "Interrupted by /stop" };
+            }
+            return .{ .success = true, .output = try allocator.dupe(u8, "probe-finished") };
+        }
+    };
+
+    const OneShotToolProvider = struct {
+        const Self = @This();
+        call_count: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+            const tool_calls = try allocator.alloc(providers.ToolCall, 1);
+            tool_calls[0] = .{
+                .id = try allocator.dupe(u8, "call-hard-stop"),
+                .name = try allocator.dupe(u8, "hard_stop_probe"),
+                .arguments = try allocator.dupe(u8, "{}"),
+            };
+            return .{
+                .content = try allocator.dupe(u8, "running"),
+                .tool_calls = tool_calls,
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "one-shot-tool-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const InterruptCtx = struct {
+        agent: *Agent,
+        started: *std.atomic.Value(bool),
+    };
+    const InterruptWorker = struct {
+        fn run(ctx: *InterruptCtx) void {
+            while (!ctx.started.load(.acquire)) {
+                std.Thread.sleep(10 * std.time.ns_per_ms);
+            }
+            std.Thread.sleep(80 * std.time.ns_per_ms);
+            ctx.agent.requestInterrupt();
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    var started = std.atomic.Value(bool).init(false);
+    var tool_impl = ProbeTool{ .started = &started };
+    const tools = [_]Tool{tool_impl.tool()};
+
+    var specs = try allocator.alloc(ToolSpec, tools.len);
+    for (tools, 0..) |t, i| {
+        specs[i] = .{
+            .name = t.name(),
+            .description = t.description(),
+            .parameters_json = t.parametersJson(),
+        };
+    }
+
+    var provider_state = OneShotToolProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = OneShotToolProvider.chatWithSystem,
+        .chat = OneShotToolProvider.chat,
+        .supportsNativeTools = OneShotToolProvider.supportsNativeTools,
+        .getName = OneShotToolProvider.getName,
+        .deinit = OneShotToolProvider.deinitFn,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &tools,
+        .tool_specs = specs,
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 4,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    var interrupt_ctx = InterruptCtx{ .agent = &agent, .started = &started };
+    const interrupt_thread = try std.Thread.spawn(.{}, InterruptWorker.run, .{&interrupt_ctx});
+    defer interrupt_thread.join();
+
+    const response = try agent.turn("run hard stop mock");
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "Interrupted by /stop") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "hard_stop_probe") != null);
+    try std.testing.expectEqual(@as(usize, 1), provider_state.call_count);
+}
+
 test "slash /approve executes pending bash command" {
     const allocator = std.testing.allocator;
 
@@ -3142,6 +5062,8 @@ test "slash /restart clears runtime command settings" {
     defer allocator.free(usage_resp);
     const tts_resp = (try agent.handleSlashCommand("/tts always provider test-provider")).?;
     defer allocator.free(tts_resp);
+    agent.total_tokens = 42;
+    agent.last_turn_usage = .{ .prompt_tokens = 7, .completion_tokens = 5, .total_tokens = 12 };
 
     const response = (try agent.handleSlashCommand("/restart")).?;
     defer allocator.free(response);
@@ -3152,6 +5074,8 @@ test "slash /restart clears runtime command settings" {
     try std.testing.expect(agent.usage_mode == .off);
     try std.testing.expect(agent.tts_mode == .off);
     try std.testing.expect(agent.tts_provider == null);
+    try std.testing.expectEqual(@as(u64, 0), agent.total_tokens);
+    try std.testing.expectEqual(@as(u32, 0), agent.last_turn_usage.total_tokens);
 }
 
 test "turn includes reasoning and usage footer when enabled" {
@@ -3221,6 +5145,74 @@ test "turn includes reasoning and usage footer when enabled" {
     try std.testing.expect(std.mem.indexOf(u8, response, "Reasoning:\nthinking trace") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "[usage] total_tokens=10") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "final answer") != null);
+}
+
+test "turn estimates token usage when provider omits usage" {
+    const ProviderState = struct {
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(_: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return .{
+                .content = try allocator.dupe(u8, "final answer"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "test";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    var state: u8 = 0;
+    const vtable = Provider.VTable{
+        .chatWithSystem = ProviderState.chatWithSystem,
+        .chat = ProviderState.chat,
+        .supportsNativeTools = ProviderState.supportsNativeTools,
+        .getName = ProviderState.getName,
+        .deinit = ProviderState.deinitFn,
+    };
+    const provider = Provider{ .ptr = @ptrCast(&state), .vtable = &vtable };
+
+    const allocator = std.testing.allocator;
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 20,
+        .auto_save = false,
+        .history = .empty,
+    };
+    defer agent.deinit();
+
+    const response = try agent.turn("hello");
+    defer allocator.free(response);
+
+    const expected_tokens = estimate_text_tokens("final answer");
+    try std.testing.expectEqual(@as(u64, expected_tokens), agent.tokensUsed());
+
+    const status = (try agent.handleSlashCommand("/status")).?;
+    defer allocator.free(status);
+    var expected_line_buf: [64]u8 = undefined;
+    const expected_line = try std.fmt.bufPrint(&expected_line_buf, "Tokens used: {d}", .{expected_tokens});
+    try std.testing.expect(std.mem.indexOf(u8, status, expected_line) != null);
 }
 
 test "turn refreshes system prompt after workspace markdown change" {
@@ -3653,6 +5645,75 @@ test "slash /model dupe prevents use-after-free" {
     try std.testing.expectEqualStrings("new-model-xyz", agent.model_name);
 }
 
+test "turn passes auto-routed model to provider" {
+    const CaptureProvider = struct {
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(_: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, model: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return .{
+                .content = try allocator.dupe(u8, model),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, model),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "capture-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = CaptureProvider.chatWithSystem,
+        .chat = CaptureProvider.chat,
+        .supportsNativeTools = CaptureProvider.supportsNativeTools,
+        .getName = CaptureProvider.getName,
+        .deinit = CaptureProvider.deinitFn,
+    };
+    const provider = Provider{
+        .ptr = @ptrFromInt(1),
+        .vtable = &provider_vtable,
+    };
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .model_routes = &.{
+            .{ .hint = "fast", .provider = "groq", .model = "llama-3.3-70b" },
+            .{ .hint = "balanced", .provider = "openrouter", .model = "anthropic/claude-sonnet-4" },
+        },
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 20,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    const response = try agent.turn("show current status");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("groq/llama-3.3-70b", response);
+}
+
 // Bug 2: @intCast on negative i64 duration should not panic.
 // Simulate by verifying the @max(0, ...) clamping logic.
 test "milliTimestamp negative difference clamps to zero" {
@@ -4060,6 +6121,259 @@ test "Agent tool loop frees dynamic tool outputs" {
     try std.testing.expectEqual(@as(usize, 2), provider_state.call_count);
 }
 
+test "Agent shell failure with normalized output does not poison next turn" {
+    const ShellFailureProvider = struct {
+        const Self = @This();
+
+        call_count: usize = 0,
+        saw_tool_results: bool = false,
+        saw_error_tool_result: bool = false,
+        saw_valid_utf8_tool_results: bool = false,
+        saw_non_empty_error_tool_result: bool = false,
+
+        fn failingShellCommand() []const u8 {
+            return if (comptime builtin.os.tag == .windows)
+                "powershell.exe -NoProfile -Command \"[Console]::OpenStandardError().Write([byte[]](0xD6,0xD0,0xCE,0xC4),0,4)\" & exit /b 1"
+            else
+                "printf '\\200' >&2; exit 1";
+        }
+
+        fn captureToolResultMessage(self: *Self, messages: []const ChatMessage) void {
+            const start_marker = "<tool_result name=\"shell\" status=\"error\">";
+            const end_marker = "</tool_result>";
+
+            for (messages) |msg| {
+                if (msg.role != .user) continue;
+                if (std.mem.indexOf(u8, msg.content, "[Tool results]") == null) continue;
+
+                self.saw_tool_results = true;
+                self.saw_error_tool_result = std.mem.indexOf(u8, msg.content, "<tool_result name=\"shell\" status=\"error\">") != null;
+                self.saw_valid_utf8_tool_results = std.unicode.utf8ValidateSlice(msg.content);
+                if (std.mem.indexOf(u8, msg.content, start_marker)) |start_idx| {
+                    const body_start = start_idx + start_marker.len;
+                    if (std.mem.indexOf(u8, msg.content[body_start..], end_marker)) |end_rel| {
+                        const body = std.mem.trim(u8, msg.content[body_start .. body_start + end_rel], " \t\r\n");
+                        self.saw_non_empty_error_tool_result = body.len > 0;
+                    }
+                }
+                break;
+            }
+        }
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, request: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+
+            if (self.call_count == 1) {
+                const tool_calls = try allocator.alloc(providers.ToolCall, 1);
+                tool_calls[0] = .{
+                    .id = try allocator.dupe(u8, "call-shell-1"),
+                    .name = try allocator.dupe(u8, "shell"),
+                    .arguments = try std.fmt.allocPrint(allocator, "{{\"command\":{f}}}", .{
+                        std.json.fmt(failingShellCommand(), .{}),
+                    }),
+                };
+
+                return .{
+                    .content = try allocator.dupe(u8, "Run shell"),
+                    .tool_calls = tool_calls,
+                    .usage = .{},
+                    .model = try allocator.dupe(u8, "test-model"),
+                };
+            }
+
+            self.captureToolResultMessage(request.messages);
+            return .{
+                .content = try allocator.dupe(u8, "recovered"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "shell-failure-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+
+    var provider_state = ShellFailureProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = ShellFailureProvider.chatWithSystem,
+        .chat = ShellFailureProvider.chat,
+        .supportsNativeTools = ShellFailureProvider.supportsNativeTools,
+        .getName = ShellFailureProvider.getName,
+        .deinit = ShellFailureProvider.deinitFn,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var shell_tool_impl = tools_mod.shell.ShellTool{ .workspace_dir = "." };
+    const tool_list = [_]Tool{shell_tool_impl.tool()};
+
+    var specs = try allocator.alloc(ToolSpec, tool_list.len);
+    for (tool_list, 0..) |t, i| {
+        specs[i] = .{
+            .name = t.name(),
+            .description = t.description(),
+            .parameters_json = t.parametersJson(),
+        };
+    }
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &tool_list,
+        .tool_specs = specs,
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = ".",
+        .max_tool_iterations = 4,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    const response = try agent.turn("run failing shell");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("recovered", response);
+    try std.testing.expectEqual(@as(usize, 2), provider_state.call_count);
+    try std.testing.expect(provider_state.saw_tool_results);
+    try std.testing.expect(provider_state.saw_error_tool_result);
+    try std.testing.expect(provider_state.saw_valid_utf8_tool_results);
+    try std.testing.expect(provider_state.saw_non_empty_error_tool_result);
+
+    for (agent.history.items) |msg| {
+        try std.testing.expect(std.unicode.utf8ValidateSlice(msg.content));
+    }
+}
+
+test "Agent strips fabricated tool_result blocks from XML assistant history" {
+    const XmlFabricationProvider = struct {
+        saw_fake_tool_result_in_history: bool = false,
+        call_count: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, request: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.call_count += 1;
+
+            if (self.call_count == 1) {
+                return .{
+                    .content = try allocator.dupe(
+                        u8,
+                        "<tool_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"printf hi\"}}</tool_call><tool_result name=\"shell\" status=\"ok\">fabricated</tool_result>",
+                    ),
+                    .tool_calls = &.{},
+                    .usage = .{},
+                    .model = try allocator.dupe(u8, "test-model"),
+                };
+            }
+
+            for (request.messages) |msg| {
+                if (msg.role != .assistant) continue;
+                if (std.mem.indexOf(u8, msg.content, "fabricated") != null) {
+                    self.saw_fake_tool_result_in_history = true;
+                }
+            }
+
+            return .{
+                .content = try allocator.dupe(u8, "done"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "xml-fabrication-provider";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+
+    var provider_state = XmlFabricationProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = XmlFabricationProvider.chatWithSystem,
+        .chat = XmlFabricationProvider.chat,
+        .supportsNativeTools = XmlFabricationProvider.supportsNativeTools,
+        .getName = XmlFabricationProvider.getName,
+        .deinit = XmlFabricationProvider.deinitFn,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var shell_tool_impl = tools_mod.shell.ShellTool{ .workspace_dir = "." };
+    const tool_list = [_]Tool{shell_tool_impl.tool()};
+
+    var specs = try allocator.alloc(ToolSpec, tool_list.len);
+    for (tool_list, 0..) |t, i| {
+        specs[i] = .{
+            .name = t.name(),
+            .description = t.description(),
+            .parameters_json = t.parametersJson(),
+        };
+    }
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &tool_list,
+        .tool_specs = specs,
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = ".",
+        .max_tool_iterations = 4,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    const response = try agent.turn("run shell");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("done", response);
+    try std.testing.expectEqual(@as(usize, 2), provider_state.call_count);
+    try std.testing.expect(!provider_state.saw_fake_tool_result_in_history);
+}
+
 test "Agent streaming fields can be set" {
     const allocator = std.testing.allocator;
     var noop = observability.NoopObserver{};
@@ -4090,6 +6404,105 @@ test "Agent streaming fields can be set" {
     try std.testing.expect(agent.stream_ctx != null);
 }
 
+test "Agent falls back to blocking chat when stream ctx is missing" {
+    const allocator = std.testing.allocator;
+
+    const StreamGuardProvider = struct {
+        chat_calls: usize = 0,
+        stream_calls: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator_: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator_.dupe(u8, "ok");
+        }
+
+        fn chat(ptr: *anyopaque, allocator_: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!ChatResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.chat_calls += 1;
+            return .{
+                .content = try allocator_.dupe(u8, "ok"),
+                .tool_calls = &.{},
+                .usage = .{},
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+
+        fn supportsStreaming(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn streamChat(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: providers.ChatRequest,
+            _: []const u8,
+            _: f64,
+            _: providers.StreamCallback,
+            _: *anyopaque,
+        ) anyerror!providers.StreamChatResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.stream_calls += 1;
+            return error.ShouldNotStream;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "stream-guard";
+        }
+
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    var provider_state = StreamGuardProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = StreamGuardProvider.chatWithSystem,
+        .chat = StreamGuardProvider.chat,
+        .supportsNativeTools = StreamGuardProvider.supportsNativeTools,
+        .getName = StreamGuardProvider.getName,
+        .deinit = StreamGuardProvider.deinitFn,
+        .supports_streaming = StreamGuardProvider.supportsStreaming,
+        .stream_chat = StreamGuardProvider.streamChat,
+    };
+    const provider = Provider{
+        .ptr = @ptrCast(&provider_state),
+        .vtable = &provider_vtable,
+    };
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &.{},
+        .tool_specs = try allocator.alloc(ToolSpec, 0),
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 2,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    const test_cb: providers.StreamCallback = struct {
+        fn cb(_: *anyopaque, _: providers.StreamChunk) void {}
+    }.cb;
+    agent.stream_callback = test_cb;
+    agent.stream_ctx = null;
+
+    const response = try agent.turn("hello");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("ok", response);
+    try std.testing.expectEqual(@as(usize, 1), provider_state.chat_calls);
+    try std.testing.expectEqual(@as(usize, 0), provider_state.stream_calls);
+}
+
 test "Agent shouldForceActionFollowThrough detects english deferred promise" {
     try std.testing.expect(Agent.shouldForceActionFollowThrough("I'll try again with a different filename now."));
     try std.testing.expect(Agent.shouldForceActionFollowThrough("let me check that and get back in a moment"));
@@ -4103,4 +6516,371 @@ test "Agent shouldForceActionFollowThrough detects russian deferred promise" {
 test "Agent shouldForceActionFollowThrough ignores normal final answer" {
     try std.testing.expect(!Agent.shouldForceActionFollowThrough("Вот результат: файл успешно отправлен."));
     try std.testing.expect(!Agent.shouldForceActionFollowThrough("I cannot do that in this environment."));
+}
+
+test "Agent selectDisplayText hides malformed tool markup payload" {
+    const raw = "<tool_call>web_search<arg_key>query</arg_key><arg_value>x</arg_value></tool_call>";
+    const selected = Agent.selectDisplayText(raw, "", 0);
+    try std.testing.expectEqualStrings("", selected);
+}
+
+test "Agent selectDisplayText keeps plain text when no markup exists" {
+    const raw = "All good.";
+    const selected = Agent.selectDisplayText(raw, "", 0);
+    try std.testing.expectEqualStrings("All good.", selected);
+}
+
+test "Agent selectDisplayText prefers parsed text when present" {
+    const selected = Agent.selectDisplayText("<tool_call>{}</tool_call>", "let me check", 1);
+    try std.testing.expectEqualStrings("let me check", selected);
+}
+
+test "Agent selectDisplayText hides malformed tool markup present in parsed text" {
+    const parsed_with_markup = "Some text <tool_call>{\"name\":\"shell\"";
+    const selected = Agent.selectDisplayText(parsed_with_markup, parsed_with_markup, 0);
+    try std.testing.expectEqualStrings("", selected);
+}
+
+test "Agent.fromConfig sets exec_security=full for full autonomy" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "openai/gpt-4.1-mini",
+        .allocator = allocator,
+    };
+    cfg.autonomy.level = .full;
+
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfig(allocator, &cfg, undefined, &.{}, null, noop.observer());
+    defer agent.deinit();
+
+    try std.testing.expect(agent.exec_security == .full);
+    try std.testing.expect(agent.exec_ask == .off);
+}
+
+test "Agent.fromConfig sets exec_security=deny for read_only autonomy" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "openai/gpt-4.1-mini",
+        .allocator = allocator,
+    };
+    cfg.autonomy.level = .read_only;
+
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfig(allocator, &cfg, undefined, &.{}, null, noop.observer());
+    defer agent.deinit();
+
+    try std.testing.expect(agent.exec_security == .deny);
+    try std.testing.expect(agent.exec_ask == .off);
+}
+
+test "Agent.fromConfig sets exec_security=allowlist for supervised autonomy" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "openai/gpt-4.1-mini",
+        .allocator = allocator,
+    };
+    cfg.autonomy.level = .supervised;
+
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfig(allocator, &cfg, undefined, &.{}, null, noop.observer());
+    defer agent.deinit();
+
+    try std.testing.expect(agent.exec_security == .allowlist);
+    try std.testing.expect(agent.exec_ask == .on_miss);
+}
+
+test "Agent.fromConfig sets multimodal_unrestricted for yolo" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "openai/gpt-4.1-mini",
+        .allocator = allocator,
+    };
+    cfg.autonomy.level = .yolo;
+
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfig(allocator, &cfg, undefined, &.{}, null, noop.observer());
+    defer agent.deinit();
+
+    try std.testing.expect(agent.multimodal_unrestricted == true);
+}
+
+test "Agent.fromConfig does not set multimodal_unrestricted for full" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "openai/gpt-4.1-mini",
+        .allocator = allocator,
+    };
+    cfg.autonomy.level = .full;
+
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfig(allocator, &cfg, undefined, &.{}, null, noop.observer());
+    defer agent.deinit();
+
+    try std.testing.expect(agent.multimodal_unrestricted == false);
+}
+
+test "execBlockMessage allows all commands when exec_security=full" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.exec_security = .full;
+    agent.exec_ask = .off;
+
+    // Even high-risk commands should not be blocked by execBlockMessage
+    var args1 = std.json.ObjectMap.init(allocator);
+    defer args1.deinit();
+    try args1.put("command", .{ .string = "rm -rf /tmp/test" });
+    try std.testing.expect(agent.execBlockMessage(args1) == null);
+
+    var args2 = std.json.ObjectMap.init(allocator);
+    defer args2.deinit();
+    try args2.put("command", .{ .string = "curl https://example.com" });
+    try std.testing.expect(agent.execBlockMessage(args2) == null);
+
+    var args3 = std.json.ObjectMap.init(allocator);
+    defer args3.deinit();
+    try args3.put("command", .{ .string = "ls -la" });
+    try std.testing.expect(agent.execBlockMessage(args3) == null);
+}
+
+test "execBlockMessage checks allowlist when exec_security=allowlist" {
+    const allocator = std.testing.allocator;
+    const policy_mod = @import("../security/policy.zig");
+    var tracker = policy_mod.RateTracker.init(allocator, 100);
+    defer tracker.deinit();
+
+    const allowed = [_][]const u8{ "ls", "cat" };
+    var policy = policy_mod.SecurityPolicy{
+        .autonomy = .supervised,
+        .workspace_dir = "/tmp",
+        .tracker = &tracker,
+        .allowed_commands = &allowed,
+    };
+
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.exec_security = .allowlist;
+    agent.exec_ask = .on_miss;
+    agent.policy = &policy;
+
+    // Allowed command passes
+    var args1 = std.json.ObjectMap.init(allocator);
+    defer args1.deinit();
+    try args1.put("command", .{ .string = "ls -la" });
+    try std.testing.expect(agent.execBlockMessage(args1) == null);
+
+    // Disallowed command is blocked
+    var args2 = std.json.ObjectMap.init(allocator);
+    defer args2.deinit();
+    try args2.put("command", .{ .string = "curl https://example.com" });
+    try std.testing.expect(agent.execBlockMessage(args2) != null);
+}
+
+test "execBlockMessage allowlist mode honors wildcard allowed_commands" {
+    const allocator = std.testing.allocator;
+    const policy_mod = @import("../security/policy.zig");
+    var tracker_open = policy_mod.RateTracker.init(allocator, 10000);
+    defer tracker_open.deinit();
+
+    var open_policy = policy_mod.SecurityPolicy{
+        .autonomy = .full,
+        .workspace_dir = "/tmp",
+        .allowed_commands = &.{"*"},
+        .block_high_risk_commands = false,
+        .require_approval_for_medium_risk = false,
+        .tracker = &tracker_open,
+    };
+
+    var tracker_restricted = policy_mod.RateTracker.init(allocator, 10000);
+    defer tracker_restricted.deinit();
+    const restricted_allowed = [_][]const u8{"ls"};
+    var restricted_policy = policy_mod.SecurityPolicy{
+        .autonomy = .supervised,
+        .workspace_dir = "/tmp",
+        .allowed_commands = &restricted_allowed,
+        .block_high_risk_commands = false,
+        .require_approval_for_medium_risk = false,
+        .tracker = &tracker_restricted,
+    };
+
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    agent.exec_security = .allowlist;
+    agent.exec_ask = .on_miss;
+
+    // Command outside default allowlist should pass with wildcard policy.
+    agent.policy = &open_policy;
+    var args = std.json.ObjectMap.init(allocator);
+    defer args.deinit();
+    try args.put("command", .{ .string = "python3 script.py" });
+    try std.testing.expect(agent.execBlockMessage(args) == null);
+
+    // Same command should be blocked under restrictive allowlist.
+    agent.policy = &restricted_policy;
+    try std.testing.expect(agent.execBlockMessage(args) != null);
+}
+
+// ── filterToolSpecsForTurn tests ─────────────────────────────────
+
+test "filterToolSpecsForTurn no groups returns all specs unchanged" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .default_model = "openai/gpt-4.1-mini",
+        .allocator = allocator,
+    };
+    var noop = observability.NoopObserver{};
+    const specs: []const ToolSpec = &.{
+        .{ .name = "shell", .description = "run shell", .parameters_json = "{}" },
+        .{ .name = "mcp_vikunja_list_tasks", .description = "list tasks", .parameters_json = "{}" },
+    };
+    var agent = try Agent.fromConfig(allocator, &cfg, undefined, &.{}, null, noop.observer());
+    defer agent.deinit();
+    // Override tool_specs to our test set (not heap-alloc'd via fromConfig)
+    allocator.free(agent.tool_specs);
+    agent.tool_specs = specs;
+    agent.tool_filter_groups = &.{}; // explicitly empty
+
+    const result = try agent.filterToolSpecsForTurn(arena, "show me tasks");
+    // Should be same pointer — no copy made
+    try std.testing.expectEqual(specs.ptr, result.ptr);
+    try std.testing.expectEqual(@as(usize, 2), result.len);
+    // Prevent double-free: clear the pointer so deinit doesn't free it
+    agent.tool_specs = try allocator.alloc(ToolSpec, 0);
+}
+
+test "filterToolSpecsForTurn always group always includes matching MCP tool" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .default_model = "openai/gpt-4.1-mini",
+        .allocator = allocator,
+    };
+    var noop = observability.NoopObserver{};
+    const specs: []const ToolSpec = &.{
+        .{ .name = "shell", .description = "run shell", .parameters_json = "{}" },
+        .{ .name = "mcp_vikunja_list_tasks", .description = "list tasks", .parameters_json = "{}" },
+        .{ .name = "mcp_browser_open", .description = "open browser", .parameters_json = "{}" },
+    };
+    const patterns: []const []const u8 = &.{"mcp_vikunja_*"};
+    const groups: []const config_types.ToolFilterGroup = &.{
+        .{ .mode = .always, .tools = patterns, .keywords = &.{} },
+    };
+
+    var agent = try Agent.fromConfig(allocator, &cfg, undefined, &.{}, null, noop.observer());
+    defer agent.deinit();
+    allocator.free(agent.tool_specs);
+    agent.tool_specs = specs;
+    agent.tool_filter_groups = groups;
+
+    const result = try agent.filterToolSpecsForTurn(arena, "hello world");
+    // shell (non-MCP) + mcp_vikunja_list_tasks (always matched); mcp_browser_open excluded
+    try std.testing.expectEqual(@as(usize, 2), result.len);
+    try std.testing.expectEqualStrings("shell", result[0].name);
+    try std.testing.expectEqualStrings("mcp_vikunja_list_tasks", result[1].name);
+    agent.tool_specs = try allocator.alloc(ToolSpec, 0);
+}
+
+test "filterToolSpecsForTurn dynamic group includes tool on keyword match" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .default_model = "openai/gpt-4.1-mini",
+        .allocator = allocator,
+    };
+    var noop = observability.NoopObserver{};
+    const specs: []const ToolSpec = &.{
+        .{ .name = "shell", .description = "run shell", .parameters_json = "{}" },
+        .{ .name = "mcp_vikunja_list_tasks", .description = "list tasks", .parameters_json = "{}" },
+    };
+    const patterns: []const []const u8 = &.{"mcp_vikunja_*"};
+    const keywords: []const []const u8 = &.{ "task", "vikunja", "todo" };
+    const groups: []const config_types.ToolFilterGroup = &.{
+        .{ .mode = .dynamic, .tools = patterns, .keywords = keywords },
+    };
+
+    var agent = try Agent.fromConfig(allocator, &cfg, undefined, &.{}, null, noop.observer());
+    defer agent.deinit();
+    allocator.free(agent.tool_specs);
+    agent.tool_specs = specs;
+    agent.tool_filter_groups = groups;
+
+    // Keyword present — tool should be included
+    const with_kw = try agent.filterToolSpecsForTurn(arena, "show me my tasks for today");
+    try std.testing.expectEqual(@as(usize, 2), with_kw.len);
+    try std.testing.expectEqualStrings("mcp_vikunja_list_tasks", with_kw[1].name);
+
+    // No keyword — MCP tool should be excluded
+    const without_kw = try agent.filterToolSpecsForTurn(arena, "what is the weather?");
+    try std.testing.expectEqual(@as(usize, 1), without_kw.len);
+    try std.testing.expectEqualStrings("shell", without_kw[0].name);
+
+    agent.tool_specs = try allocator.alloc(ToolSpec, 0);
+}
+
+test "filterToolSpecsForTurn dynamic group keyword match is case-insensitive" {
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .default_model = "openai/gpt-4.1-mini",
+        .allocator = allocator,
+    };
+    var noop = observability.NoopObserver{};
+    const specs: []const ToolSpec = &.{
+        .{ .name = "mcp_vikunja_create_task", .description = "create task", .parameters_json = "{}" },
+    };
+    const patterns: []const []const u8 = &.{"mcp_vikunja_*"};
+    const keywords: []const []const u8 = &.{"task"};
+    const groups: []const config_types.ToolFilterGroup = &.{
+        .{ .mode = .dynamic, .tools = patterns, .keywords = keywords },
+    };
+
+    var agent = try Agent.fromConfig(allocator, &cfg, undefined, &.{}, null, noop.observer());
+    defer agent.deinit();
+    allocator.free(agent.tool_specs);
+    agent.tool_specs = specs;
+    agent.tool_filter_groups = groups;
+
+    const result = try agent.filterToolSpecsForTurn(arena, "Create a TASK for me");
+    try std.testing.expectEqual(@as(usize, 1), result.len);
+    agent.tool_specs = try allocator.alloc(ToolSpec, 0);
+}
+
+test "globMatch handles prefix wildcard" {
+    try std.testing.expect(Agent.globMatch("mcp_vikunja_*", "mcp_vikunja_list_tasks"));
+    try std.testing.expect(Agent.globMatch("mcp_vikunja_*", "mcp_vikunja_create_task"));
+    try std.testing.expect(!Agent.globMatch("mcp_vikunja_*", "mcp_browser_open"));
+    try std.testing.expect(Agent.globMatch("*", "anything"));
+    try std.testing.expect(Agent.globMatch("shell", "shell"));
+    try std.testing.expect(!Agent.globMatch("shell", "shell_extra"));
 }

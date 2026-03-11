@@ -23,6 +23,7 @@ const onebot = channels_mod.onebot;
 const maixcam = channels_mod.maixcam;
 const slack = channels_mod.slack;
 const irc = channels_mod.irc;
+const web = channels_mod.web;
 const Channel = channels_mod.Channel;
 
 const log = std.log.scoped(.channel_manager);
@@ -30,7 +31,7 @@ const log = std.log.scoped(.channel_manager);
 pub const ListenerType = enum {
     /// Telegram, Signal — poll in a loop
     polling,
-    /// Discord, Mattermost, Slack, IRC, QQ, OneBot — internal socket/WebSocket loop
+    /// Discord, Mattermost, Slack, IRC, QQ(websocket), OneBot — internal socket/WebSocket loop
     gateway_loop,
     /// WhatsApp, Line, Lark — HTTP gateway receives
     webhook_only,
@@ -207,7 +208,10 @@ pub const ChannelManager = struct {
         const account_id = accountIdFromConfig(cfg);
         try self.registry.registerWithAccount(ch, account_id);
 
-        const listener_type = comptime listenerTypeForField(field_name);
+        var listener_type = comptime listenerTypeForField(field_name);
+        if (comptime std.mem.eql(u8, field_name, "qq") or std.mem.eql(u8, field_name, "lark")) {
+            listener_type = if (cfg.receive_mode == .webhook) .webhook_only else .gateway_loop;
+        }
         try self.entries.append(self.allocator, .{
             .name = field_name,
             .account_id = account_id,
@@ -251,9 +255,17 @@ pub const ChannelManager = struct {
                         try self.appendChannelFromConfig(field.name, cfg);
                     }
                 },
-                .optional => {
+                .optional => |opt| {
                     if (@field(self.config.channels, field.name)) |cfg| {
-                        try self.appendChannelFromConfig(field.name, cfg);
+                        const inner = comptime blk: {
+                            const info = @typeInfo(opt.child);
+                            break :blk info == .pointer and info.pointer.size == .one;
+                        };
+                        if (inner) {
+                            try self.appendChannelFromConfig(field.name, cfg.*);
+                        } else {
+                            try self.appendChannelFromConfig(field.name, cfg);
+                        }
                     }
                 },
                 else => {},
@@ -348,7 +360,7 @@ pub const ChannelManager = struct {
     /// Monitoring loop: check health, restart failed channels with backoff.
     /// Blocks until shutdown.
     pub fn supervisionLoop(self: *ChannelManager, state: *daemon.DaemonState) void {
-        const STALE_THRESHOLD_SECS: i64 = 90;
+        const STALE_THRESHOLD_SECS: i64 = 600;
         const WATCH_INTERVAL_SECS: u64 = 10;
 
         while (!daemon.isShutdownRequested()) {
@@ -741,6 +753,7 @@ test "ChannelManager collectConfiguredChannels wires listener types accounts and
             .app_id = "appid",
             .app_secret = "appsecret",
             .bot_token = "bottoken",
+            .receive_mode = .websocket,
         },
     };
     const onebot_accounts = [_]@import("config_types.zig").OneBotConfig{
@@ -903,7 +916,13 @@ test "ChannelManager collectConfiguredChannels wires listener types accounts and
     }
     if (channel_catalog.isBuildEnabled(.lark)) {
         expected_total += config.channels.lark.len;
-        expected_webhook_only += config.channels.lark.len;
+        for (config.channels.lark) |lark_cfg| {
+            if (lark_cfg.receive_mode == .webhook) {
+                expected_webhook_only += 1;
+            } else {
+                expected_gateway_loop += 1;
+            }
+        }
     }
     if (channel_catalog.isBuildEnabled(.matrix)) {
         expected_total += config.channels.matrix.len;
@@ -1013,4 +1032,165 @@ test "ChannelManager collectConfiguredChannels wires listener types accounts and
         try std.testing.expectEqual(@as(usize, 1), slack_ptr.policy.allowlist.len);
         try std.testing.expectEqualStrings("slack-admin", slack_ptr.policy.allowlist[0]);
     }
+}
+
+test "ChannelManager marks qq webhook receive_mode as webhook_only" {
+    if (!channel_catalog.isBuildEnabled(.qq)) return;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const qq_accounts = [_]config_types.QQConfig{
+        .{
+            .account_id = "qq-main",
+            .app_id = "appid",
+            .app_secret = "appsecret",
+            .bot_token = "bottoken",
+            .receive_mode = .webhook,
+        },
+    };
+
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .channels = .{
+            .qq = &qq_accounts,
+        },
+    };
+
+    var reg = dispatch.ChannelRegistry.init(allocator);
+    defer reg.deinit();
+
+    const mgr = try ChannelManager.init(allocator, &config, &reg);
+    defer mgr.deinit();
+
+    try mgr.collectConfiguredChannels();
+    const qq_entry = findEntryByNameAccount(mgr.channelEntries(), "qq", "qq-main") orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(ListenerType.webhook_only, qq_entry.listener_type);
+}
+
+test "ChannelManager marks lark websocket receive_mode as gateway_loop" {
+    if (!channel_catalog.isBuildEnabled(.lark)) return;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const lark_accounts = [_]config_types.LarkConfig{
+        .{
+            .account_id = "lark-main",
+            .app_id = "cli_xxx",
+            .app_secret = "secret_xxx",
+            .use_feishu = true,
+            .receive_mode = .websocket,
+        },
+    };
+
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .channels = .{
+            .lark = &lark_accounts,
+        },
+    };
+
+    var reg = dispatch.ChannelRegistry.init(allocator);
+    defer reg.deinit();
+
+    const mgr = try ChannelManager.init(allocator, &config, &reg);
+    defer mgr.deinit();
+
+    try mgr.collectConfiguredChannels();
+    const lark_entry = findEntryByNameAccount(mgr.channelEntries(), "lark", "lark-main") orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(ListenerType.gateway_loop, lark_entry.listener_type);
+}
+
+test "ChannelManager marks lark webhook receive_mode as webhook_only" {
+    if (!channel_catalog.isBuildEnabled(.lark)) return;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const lark_accounts = [_]config_types.LarkConfig{
+        .{
+            .account_id = "lark-main",
+            .app_id = "cli_xxx",
+            .app_secret = "secret_xxx",
+            .receive_mode = .webhook,
+        },
+    };
+
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .channels = .{
+            .lark = &lark_accounts,
+        },
+    };
+
+    var reg = dispatch.ChannelRegistry.init(allocator);
+    defer reg.deinit();
+
+    const mgr = try ChannelManager.init(allocator, &config, &reg);
+    defer mgr.deinit();
+
+    try mgr.collectConfiguredChannels();
+    const lark_entry = findEntryByNameAccount(mgr.channelEntries(), "lark", "lark-main") orelse
+        return error.TestUnexpectedResult;
+    try std.testing.expectEqual(ListenerType.webhook_only, lark_entry.listener_type);
+}
+
+test "ChannelManager collects web channel from config" {
+    if (!channel_catalog.isBuildEnabled(.web)) return;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const web_accounts = [_]config_types.WebConfig{
+        .{
+            .account_id = "local",
+            .port = 32123,
+            .path = "/relay/",
+            .auth_token = "relay-token-0123456789",
+        },
+    };
+
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .channels = .{
+            .web = &web_accounts,
+        },
+    };
+
+    var reg = dispatch.ChannelRegistry.init(allocator);
+    defer reg.deinit();
+
+    var event_bus = bus_mod.Bus.init();
+
+    const mgr = try ChannelManager.init(allocator, &config, &reg);
+    defer mgr.deinit();
+    mgr.setEventBus(&event_bus);
+
+    try mgr.collectConfiguredChannels();
+
+    try expectEntryPresence(mgr.channelEntries(), "web", "local", true);
+
+    // Verify it was registered with correct listener type
+    const web_entry = findEntryByNameAccount(mgr.channelEntries(), "web", "local").?;
+    try std.testing.expectEqual(ListenerType.gateway_loop, web_entry.listener_type);
+
+    const web_ptr: *web.WebChannel = @ptrCast(@alignCast(web_entry.channel.ptr));
+    try std.testing.expect(web_ptr.bus == &event_bus);
+    try std.testing.expectEqualStrings("/relay", web_ptr.ws_path);
+    try std.testing.expectEqualStrings("relay-token-0123456789", web_ptr.configured_auth_token.?);
 }

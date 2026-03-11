@@ -9,6 +9,7 @@ const root = @import("root.zig");
 const sse = @import("sse.zig");
 const platform = @import("../platform.zig");
 const auth = @import("../auth.zig");
+const http_util = @import("../http_util.zig");
 
 const Provider = root.Provider;
 const ChatMessage = root.ChatMessage;
@@ -391,6 +392,17 @@ fn codexStreamRequest(
     argv_buf[argc] = auth_header;
     argc += 1;
 
+    // Add proxy from environment if set
+    const proxy = http_util.getProxyFromEnv(allocator) catch null;
+    defer if (proxy) |p| allocator.free(p);
+
+    if (proxy) |p| {
+        argv_buf[argc] = "--proxy";
+        argc += 1;
+        argv_buf[argc] = p;
+        argc += 1;
+    }
+
     for (extra_headers) |hdr| {
         argv_buf[argc] = "-H";
         argc += 1;
@@ -398,18 +410,35 @@ fn codexStreamRequest(
         argc += 1;
     }
 
-    argv_buf[argc] = "-d";
+    argv_buf[argc] = "--data-binary";
     argc += 1;
-    argv_buf[argc] = body;
+    argv_buf[argc] = "@-";
     argc += 1;
     argv_buf[argc] = url;
     argc += 1;
 
     var child = std.process.Child.init(argv_buf[0..argc], allocator);
+    child.stdin_behavior = .Pipe;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Ignore;
 
     try child.spawn();
+
+    if (child.stdin) |stdin_file| {
+        stdin_file.writeAll(body) catch {
+            stdin_file.close();
+            child.stdin = null;
+            _ = child.kill() catch {};
+            _ = child.wait() catch {};
+            return error.CurlWriteError;
+        };
+        stdin_file.close();
+        child.stdin = null;
+    } else {
+        _ = child.kill() catch {};
+        _ = child.wait() catch {};
+        return error.CurlWriteError;
+    }
 
     // Read stdout line by line, parse Codex SSE events
     var accumulated: std.ArrayListUnmanaged(u8) = .empty;

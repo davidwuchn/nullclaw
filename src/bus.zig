@@ -7,6 +7,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
+const streaming = @import("streaming.zig");
+const thread_stacks = @import("thread_stacks.zig");
 
 // ---------------------------------------------------------------------------
 // Message types
@@ -39,6 +41,7 @@ pub const OutboundMessage = struct {
     chat_id: []const u8, // target chat
     content: []const u8, // response text
     media: []const []const u8 = &.{}, // file paths/URLs to send
+    stage: streaming.OutboundStage = .final,
 
     pub fn deinit(self: *const OutboundMessage, allocator: Allocator) void {
         for (self.media) |m| allocator.free(m);
@@ -141,6 +144,25 @@ pub fn makeOutbound(
     chat_id: []const u8,
     content: []const u8,
 ) Allocator.Error!OutboundMessage {
+    return makeOutboundWithStage(allocator, channel, chat_id, content, .final);
+}
+
+pub fn makeOutboundChunk(
+    allocator: Allocator,
+    channel: []const u8,
+    chat_id: []const u8,
+    content: []const u8,
+) Allocator.Error!OutboundMessage {
+    return makeOutboundWithStage(allocator, channel, chat_id, content, .chunk);
+}
+
+fn makeOutboundWithStage(
+    allocator: Allocator,
+    channel: []const u8,
+    chat_id: []const u8,
+    content: []const u8,
+    stage: streaming.OutboundStage,
+) Allocator.Error!OutboundMessage {
     // channel is not duped — must be a literal or long-lived config pointer
     const cid = try allocator.dupe(u8, chat_id);
     errdefer allocator.free(cid);
@@ -150,6 +172,7 @@ pub fn makeOutbound(
         .channel = channel,
         .chat_id = cid,
         .content = ct,
+        .stage = stage,
     };
 }
 
@@ -159,6 +182,27 @@ pub fn makeOutboundWithAccount(
     account_id: []const u8,
     chat_id: []const u8,
     content: []const u8,
+) Allocator.Error!OutboundMessage {
+    return makeOutboundWithAccountStage(allocator, channel, account_id, chat_id, content, .final);
+}
+
+pub fn makeOutboundChunkWithAccount(
+    allocator: Allocator,
+    channel: []const u8,
+    account_id: []const u8,
+    chat_id: []const u8,
+    content: []const u8,
+) Allocator.Error!OutboundMessage {
+    return makeOutboundWithAccountStage(allocator, channel, account_id, chat_id, content, .chunk);
+}
+
+fn makeOutboundWithAccountStage(
+    allocator: Allocator,
+    channel: []const u8,
+    account_id: []const u8,
+    chat_id: []const u8,
+    content: []const u8,
+    stage: streaming.OutboundStage,
 ) Allocator.Error!OutboundMessage {
     const cid = try allocator.dupe(u8, chat_id);
     errdefer allocator.free(cid);
@@ -171,6 +215,7 @@ pub fn makeOutboundWithAccount(
         .account_id = aid,
         .chat_id = cid,
         .content = ct,
+        .stage = stage,
     };
 }
 
@@ -379,6 +424,7 @@ test "makeOutbound produces owned copies" {
 
     src_content[0] = 'Z';
     try testing.expectEqualStrings("reply", msg.content);
+    try testing.expect(msg.stage == .final);
 }
 
 test "makeOutboundWithAccount stores account_id" {
@@ -387,6 +433,22 @@ test "makeOutboundWithAccount stores account_id" {
     defer msg.deinit(alloc);
     try testing.expect(msg.account_id != null);
     try testing.expectEqualStrings("backup", msg.account_id.?);
+    try testing.expect(msg.stage == .final);
+}
+
+test "makeOutboundChunk marks chunk stage" {
+    const alloc = testing.allocator;
+    const msg = try makeOutboundChunk(alloc, "web", "c1", "delta");
+    defer msg.deinit(alloc);
+    try testing.expect(msg.stage == .chunk);
+}
+
+test "makeOutboundChunkWithAccount marks chunk stage" {
+    const alloc = testing.allocator;
+    const msg = try makeOutboundChunkWithAccount(alloc, "web", "main", "c1", "delta");
+    defer msg.deinit(alloc);
+    try testing.expect(msg.stage == .chunk);
+    try testing.expectEqualStrings("main", msg.account_id.?);
 }
 
 // ---------------------------------------------------------------------------
@@ -433,7 +495,7 @@ test "queue fill to capacity" {
 test "queue close wakes consumer — returns null" {
     var q = BoundedQueue(u32, 4).init();
 
-    const handle = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, struct {
+    const handle = try std.Thread.spawn(.{ .stack_size = thread_stacks.COORDINATION_STACK_SIZE }, struct {
         fn run(qp: *BoundedQueue(u32, 4)) void {
             std.Thread.sleep(5 * std.time.ns_per_ms);
             qp.close();
@@ -525,7 +587,7 @@ test "bus multiple inbound producers" {
 
     var handles: [num_threads]std.Thread = undefined;
     for (0..num_threads) |t| {
-        handles[t] = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, struct {
+        handles[t] = try std.Thread.spawn(.{ .stack_size = thread_stacks.COORDINATION_STACK_SIZE }, struct {
             fn run(b: *Bus, tid: usize, a: Allocator) void {
                 for (0..msgs_per_thread) |i| {
                     var id_buf: [32]u8 = undefined;
@@ -564,7 +626,7 @@ test "bus stress: 10 producers × 100 messages" {
 
     var producers: [num_threads]std.Thread = undefined;
     for (0..num_threads) |t| {
-        producers[t] = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, struct {
+        producers[t] = try std.Thread.spawn(.{ .stack_size = thread_stacks.COORDINATION_STACK_SIZE }, struct {
             fn run(b: *Bus, tid: usize, a: Allocator) void {
                 for (0..msgs_per_thread) |i| {
                     var id_buf: [32]u8 = undefined;
@@ -577,7 +639,7 @@ test "bus stress: 10 producers × 100 messages" {
     }
 
     var count: usize = 0;
-    const consumer = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, struct {
+    const consumer = try std.Thread.spawn(.{ .stack_size = thread_stacks.COORDINATION_STACK_SIZE }, struct {
         fn run(b: *Bus, cnt: *usize, a: Allocator) void {
             while (b.consumeInbound()) |msg| {
                 msg.deinit(a);
@@ -727,7 +789,7 @@ test "bus outbound multiple producers" {
 
     var handles: [num_threads]std.Thread = undefined;
     for (0..num_threads) |t| {
-        handles[t] = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, struct {
+        handles[t] = try std.Thread.spawn(.{ .stack_size = thread_stacks.COORDINATION_STACK_SIZE }, struct {
             fn run(b: *Bus, tid: usize, a: Allocator) void {
                 for (0..msgs_per_thread) |i| {
                     var id_buf: [32]u8 = undefined;

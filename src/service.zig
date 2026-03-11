@@ -1,6 +1,6 @@
 //! Service management — launchd (macOS), systemd (Linux), and SCM (Windows).
 //!
-//! Mirrors ZeroClaw's service module: install, start, stop, status, uninstall.
+//! Mirrors ZeroClaw's service module: install, start, stop, restart, status, uninstall.
 //! Uses child process execution to interact with launchctl / systemctl / sc.exe.
 
 const std = @import("std");
@@ -15,6 +15,7 @@ pub const ServiceCommand = enum {
     install,
     start,
     stop,
+    restart,
     status,
     uninstall,
 };
@@ -38,6 +39,7 @@ pub fn handleCommand(
         .install => install(allocator, config_path),
         .start => startService(allocator),
         .stop => stopService(allocator),
+        .restart => restartService(allocator),
         .status => serviceStatus(allocator),
         .uninstall => uninstall(allocator),
     };
@@ -83,6 +85,43 @@ fn stopService(allocator: std.mem.Allocator) !void {
         try runChecked(allocator, &.{ "systemctl", "--user", "stop", "nullclaw.service" });
     } else if (comptime builtin.os.tag == .windows) {
         try runChecked(allocator, &.{ "sc.exe", "stop", WINDOWS_SERVICE_NAME });
+    } else {
+        return error.UnsupportedPlatform;
+    }
+}
+
+fn restartService(allocator: std.mem.Allocator) !void {
+    // Restart should still proceed when stop reports "already stopped"/"not loaded",
+    // but should not mask unrelated stop failures.
+    try stopServiceForRestart(allocator);
+    try startService(allocator);
+}
+
+fn stopServiceForRestart(allocator: std.mem.Allocator) !void {
+    if (comptime builtin.os.tag == .macos) {
+        // launchctl stop/unload can fail when not loaded; treat as best-effort here.
+        const plist = try macosServiceFile(allocator);
+        defer allocator.free(plist);
+        runChecked(allocator, &.{ "launchctl", "stop", SERVICE_LABEL }) catch {};
+        runChecked(allocator, &.{ "launchctl", "unload", "-w", plist }) catch {};
+        return;
+    } else if (comptime builtin.os.tag == .linux) {
+        try assertLinuxSystemdUserAvailable(allocator);
+        const status = try runCaptureStatus(allocator, &.{ "systemctl", "--user", "stop", "nullclaw.service" });
+        defer allocator.free(status.stdout);
+        defer allocator.free(status.stderr);
+        if (status.success) return;
+        const detail = captureStatusDetail(&status);
+        if (isSystemdUnitNotLoadedDetail(detail)) return;
+        return error.CommandFailed;
+    } else if (comptime builtin.os.tag == .windows) {
+        const status = try runCaptureStatus(allocator, &.{ "sc.exe", "stop", WINDOWS_SERVICE_NAME });
+        defer allocator.free(status.stdout);
+        defer allocator.free(status.stderr);
+        if (status.success) return;
+        const detail = captureStatusDetail(&status);
+        if (isWindowsServiceMissingDetail(detail) or isWindowsServiceNotRunningDetail(detail)) return;
+        return error.CommandFailed;
     } else {
         return error.UnsupportedPlatform;
     }
@@ -171,6 +210,8 @@ fn installMacos(allocator: std.mem.Allocator, _: []const u8) !void {
     // Get current executable path
     var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
     const exe_path = try std.fs.selfExePath(&exe_buf);
+    const service_exe_path = try resolveServiceExecutablePath(allocator, exe_path);
+    defer allocator.free(service_exe_path);
 
     const home = try getHomeDir(allocator);
     defer allocator.free(home);
@@ -208,12 +249,45 @@ fn installMacos(allocator: std.mem.Allocator, _: []const u8) !void {
         \\  <string>{s}</string>
         \\</dict>
         \\</plist>
-    , .{ SERVICE_LABEL, xmlEscape(exe_path), xmlEscape(stdout_log), xmlEscape(stderr_log) });
+    , .{ SERVICE_LABEL, xmlEscape(service_exe_path), xmlEscape(stdout_log), xmlEscape(stderr_log) });
     defer allocator.free(content);
 
     const file = try std.fs.createFileAbsolute(plist, .{});
     defer file.close();
     try file.writeAll(content);
+}
+
+fn resolveServiceExecutablePath(allocator: std.mem.Allocator, exe_path: []const u8) ![]u8 {
+    if (try preferredHomebrewShimPath(allocator, exe_path)) |candidate| {
+        std.fs.accessAbsolute(candidate, .{}) catch |err| switch (err) {
+            error.FileNotFound => {
+                allocator.free(candidate);
+                return allocator.dupe(u8, exe_path);
+            },
+            else => {
+                allocator.free(candidate);
+                return err;
+            },
+        };
+        return candidate;
+    }
+    return allocator.dupe(u8, exe_path);
+}
+
+fn preferredHomebrewShimPath(allocator: std.mem.Allocator, exe_path: []const u8) !?[]u8 {
+    if (!std.mem.endsWith(u8, exe_path, "/bin/nullclaw")) {
+        return null;
+    }
+
+    const cellar_marker = "/Cellar/nullclaw/";
+    const cellar_index = std.mem.indexOf(u8, exe_path, cellar_marker) orelse return null;
+    if (cellar_index == 0) {
+        return null;
+    }
+
+    // selfExePath uses POSIX separators for Homebrew installs even when tests run on Windows.
+    const candidate = try std.fmt.allocPrint(allocator, "{s}/bin/nullclaw", .{exe_path[0..cellar_index]});
+    return candidate;
 }
 
 fn installLinux(allocator: std.mem.Allocator) !void {
@@ -228,6 +302,13 @@ fn installLinux(allocator: std.mem.Allocator) !void {
 
     var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
     const exe_path = try std.fs.selfExePath(&exe_buf);
+    const service_exe_path = try resolveServiceExecutablePath(allocator, exe_path);
+    defer allocator.free(service_exe_path);
+
+    const home = try getHomeDir(allocator);
+    defer allocator.free(home);
+    const config_dir = try std.fs.path.join(allocator, &.{ home, ".nullclaw" });
+    defer allocator.free(config_dir);
 
     const content = try std.fmt.allocPrint(allocator,
         \\[Unit]
@@ -239,10 +320,11 @@ fn installLinux(allocator: std.mem.Allocator) !void {
         \\ExecStart={s} gateway
         \\Restart=always
         \\RestartSec=3
+        \\EnvironmentFile=-{s}/.env
         \\
         \\[Install]
         \\WantedBy=default.target
-    , .{exe_path});
+    , .{ service_exe_path, config_dir });
     defer allocator.free(content);
 
     const file = try std.fs.createFileAbsolute(unit, .{});
@@ -353,10 +435,21 @@ fn isSystemdUnavailableDetail(detail: []const u8) bool {
         std.ascii.indexOfIgnoreCase(detail, "no such file or directory") != null;
 }
 
+fn isSystemdUnitNotLoadedDetail(detail: []const u8) bool {
+    return std.ascii.indexOfIgnoreCase(detail, "unit nullclaw.service not loaded") != null or
+        std.ascii.indexOfIgnoreCase(detail, "could not be found") != null or
+        std.ascii.indexOfIgnoreCase(detail, "not loaded") != null;
+}
+
 fn isWindowsServiceMissingDetail(detail: []const u8) bool {
     return std.ascii.indexOfIgnoreCase(detail, "1060") != null or
         std.ascii.indexOfIgnoreCase(detail, "does not exist as an installed service") != null or
         std.ascii.indexOfIgnoreCase(detail, "service does not exist") != null;
+}
+
+fn isWindowsServiceNotRunningDetail(detail: []const u8) bool {
+    return std.ascii.indexOfIgnoreCase(detail, "1062") != null or
+        std.ascii.indexOfIgnoreCase(detail, "service has not been started") != null;
 }
 
 fn isWindowsServiceAlreadyExistsDetail(detail: []const u8) bool {
@@ -502,6 +595,32 @@ test "xmlEscape returns input for safe strings" {
     try std.testing.expectEqualStrings(input, xmlEscape(input));
 }
 
+test "preferredHomebrewShimPath resolves Apple Silicon Cellar install" {
+    const shim = (try preferredHomebrewShimPath(std.testing.allocator, "/opt/homebrew/Cellar/nullclaw/2026.3.7/bin/nullclaw")).?;
+    defer std.testing.allocator.free(shim);
+    try std.testing.expectEqualStrings("/opt/homebrew/bin/nullclaw", shim);
+}
+
+test "preferredHomebrewShimPath resolves Intel Homebrew Cellar install" {
+    const shim = (try preferredHomebrewShimPath(std.testing.allocator, "/usr/local/Cellar/nullclaw/2026.3.7/bin/nullclaw")).?;
+    defer std.testing.allocator.free(shim);
+    try std.testing.expectEqualStrings("/usr/local/bin/nullclaw", shim);
+}
+
+test "preferredHomebrewShimPath resolves Linux Homebrew Cellar install" {
+    const shim = (try preferredHomebrewShimPath(std.testing.allocator, "/home/linuxbrew/.linuxbrew/Cellar/nullclaw/2026.3.7/bin/nullclaw")).?;
+    defer std.testing.allocator.free(shim);
+    try std.testing.expectEqualStrings("/home/linuxbrew/.linuxbrew/bin/nullclaw", shim);
+}
+
+test "preferredHomebrewShimPath ignores non-Cellar paths" {
+    try std.testing.expect((try preferredHomebrewShimPath(std.testing.allocator, "/Applications/nullclaw/bin/nullclaw")) == null);
+}
+
+test "preferredHomebrewShimPath ignores non-executable Cellar paths" {
+    try std.testing.expect((try preferredHomebrewShimPath(std.testing.allocator, "/opt/homebrew/Cellar/nullclaw/2026.3.7/share/nullclaw.txt")) == null);
+}
+
 test "runChecked succeeds for true command" {
     runChecked(std.testing.allocator, &.{"true"}) catch {
         // May fail in CI — just ensure it compiles
@@ -527,10 +646,23 @@ test "isSystemdUnavailableDetail detects common unavailable errors" {
     try std.testing.expect(!isSystemdUnavailableDetail("permission denied"));
 }
 
+test "isSystemdUnitNotLoadedDetail detects stop-not-loaded patterns" {
+    try std.testing.expect(isSystemdUnitNotLoadedDetail("Unit nullclaw.service not loaded."));
+    try std.testing.expect(isSystemdUnitNotLoadedDetail("Unit nullclaw.service could not be found."));
+    try std.testing.expect(isSystemdUnitNotLoadedDetail("not loaded"));
+    try std.testing.expect(!isSystemdUnitNotLoadedDetail("permission denied"));
+}
+
 test "isWindowsServiceMissingDetail detects missing-service patterns" {
     try std.testing.expect(isWindowsServiceMissingDetail("OpenService FAILED 1060"));
     try std.testing.expect(isWindowsServiceMissingDetail("The specified service does not exist as an installed service."));
     try std.testing.expect(!isWindowsServiceMissingDetail("OpenService FAILED 5: Access is denied."));
+}
+
+test "isWindowsServiceNotRunningDetail detects stop-not-running patterns" {
+    try std.testing.expect(isWindowsServiceNotRunningDetail("ControlService FAILED 1062"));
+    try std.testing.expect(isWindowsServiceNotRunningDetail("The service has not been started."));
+    try std.testing.expect(!isWindowsServiceNotRunningDetail("OpenService FAILED 1060"));
 }
 
 test "isWindowsServiceAlreadyExistsDetail detects duplicate-service patterns" {

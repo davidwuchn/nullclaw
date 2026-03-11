@@ -9,17 +9,17 @@ const Tool = root.Tool;
 const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const net_security = @import("../root.zig").net_security;
+const http_util = @import("../http_util.zig");
+
+const log = std.log.scoped(.web_fetch);
 
 /// Default max chars for extracted content.
 const DEFAULT_MAX_CHARS: usize = 50_000;
-const WEB_FETCH_HEADERS = [_]std.http.Header{
-    .{ .name = "User-Agent", .value = "nullclaw/0.1 (web_fetch tool)" },
-    .{ .name = "Accept", .value = "text/html,application/json,text/plain,*/*" },
-};
 
 /// Web fetch tool — fetches URLs and extracts readable content.
 pub const WebFetchTool = struct {
     default_max_chars: usize = DEFAULT_MAX_CHARS,
+    allowed_domains: []const []const u8 = &.{}, // empty = allow all
 
     pub const tool_name = "web_fetch";
     pub const tool_description = "Fetch a web page and extract its text content. Converts HTML to readable text with markdown formatting.";
@@ -60,53 +60,45 @@ pub const WebFetchTool = struct {
         };
         defer allocator.free(connect_host);
 
-        const max_chars = parseMaxCharsWithDefault(args, self.default_max_chars);
-
-        // Fetch URL
-        var client: std.http.Client = .{ .allocator = allocator };
-        defer client.deinit();
-
-        const protocol: std.http.Client.Protocol = if (std.ascii.eqlIgnoreCase(uri.scheme, "https")) .tls else .plain;
-        const authority_host = stripHostBrackets(host);
-        const connection = client.connectTcpOptions(.{
-            .host = connect_host,
-            .port = resolved_port,
-            .protocol = protocol,
-            .proxied_host = authority_host,
-            .proxied_port = resolved_port,
-        }) catch |err| {
-            const msg = try std.fmt.allocPrint(allocator, "Fetch failed: {}", .{err});
-            return ToolResult{ .success = false, .output = "", .error_msg = msg };
-        };
-
-        var req = client.request(.GET, uri, buildRequestOptions(connection)) catch |err| {
-            const msg = try std.fmt.allocPrint(allocator, "Fetch failed: {}", .{err});
-            return ToolResult{ .success = false, .output = "", .error_msg = msg };
-        };
-        defer req.deinit();
-
-        req.sendBodiless() catch |err| {
-            const msg = try std.fmt.allocPrint(allocator, "Failed to send request: {}", .{err});
-            return ToolResult{ .success = false, .output = "", .error_msg = msg };
-        };
-
-        var redirect_buf: [4096]u8 = undefined;
-        var response = req.receiveHead(&redirect_buf) catch |err| {
-            const msg = try std.fmt.allocPrint(allocator, "Failed to receive response: {}", .{err});
-            return ToolResult{ .success = false, .output = "", .error_msg = msg };
-        };
-
-        const status_code = @intFromEnum(response.head.status);
-        if (!isSuccessStatus(status_code)) {
-            const msg = try std.fmt.allocPrint(allocator, "HTTP {d}", .{status_code});
-            return ToolResult{ .success = false, .output = "", .error_msg = msg };
+        // Keep security surface aligned with http_request.
+        if (self.allowed_domains.len > 0) {
+            if (!net_security.hostMatchesAllowlist(host, self.allowed_domains)) {
+                return ToolResult.fail("Host is not in http_request.allowed_domains");
+            }
         }
 
-        // Read body (limit to 2MB)
-        var transfer_buf: [8192]u8 = undefined;
-        const reader = response.reader(&transfer_buf);
-        const body = reader.readAlloc(allocator, 2 * 1024 * 1024) catch |err| {
-            const msg = try std.fmt.allocPrint(allocator, "Failed to read response: {}", .{err});
+        const max_chars = parseMaxCharsWithDefault(args, self.default_max_chars);
+
+        // Fetch URL via curl subprocess
+        const headers = [_][]const u8{
+            "User-Agent: nullclaw/0.1 (web_fetch tool)",
+            "Accept: text/html,application/json,text/plain,*/*",
+        };
+
+        const body = blk: {
+            if (shouldUseCurlResolve(host)) {
+                const resolve_entry = try buildCurlResolveEntry(allocator, host, resolved_port, connect_host);
+                defer allocator.free(resolve_entry);
+                break :blk http_util.curlGetWithResolve(
+                    allocator,
+                    url,
+                    &headers,
+                    "30",
+                    resolve_entry,
+                );
+            }
+            break :blk http_util.curlGet(
+                allocator,
+                url,
+                &headers,
+                "30",
+            );
+        } catch |err| {
+            log.err("web_fetch connection failed for {s}: {}", .{ url, err });
+            if (err == error.CurlInterrupted) {
+                return ToolResult.fail("Interrupted by /stop");
+            }
+            const msg = try std.fmt.allocPrint(allocator, "Fetch failed: {}", .{err});
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
         };
         defer allocator.free(body);
@@ -140,23 +132,26 @@ fn parseMaxCharsWithDefault(args: JsonObjectMap, default: usize) usize {
     return @intCast(val_i64);
 }
 
-fn buildRequestOptions(connection: ?*std.http.Client.Connection) std.http.Client.RequestOptions {
-    return .{
-        .extra_headers = &WEB_FETCH_HEADERS,
-        .redirect_behavior = .unhandled,
-        .connection = connection,
-    };
+fn shouldUseCurlResolve(host: []const u8) bool {
+    // DNS pinning is required for hostname-based URLs. IPv6 literals do not
+    // involve DNS and don't fit curl's host:port `--resolve` syntax cleanly.
+    return std.mem.indexOfScalar(u8, net_security.stripHostBrackets(host), ':') == null;
 }
 
-fn isSuccessStatus(status_code: u16) bool {
-    return status_code >= 200 and status_code < 300;
-}
+fn buildCurlResolveEntry(
+    allocator: std.mem.Allocator,
+    host: []const u8,
+    port: u16,
+    connect_host: []const u8,
+) ![]u8 {
+    const host_for_resolve = net_security.stripHostBrackets(host);
+    const connect_target = if (std.mem.indexOfScalar(u8, connect_host, ':') != null)
+        try std.fmt.allocPrint(allocator, "[{s}]", .{connect_host})
+    else
+        try allocator.dupe(u8, connect_host);
+    defer allocator.free(connect_target);
 
-fn stripHostBrackets(host: []const u8) []const u8 {
-    if (std.mem.startsWith(u8, host, "[") and std.mem.endsWith(u8, host, "]")) {
-        return host[1 .. host.len - 1];
-    }
-    return host;
+    return std.fmt.allocPrint(allocator, "{s}:{d}:{s}", .{ host_for_resolve, port, connect_target });
 }
 
 /// Convert HTML to readable text with basic markdown formatting.
@@ -494,26 +489,41 @@ test "WebFetchTool loopback decimal alias blocked" {
     try testing.expectEqualStrings("Blocked local/private host", result.error_msg.?);
 }
 
-test "web_fetch disables automatic redirects" {
-    const opts = buildRequestOptions(null);
-    try testing.expect(opts.redirect_behavior == .unhandled);
-    try testing.expect(opts.connection == null);
+test "WebFetchTool blocked when host is not in allowlist" {
+    const domains = [_][]const u8{"example.com"};
+    var wft = WebFetchTool{ .allowed_domains = &domains };
+    const parsed = try root.parseTestArgs("{\"url\":\"https://google.com\"}");
+    defer parsed.deinit();
+    const result = try wft.execute(testing.allocator, parsed.value.object);
+    try testing.expect(!result.success);
+    try testing.expectEqualStrings("Host is not in http_request.allowed_domains", result.error_msg.?);
 }
 
-test "web_fetch request options keep provided connection" {
-    const fake_ptr_value = @as(usize, @alignOf(std.http.Client.Connection));
-    const fake_connection: *std.http.Client.Connection = @ptrFromInt(fake_ptr_value);
-    const opts = buildRequestOptions(fake_connection);
-    try testing.expect(opts.connection != null);
-    try testing.expectEqual(@intFromPtr(fake_connection), @intFromPtr(opts.connection.?));
+test "WebFetchTool local host remains blocked with allowlist configured" {
+    const domains = [_][]const u8{"example.com"};
+    var wft = WebFetchTool{ .allowed_domains = &domains };
+    const parsed = try root.parseTestArgs("{\"url\":\"http://127.0.0.1/\"}");
+    defer parsed.deinit();
+    const result = try wft.execute(testing.allocator, parsed.value.object);
+    try testing.expect(!result.success);
+    try testing.expectEqualStrings("Blocked local/private host", result.error_msg.?);
 }
 
-test "web_fetch treats only 2xx as success" {
-    try testing.expect(isSuccessStatus(200));
-    try testing.expect(isSuccessStatus(299));
-    try testing.expect(!isSuccessStatus(300));
-    try testing.expect(!isSuccessStatus(302));
-    try testing.expect(!isSuccessStatus(404));
+test "buildCurlResolveEntry formats ipv4 connect target" {
+    const entry = try buildCurlResolveEntry(testing.allocator, "example.com", 443, "93.184.216.34");
+    defer testing.allocator.free(entry);
+    try testing.expectEqualStrings("example.com:443:93.184.216.34", entry);
+}
+
+test "buildCurlResolveEntry wraps ipv6 connect target" {
+    const entry = try buildCurlResolveEntry(testing.allocator, "example.com", 443, "2001:db8::1");
+    defer testing.allocator.free(entry);
+    try testing.expectEqualStrings("example.com:443:[2001:db8::1]", entry);
+}
+
+test "shouldUseCurlResolve skips ipv6 literal hosts" {
+    try testing.expect(shouldUseCurlResolve("example.com"));
+    try testing.expect(!shouldUseCurlResolve("[2001:db8::1]"));
 }
 
 test "htmlToText strips script and style" {

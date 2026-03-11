@@ -2,6 +2,8 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const root = @import("root.zig");
 const bus = @import("../bus.zig");
+const Atomic = @import("../portable_atomic.zig").Atomic;
+const thread_stacks = @import("../thread_stacks.zig");
 
 /// Message dispatch — routes incoming ChannelMessages to the agent,
 /// routes agent responses back to the originating channel.
@@ -134,9 +136,9 @@ pub fn buildSystemPrompt(
 
 /// Counters for the outbound dispatch loop (all atomic for thread safety).
 pub const DispatchStats = struct {
-    dispatched: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    errors: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    channel_not_found: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    dispatched: Atomic(u64) = Atomic(u64).init(0),
+    errors: Atomic(u64) = Atomic(u64).init(0),
+    channel_not_found: Atomic(u64) = Atomic(u64).init(0),
 
     pub fn getDispatched(self: *const DispatchStats) u64 {
         return self.dispatched.load(.monotonic);
@@ -174,7 +176,7 @@ pub fn runOutboundDispatcher(
             registry.findByName(msg.channel);
 
         if (channel_opt) |channel| {
-            channel.send(msg.chat_id, msg.content, msg.media) catch {
+            channel.sendEvent(msg.chat_id, msg.content, msg.media, msg.stage) catch {
                 _ = stats.errors.fetchAdd(1, .monotonic);
                 continue;
             };
@@ -350,13 +352,15 @@ test "build system prompt" {
 /// Mock channel for dispatch tests.
 const MockChannel = struct {
     name_str: []const u8,
-    sent_count: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    sent_count: Atomic(u64) = Atomic(u64).init(0),
+    chunk_count: Atomic(u64) = Atomic(u64).init(0),
     should_fail: bool = false,
 
     const vtable = root.Channel.VTable{
         .start = mockStart,
         .stop = mockStop,
         .send = mockSend,
+        .sendEvent = mockSendEvent,
         .name = mockName,
         .healthCheck = mockHealthCheck,
     };
@@ -371,6 +375,20 @@ const MockChannel = struct {
         const self: *MockChannel = @ptrCast(@alignCast(ctx));
         if (self.should_fail) return error.SendFailed;
         _ = self.sent_count.fetchAdd(1, .monotonic);
+    }
+    fn mockSendEvent(
+        ctx: *anyopaque,
+        _: []const u8,
+        _: []const u8,
+        _: []const []const u8,
+        stage: root.Channel.OutboundStage,
+    ) anyerror!void {
+        const self: *MockChannel = @ptrCast(@alignCast(ctx));
+        if (self.should_fail) return error.SendFailed;
+        switch (stage) {
+            .chunk => _ = self.chunk_count.fetchAdd(1, .monotonic),
+            .final => _ = self.sent_count.fetchAdd(1, .monotonic),
+        }
     }
     fn mockName(ctx: *anyopaque) []const u8 {
         const self: *const MockChannel = @ptrCast(@alignCast(ctx));
@@ -410,6 +428,28 @@ test "dispatcher routes message to correct channel" {
     try std.testing.expectEqual(@as(u64, 0), stats.getErrors());
     try std.testing.expectEqual(@as(u64, 0), stats.getChannelNotFound());
     try std.testing.expectEqual(@as(u64, 1), mock_tg.sent_count.load(.monotonic));
+}
+
+test "dispatcher routes chunk stage via sendEvent" {
+    const allocator = std.testing.allocator;
+
+    var mock_web = MockChannel{ .name_str = "web" };
+    var reg = ChannelRegistry.init(allocator);
+    defer reg.deinit();
+    try reg.register(mock_web.channel());
+
+    var event_bus = bus.Bus.init();
+    var stats = DispatchStats{};
+
+    const msg = try bus.makeOutboundChunk(allocator, "web", "chat1", "hel");
+    try event_bus.publishOutbound(msg);
+    event_bus.close();
+
+    runOutboundDispatcher(allocator, &event_bus, &reg, &stats);
+
+    try std.testing.expectEqual(@as(u64, 1), stats.getDispatched());
+    try std.testing.expectEqual(@as(u64, 1), mock_web.chunk_count.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), mock_web.sent_count.load(.monotonic));
 }
 
 test "dispatcher routes to matching account when channel has multiple accounts" {
@@ -592,7 +632,7 @@ test "dispatcher runs in a separate thread" {
     var stats = DispatchStats{};
 
     // Spawn dispatcher thread
-    const thread = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, runOutboundDispatcher, .{
+    const thread = try std.Thread.spawn(.{ .stack_size = thread_stacks.COORDINATION_STACK_SIZE }, runOutboundDispatcher, .{
         allocator, &event_bus, &reg, &stats,
     });
 
@@ -625,14 +665,14 @@ test "dispatcher concurrent producers + single dispatcher" {
     const total = num_producers * msgs_per_producer;
 
     // Spawn dispatcher
-    const dispatcher = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, runOutboundDispatcher, .{
+    const dispatcher = try std.Thread.spawn(.{ .stack_size = thread_stacks.COORDINATION_STACK_SIZE }, runOutboundDispatcher, .{
         allocator, &event_bus, &reg, &stats,
     });
 
     // Spawn producers
     var producers: [num_producers]std.Thread = undefined;
     for (0..num_producers) |i| {
-        producers[i] = try std.Thread.spawn(.{ .stack_size = 64 * 1024 }, struct {
+        producers[i] = try std.Thread.spawn(.{ .stack_size = thread_stacks.COORDINATION_STACK_SIZE }, struct {
             fn run(b: *bus.Bus, a: Allocator) void {
                 for (0..msgs_per_producer) |_| {
                     const m = bus.makeOutbound(a, "test", "c", "x") catch return;

@@ -7,6 +7,7 @@
 const std = @import("std");
 const memory_mod = @import("../memory/root.zig");
 const Memory = memory_mod.Memory;
+const bootstrap_mod = @import("../bootstrap/root.zig");
 
 // ── JSON arg extraction helpers ─────────────────────────────────
 // Used by all tool implementations to extract typed fields from
@@ -41,6 +42,14 @@ pub fn getInt(args: JsonObjectMap, key: []const u8) ?i64 {
 
 pub fn getValue(args: JsonObjectMap, key: []const u8) ?JsonValue {
     return args.get(key);
+}
+
+pub fn getStringArray(args: JsonObjectMap, key: []const u8) ?[]const JsonValue {
+    const val = args.get(key) orelse return null;
+    return switch (val) {
+        .array => |a| a.items,
+        else => null,
+    };
 }
 
 /// Test helper: parse a JSON string into a Parsed(Value) for use in tool tests.
@@ -265,6 +274,12 @@ pub fn allTools(
     workspace_dir: []const u8,
     opts: struct {
         http_enabled: bool = false,
+        http_allowed_domains: []const []const u8 = &.{},
+        http_max_response_size: u32 = 1_000_000,
+        http_timeout_secs: u64 = 30,
+        web_search_base_url: ?[]const u8 = null,
+        web_search_provider: []const u8 = "auto",
+        web_search_fallback_providers: []const []const u8 = &.{},
         browser_enabled: bool = false,
         screenshot_enabled: bool = false,
         composio_api_key: ?[]const u8 = null,
@@ -272,12 +287,15 @@ pub fn allTools(
         hardware_boards: ?[]const []const u8 = null,
         mcp_tools: ?[]const Tool = null,
         agents: ?[]const @import("../config.zig").NamedAgentConfig = null,
+        configured_providers: []const @import("../config_types.zig").ProviderEntry = &.{},
         fallback_api_key: ?[]const u8 = null,
         delegate_depth: u32 = 0,
         subagent_manager: ?*@import("../subagent.zig").SubagentManager = null,
         allowed_paths: []const []const u8 = &.{},
         tools_config: @import("../config.zig").ToolsConfig = .{},
         policy: ?*const @import("../security/policy.zig").SecurityPolicy = null,
+        bootstrap_provider: ?bootstrap_mod.BootstrapProvider = null,
+        backend_name: []const u8 = "hybrid",
     },
 ) ![]Tool {
     var list: std.ArrayList(Tool) = .{};
@@ -298,6 +316,7 @@ pub fn allTools(
         .timeout_ns = tc.shell_timeout_secs * std.time.ns_per_s,
         .max_output_bytes = tc.shell_max_output_bytes,
         .policy = opts.policy,
+        .path_env_vars = tc.path_env_vars,
     };
     try list.append(allocator, st.tool());
 
@@ -306,11 +325,22 @@ pub fn allTools(
     try list.append(allocator, ft.tool());
 
     const wt = try allocator.create(file_write.FileWriteTool);
-    wt.* = .{ .workspace_dir = workspace_dir, .allowed_paths = opts.allowed_paths };
+    wt.* = .{
+        .workspace_dir = workspace_dir,
+        .allowed_paths = opts.allowed_paths,
+        .bootstrap_provider = opts.bootstrap_provider,
+        .backend_name = opts.backend_name,
+    };
     try list.append(allocator, wt.tool());
 
     const et2 = try allocator.create(file_edit.FileEditTool);
-    et2.* = .{ .workspace_dir = workspace_dir, .allowed_paths = opts.allowed_paths, .max_file_size = tc.max_file_size_bytes };
+    et2.* = .{
+        .workspace_dir = workspace_dir,
+        .allowed_paths = opts.allowed_paths,
+        .max_file_size = tc.max_file_size_bytes,
+        .bootstrap_provider = opts.bootstrap_provider,
+        .backend_name = opts.backend_name,
+    };
     try list.append(allocator, et2.tool());
 
     const gt = try allocator.create(git.GitTool);
@@ -343,6 +373,7 @@ pub fn allTools(
     const dlt = try allocator.create(delegate.DelegateTool);
     dlt.* = .{
         .agents = opts.agents orelse &.{},
+        .configured_providers = opts.configured_providers,
         .fallback_api_key = opts.fallback_api_key,
         .depth = opts.delegate_depth,
     };
@@ -358,9 +389,33 @@ pub fn allTools(
     try list.append(allocator, sp.tool());
 
     if (opts.http_enabled) {
+        // Pushover notification tool (network egress, gated with HTTP tools).
+        const pt = try allocator.create(pushover.PushoverTool);
+        pt.* = .{ .workspace_dir = workspace_dir };
+        try list.append(allocator, pt.tool());
+
         const ht = try allocator.create(http_request.HttpRequestTool);
-        ht.* = .{};
+        ht.* = .{
+            .allowed_domains = opts.http_allowed_domains,
+            .max_response_size = opts.http_max_response_size,
+        };
         try list.append(allocator, ht.tool());
+
+        const wst = try allocator.create(web_search.WebSearchTool);
+        wst.* = .{
+            .searxng_base_url = opts.web_search_base_url,
+            .provider = opts.web_search_provider,
+            .fallback_providers = opts.web_search_fallback_providers,
+            .timeout_secs = opts.http_timeout_secs,
+        };
+        try list.append(allocator, wst.tool());
+
+        const wft = try allocator.create(web_fetch.WebFetchTool);
+        wft.* = .{
+            .default_max_chars = tc.web_fetch_max_chars,
+            .allowed_domains = opts.http_allowed_domains,
+        };
+        try list.append(allocator, wft.tool());
     }
 
     if (opts.browser_enabled) {
@@ -465,8 +520,13 @@ pub fn subagentTools(
     workspace_dir: []const u8,
     opts: struct {
         http_enabled: bool = false,
+        http_allowed_domains: []const []const u8 = &.{},
+        http_max_response_size: u32 = 1_000_000,
         allowed_paths: []const []const u8 = &.{},
         policy: ?*const @import("../security/policy.zig").SecurityPolicy = null,
+        tools_config: @import("../config.zig").ToolsConfig = .{},
+        bootstrap_provider: ?bootstrap_mod.BootstrapProvider = null,
+        backend_name: []const u8 = "hybrid",
     },
 ) ![]Tool {
     var list: std.ArrayList(Tool) = .{};
@@ -477,20 +537,44 @@ pub fn subagentTools(
         list.deinit(allocator);
     }
 
+    const tc = opts.tools_config;
+
     const st = try allocator.create(shell.ShellTool);
-    st.* = .{ .workspace_dir = workspace_dir, .allowed_paths = opts.allowed_paths, .policy = opts.policy };
+    st.* = .{
+        .workspace_dir = workspace_dir,
+        .allowed_paths = opts.allowed_paths,
+        .timeout_ns = tc.shell_timeout_secs * std.time.ns_per_s,
+        .max_output_bytes = tc.shell_max_output_bytes,
+        .policy = opts.policy,
+        .path_env_vars = tc.path_env_vars,
+    };
     try list.append(allocator, st.tool());
 
     const ft = try allocator.create(file_read.FileReadTool);
-    ft.* = .{ .workspace_dir = workspace_dir, .allowed_paths = opts.allowed_paths };
+    ft.* = .{
+        .workspace_dir = workspace_dir,
+        .allowed_paths = opts.allowed_paths,
+        .max_file_size = tc.max_file_size_bytes,
+    };
     try list.append(allocator, ft.tool());
 
     const wt = try allocator.create(file_write.FileWriteTool);
-    wt.* = .{ .workspace_dir = workspace_dir, .allowed_paths = opts.allowed_paths };
+    wt.* = .{
+        .workspace_dir = workspace_dir,
+        .allowed_paths = opts.allowed_paths,
+        .bootstrap_provider = opts.bootstrap_provider,
+        .backend_name = opts.backend_name,
+    };
     try list.append(allocator, wt.tool());
 
     const et = try allocator.create(file_edit.FileEditTool);
-    et.* = .{ .workspace_dir = workspace_dir, .allowed_paths = opts.allowed_paths };
+    et.* = .{
+        .workspace_dir = workspace_dir,
+        .allowed_paths = opts.allowed_paths,
+        .max_file_size = tc.max_file_size_bytes,
+        .bootstrap_provider = opts.bootstrap_provider,
+        .backend_name = opts.backend_name,
+    };
     try list.append(allocator, et.tool());
 
     const gt = try allocator.create(git.GitTool);
@@ -499,7 +583,10 @@ pub fn subagentTools(
 
     if (opts.http_enabled) {
         const ht = try allocator.create(http_request.HttpRequestTool);
-        ht.* = .{};
+        ht.* = .{
+            .allowed_domains = opts.http_allowed_domains,
+            .max_response_size = opts.http_max_response_size,
+        };
         try list.append(allocator, ht.tool());
     }
 
@@ -651,58 +738,74 @@ test "all tools includes extras when enabled" {
         .http_enabled = true,
         .browser_enabled = true,
     });
-    defer {
-        // Free all heap-allocated tool structs (mix of types)
-        // Order: shell, file_read, file_write, file_edit, git, image_info,
-        //        memory_store, memory_recall, memory_list, memory_forget, delegate, schedule,
-        //        http_request, browser
-        std.testing.allocator.destroy(@as(*shell.ShellTool, @ptrCast(@alignCast(tools[0].ptr))));
-        std.testing.allocator.destroy(@as(*file_read.FileReadTool, @ptrCast(@alignCast(tools[1].ptr))));
-        std.testing.allocator.destroy(@as(*file_write.FileWriteTool, @ptrCast(@alignCast(tools[2].ptr))));
-        std.testing.allocator.destroy(@as(*file_edit.FileEditTool, @ptrCast(@alignCast(tools[3].ptr))));
-        std.testing.allocator.destroy(@as(*git.GitTool, @ptrCast(@alignCast(tools[4].ptr))));
-        std.testing.allocator.destroy(@as(*image.ImageInfoTool, @ptrCast(@alignCast(tools[5].ptr))));
-        std.testing.allocator.destroy(@as(*memory_store.MemoryStoreTool, @ptrCast(@alignCast(tools[6].ptr))));
-        std.testing.allocator.destroy(@as(*memory_recall.MemoryRecallTool, @ptrCast(@alignCast(tools[7].ptr))));
-        std.testing.allocator.destroy(@as(*memory_list.MemoryListTool, @ptrCast(@alignCast(tools[8].ptr))));
-        std.testing.allocator.destroy(@as(*memory_forget.MemoryForgetTool, @ptrCast(@alignCast(tools[9].ptr))));
-        std.testing.allocator.destroy(@as(*delegate.DelegateTool, @ptrCast(@alignCast(tools[10].ptr))));
-        std.testing.allocator.destroy(@as(*schedule.ScheduleTool, @ptrCast(@alignCast(tools[11].ptr))));
-        std.testing.allocator.destroy(@as(*spawn.SpawnTool, @ptrCast(@alignCast(tools[12].ptr))));
-        std.testing.allocator.destroy(@as(*http_request.HttpRequestTool, @ptrCast(@alignCast(tools[13].ptr))));
-        std.testing.allocator.destroy(@as(*browser.BrowserTool, @ptrCast(@alignCast(tools[14].ptr))));
-        std.testing.allocator.free(tools);
-    }
-    // shell + file_read + file_write + file_edit + git + image_info
-    // + memory_store + memory_recall + memory_list + memory_forget
-    // + delegate + schedule + spawn + http_request + browser = 15
-    try std.testing.expectEqual(@as(usize, 15), tools.len);
+    defer deinitTools(std.testing.allocator, tools);
+
+    // Order: shell, file_read, file_write, file_edit, git, image_info,
+    //        memory_store, memory_recall, memory_list, memory_forget,
+    //        delegate, schedule, spawn, pushover, http_request, web_search,
+    //        web_fetch, browser = 18
+    try std.testing.expectEqual(@as(usize, 18), tools.len);
 }
 
 test "all tools excludes extras when disabled" {
     const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{});
-    defer {
-        // Free all heap-allocated tool structs
-        // Order: shell, file_read, file_write, file_edit, git, image_info,
-        //        memory_store, memory_recall, memory_list, memory_forget, delegate, schedule, spawn
-        std.testing.allocator.destroy(@as(*shell.ShellTool, @ptrCast(@alignCast(tools[0].ptr))));
-        std.testing.allocator.destroy(@as(*file_read.FileReadTool, @ptrCast(@alignCast(tools[1].ptr))));
-        std.testing.allocator.destroy(@as(*file_write.FileWriteTool, @ptrCast(@alignCast(tools[2].ptr))));
-        std.testing.allocator.destroy(@as(*file_edit.FileEditTool, @ptrCast(@alignCast(tools[3].ptr))));
-        std.testing.allocator.destroy(@as(*git.GitTool, @ptrCast(@alignCast(tools[4].ptr))));
-        std.testing.allocator.destroy(@as(*image.ImageInfoTool, @ptrCast(@alignCast(tools[5].ptr))));
-        std.testing.allocator.destroy(@as(*memory_store.MemoryStoreTool, @ptrCast(@alignCast(tools[6].ptr))));
-        std.testing.allocator.destroy(@as(*memory_recall.MemoryRecallTool, @ptrCast(@alignCast(tools[7].ptr))));
-        std.testing.allocator.destroy(@as(*memory_list.MemoryListTool, @ptrCast(@alignCast(tools[8].ptr))));
-        std.testing.allocator.destroy(@as(*memory_forget.MemoryForgetTool, @ptrCast(@alignCast(tools[9].ptr))));
-        std.testing.allocator.destroy(@as(*delegate.DelegateTool, @ptrCast(@alignCast(tools[10].ptr))));
-        std.testing.allocator.destroy(@as(*schedule.ScheduleTool, @ptrCast(@alignCast(tools[11].ptr))));
-        std.testing.allocator.destroy(@as(*spawn.SpawnTool, @ptrCast(@alignCast(tools[12].ptr))));
-        std.testing.allocator.free(tools);
-    }
-    // shell + file_read + file_write + file_edit + git + image_info
-    // + memory_store + memory_recall + memory_list + memory_forget + delegate + schedule + spawn = 13
+    defer deinitTools(std.testing.allocator, tools);
+
+    // Order: shell, file_read, file_write, file_edit, git, image_info,
+    //        memory_store, memory_recall, memory_list, memory_forget,
+    //        delegate, schedule, spawn = 13
     try std.testing.expectEqual(@as(usize, 13), tools.len);
+}
+
+test "all tools wires http and web_search config into tool instances" {
+    const domains = [_][]const u8{ "example.com", "api.example.com" };
+    const search_url = "https://searx.example.com";
+    const search_fallbacks = [_][]const u8{ "jina", "duckduckgo" };
+
+    const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{
+        .http_enabled = true,
+        .http_allowed_domains = &domains,
+        .http_max_response_size = 321_000,
+        .http_timeout_secs = 12,
+        .web_search_base_url = search_url,
+        .web_search_provider = "brave",
+        .web_search_fallback_providers = &search_fallbacks,
+    });
+    defer deinitTools(std.testing.allocator, tools);
+
+    var saw_http = false;
+    var saw_search = false;
+    var saw_fetch = false;
+    for (tools) |t| {
+        if (std.mem.eql(u8, t.name(), "http_request")) {
+            const ht: *http_request.HttpRequestTool = @ptrCast(@alignCast(t.ptr));
+            try std.testing.expectEqual(@as(usize, 2), ht.allowed_domains.len);
+            try std.testing.expectEqualStrings("example.com", ht.allowed_domains[0]);
+            try std.testing.expectEqual(@as(u32, 321_000), ht.max_response_size);
+            saw_http = true;
+            continue;
+        }
+        if (std.mem.eql(u8, t.name(), "web_search")) {
+            const wst: *web_search.WebSearchTool = @ptrCast(@alignCast(t.ptr));
+            try std.testing.expectEqualStrings(search_url, wst.searxng_base_url.?);
+            try std.testing.expectEqualStrings("brave", wst.provider);
+            try std.testing.expectEqual(@as(usize, 2), wst.fallback_providers.len);
+            try std.testing.expectEqualStrings("jina", wst.fallback_providers[0]);
+            try std.testing.expectEqual(@as(u64, 12), wst.timeout_secs);
+            saw_search = true;
+            continue;
+        }
+        if (std.mem.eql(u8, t.name(), "web_fetch")) {
+            const wft: *web_fetch.WebFetchTool = @ptrCast(@alignCast(t.ptr));
+            try std.testing.expectEqual(@as(usize, 2), wft.allowed_domains.len);
+            try std.testing.expectEqualStrings("example.com", wft.allowed_domains[0]);
+            saw_fetch = true;
+        }
+    }
+
+    try std.testing.expect(saw_http);
+    try std.testing.expect(saw_search);
+    try std.testing.expect(saw_fetch);
 }
 
 test "all tools wires subagent manager into spawn tool" {
@@ -731,6 +834,68 @@ test "all tools wires subagent manager into spawn tool" {
         break;
     }
     try std.testing.expect(checked_spawn);
+}
+
+test "subagent tools use configured shell and file limits" {
+    const tools = try subagentTools(std.testing.allocator, "/tmp/yc_test", .{
+        .tools_config = .{
+            .shell_timeout_secs = 7,
+            .shell_max_output_bytes = 2048,
+            .max_file_size_bytes = 4096,
+        },
+    });
+    defer deinitTools(std.testing.allocator, tools);
+
+    var saw_shell = false;
+    var saw_file_read = false;
+    var saw_file_edit = false;
+    for (tools) |t| {
+        if (std.mem.eql(u8, t.name(), "shell")) {
+            const st: *shell.ShellTool = @ptrCast(@alignCast(t.ptr));
+            try std.testing.expectEqual(@as(u64, 7 * std.time.ns_per_s), st.timeout_ns);
+            try std.testing.expectEqual(@as(usize, 2048), st.max_output_bytes);
+            saw_shell = true;
+            continue;
+        }
+        if (std.mem.eql(u8, t.name(), "file_read")) {
+            const ft: *file_read.FileReadTool = @ptrCast(@alignCast(t.ptr));
+            try std.testing.expectEqual(@as(u64, 4096), ft.max_file_size);
+            saw_file_read = true;
+            continue;
+        }
+        if (std.mem.eql(u8, t.name(), "file_edit")) {
+            const et: *file_edit.FileEditTool = @ptrCast(@alignCast(t.ptr));
+            try std.testing.expectEqual(@as(usize, 4096), et.max_file_size);
+            saw_file_edit = true;
+        }
+    }
+
+    try std.testing.expect(saw_shell);
+    try std.testing.expect(saw_file_read);
+    try std.testing.expect(saw_file_edit);
+}
+
+test "subagent tools wire http allowlist and response limit" {
+    const domains = [_][]const u8{"example.com"};
+    const tools = try subagentTools(std.testing.allocator, "/tmp/yc_test", .{
+        .http_enabled = true,
+        .http_allowed_domains = &domains,
+        .http_max_response_size = 2222,
+    });
+    defer deinitTools(std.testing.allocator, tools);
+
+    var saw_http = false;
+    for (tools) |t| {
+        if (!std.mem.eql(u8, t.name(), "http_request")) continue;
+        const ht: *http_request.HttpRequestTool = @ptrCast(@alignCast(t.ptr));
+        try std.testing.expectEqual(@as(usize, 1), ht.allowed_domains.len);
+        try std.testing.expectEqualStrings("example.com", ht.allowed_domains[0]);
+        try std.testing.expectEqual(@as(u32, 2222), ht.max_response_size);
+        saw_http = true;
+        break;
+    }
+
+    try std.testing.expect(saw_http);
 }
 
 test "bindMemoryTools matches by vtable, not by colliding tool name" {

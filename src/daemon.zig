@@ -19,12 +19,20 @@ const agent_routing = @import("agent_routing.zig");
 const channel_catalog = @import("channel_catalog.zig");
 const channel_adapters = @import("channel_adapters.zig");
 const heartbeat_mod = @import("heartbeat.zig");
+const memory_mod = @import("memory/root.zig");
+const bootstrap_mod = @import("bootstrap/root.zig");
 const onboard = @import("onboard.zig");
+const streaming = @import("streaming.zig");
+const thread_stacks = @import("thread_stacks.zig");
 
 const log = std.log.scoped(.daemon);
 
 /// How often the daemon state file is flushed (seconds).
 const STATUS_FLUSH_SECONDS: u64 = 5;
+
+/// Daemon heartbeat initializes memory/bootstrap runtime state before it
+/// settles into its periodic loop, so it needs the session-turn budget.
+const HEARTBEAT_THREAD_STACK_SIZE: usize = thread_stacks.SESSION_TURN_STACK_SIZE;
 
 /// Maximum number of supervised components.
 const MAX_COMPONENTS: usize = 8;
@@ -155,12 +163,27 @@ fn heartbeatThread(allocator: std.mem.Allocator, config: *const Config, state: *
     const state_path = stateFilePath(allocator, config) catch return;
     defer allocator.free(state_path);
 
-    const heartbeat_engine = heartbeat_mod.HeartbeatEngine.init(
+    var heartbeat_mem_rt: ?memory_mod.MemoryRuntime = null;
+    if (!memory_mod.usesWorkspaceBootstrapFiles(config.memory.backend)) {
+        heartbeat_mem_rt = memory_mod.initRuntime(allocator, &config.memory, config.workspace_dir);
+    }
+    defer if (heartbeat_mem_rt) |*rt| rt.deinit();
+    const heartbeat_mem_opt: ?memory_mod.Memory = if (heartbeat_mem_rt) |rt| rt.memory else null;
+
+    var heartbeat_engine = heartbeat_mod.HeartbeatEngine.init(
         config.heartbeat.enabled,
         config.heartbeat.interval_minutes,
         config.workspace_dir,
         null,
     );
+    heartbeat_engine.bootstrap_provider = bootstrap_mod.createProvider(
+        allocator,
+        config.memory.backend,
+        heartbeat_mem_opt,
+        config.workspace_dir,
+    ) catch null;
+    defer if (heartbeat_engine.bootstrap_provider) |bp| bp.deinit();
+
     const heartbeat_interval_ns: i128 = @as(i128, @intCast(heartbeat_engine.interval_minutes)) * 60 * std.time.ns_per_s;
     var next_heartbeat_tick_at_ns: i128 = std.time.nanoTimestamp() + heartbeat_interval_ns;
 
@@ -265,6 +288,19 @@ fn upsertSchedulerRuntimeJob(
         dst.last_status = runtime_job.last_status;
         dst.paused = runtime_job.paused;
         dst.one_shot = runtime_job.one_shot;
+        // Update delivery config
+        dst.delivery.mode = runtime_job.delivery.mode;
+        if (dst.delivery.channel_owned) {
+            if (dst.delivery.channel) |c| allocator.free(c);
+        }
+        dst.delivery.channel = if (runtime_job.delivery.channel) |c| try allocator.dupe(u8, c) else null;
+        dst.delivery.channel_owned = runtime_job.delivery.channel != null;
+        if (dst.delivery.to_owned) {
+            if (dst.delivery.to) |t| allocator.free(t);
+        }
+        dst.delivery.to = if (runtime_job.delivery.to) |t| try allocator.dupe(u8, t) else null;
+        dst.delivery.to_owned = runtime_job.delivery.to != null;
+        dst.delivery.best_effort = runtime_job.delivery.best_effort;
         return;
     }
 
@@ -277,6 +313,22 @@ fn upsertSchedulerRuntimeJob(
         .last_status = runtime_job.last_status,
         .paused = runtime_job.paused,
         .one_shot = runtime_job.one_shot,
+        .job_type = runtime_job.job_type,
+        .session_target = runtime_job.session_target,
+        .prompt = if (runtime_job.prompt) |p| try allocator.dupe(u8, p) else null,
+        .name = if (runtime_job.name) |n| try allocator.dupe(u8, n) else null,
+        .model = if (runtime_job.model) |m| try allocator.dupe(u8, m) else null,
+        .enabled = runtime_job.enabled,
+        .delete_after_run = runtime_job.delete_after_run,
+        .created_at_s = runtime_job.created_at_s,
+        .delivery = .{
+            .mode = runtime_job.delivery.mode,
+            .channel = if (runtime_job.delivery.channel) |c| try allocator.dupe(u8, c) else null,
+            .to = if (runtime_job.delivery.to) |t| try allocator.dupe(u8, t) else null,
+            .best_effort = runtime_job.delivery.best_effort,
+            .channel_owned = runtime_job.delivery.channel != null,
+            .to_owned = runtime_job.delivery.to != null,
+        },
     });
 }
 
@@ -315,6 +367,8 @@ fn mergeSchedulerTickChangesAndSave(
 /// so tasks created/updated after daemon startup are picked up without restart.
 fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *DaemonState, event_bus: *bus_mod.Bus) void {
     var scheduler = CronScheduler.init(allocator, config.scheduler.max_tasks, config.scheduler.enabled);
+    scheduler.setShellCwd(config.workspace_dir);
+    scheduler.setAgentTimeoutSecs(config.scheduler.agent_timeout_secs);
     defer scheduler.deinit();
     var before_tick: std.StringHashMapUnmanaged(SchedulerJobSnapshot) = .empty;
     defer {
@@ -367,9 +421,6 @@ fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *
         }
     }
 }
-
-/// Stale detection threshold: 3x the Telegram long-poll timeout (30s).
-const STALE_THRESHOLD_SECS: i64 = 90;
 
 /// Channel supervisor thread — spawns polling threads for configured channels,
 /// monitors their health, and restarts on failure using SupervisedChannel.
@@ -593,6 +644,49 @@ fn clearInboundProcessingIndicator(
     ch.stopTyping(target) catch {};
 }
 
+const StreamingOutboundCtx = struct {
+    allocator: std.mem.Allocator,
+    event_bus: *bus_mod.Bus,
+    channel: []const u8,
+    account_id: ?[]const u8,
+    chat_id: []const u8,
+};
+
+fn publishStreamingChunk(ctx_ptr: *anyopaque, event: streaming.Event) void {
+    if (event.stage != .chunk or event.text.len == 0) return;
+    const ctx: *StreamingOutboundCtx = @ptrCast(@alignCast(ctx_ptr));
+
+    const out = if (ctx.account_id) |aid|
+        bus_mod.makeOutboundChunkWithAccount(ctx.allocator, ctx.channel, aid, ctx.chat_id, event.text)
+    else
+        bus_mod.makeOutboundChunk(ctx.allocator, ctx.channel, ctx.chat_id, event.text);
+
+    var message = out catch |err| {
+        log.warn("inbound dispatch chunk makeOutbound failed: {}", .{err});
+        return;
+    };
+    ctx.event_bus.publishOutbound(message) catch |err| {
+        message.deinit(ctx.allocator);
+        if (err != error.Closed) {
+            log.warn("inbound dispatch chunk publishOutbound failed: {}", .{err});
+        }
+    };
+}
+
+fn supportsStreamingOutbound(channel: []const u8) bool {
+    return std.mem.eql(u8, channel, "web") or std.mem.eql(u8, channel, "telegram");
+}
+
+fn makeStreamingSinkForChannel(
+    channel: []const u8,
+    raw_sink: streaming.Sink,
+    filter: *streaming.TagFilter,
+) ?streaming.Sink {
+    if (!supportsStreamingOutbound(channel)) return null;
+    filter.* = streaming.TagFilter.init(raw_sink);
+    return filter.sink();
+}
+
 fn inboundDispatcherThread(
     allocator: std.mem.Allocator,
     event_bus: *bus_mod.Bus,
@@ -634,7 +728,30 @@ fn inboundDispatcherThread(
             typing_recipient,
         );
 
-        const reply = runtime.session_mgr.processMessage(session_key, msg.content, null) catch |err| {
+        const use_streaming_outbound = supportsStreamingOutbound(msg.channel);
+        var streaming_ctx = StreamingOutboundCtx{
+            .allocator = allocator,
+            .event_bus = event_bus,
+            .channel = msg.channel,
+            .account_id = outbound_account_id,
+            .chat_id = msg.chat_id,
+        };
+        var stream_sink: ?streaming.Sink = null;
+        var outbound_tag_filter: streaming.TagFilter = undefined;
+        if (use_streaming_outbound) {
+            const raw_sink = streaming.Sink{
+                .callback = publishStreamingChunk,
+                .ctx = @ptrCast(&streaming_ctx),
+            };
+            stream_sink = makeStreamingSinkForChannel(msg.channel, raw_sink, &outbound_tag_filter);
+        }
+
+        const reply = runtime.session_mgr.processMessageStreaming(
+            session_key,
+            msg.content,
+            null,
+            stream_sink,
+        ) catch |err| {
             log.warn("inbound dispatch process failed: {}", .{err});
 
             // Send user-visible error reply back to the originating channel
@@ -690,7 +807,7 @@ fn inboundDispatcherThread(
 pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8, port: u16) !void {
     // Ensure lifecycle parity: workspace bootstrap files must exist
     // even when users skip onboard and start runtime directly.
-    try onboard.scaffoldWorkspace(allocator, config.workspace_dir, &onboard.ProjectContext{});
+    try onboard.scaffoldWorkspace(allocator, config.workspace_dir, &onboard.ProjectContext{}, null);
 
     health.markComponentOk("daemon");
     shutdown_requested.store(false, .release);
@@ -739,7 +856,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
 
     // Spawn gateway thread
     state.markRunning("gateway");
-    const gw_thread = std.Thread.spawn(.{ .stack_size = 256 * 1024 }, gatewayThread, .{ allocator, config, host, port, &state, &event_bus }) catch |err| {
+    const gw_thread = std.Thread.spawn(.{ .stack_size = thread_stacks.DAEMON_SERVICE_STACK_SIZE }, gatewayThread, .{ allocator, config, host, port, &state, &event_bus }) catch |err| {
         state.markError("gateway", @errorName(err));
         try stdout.print("Failed to spawn gateway: {}\n", .{err});
         return err;
@@ -749,7 +866,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     var hb_thread: ?std.Thread = null;
     if (config.heartbeat.enabled) {
         state.markRunning("heartbeat");
-        if (std.Thread.spawn(.{ .stack_size = 128 * 1024 }, heartbeatThread, .{ allocator, config, &state })) |thread| {
+        if (std.Thread.spawn(.{ .stack_size = HEARTBEAT_THREAD_STACK_SIZE }, heartbeatThread, .{ allocator, config, &state })) |thread| {
             hb_thread = thread;
         } else |err| {
             state.markError("heartbeat", @errorName(err));
@@ -761,7 +878,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     var sched_thread: ?std.Thread = null;
     if (config.scheduler.enabled) {
         state.markRunning("scheduler");
-        if (std.Thread.spawn(.{ .stack_size = 256 * 1024 }, schedulerThread, .{ allocator, config, &state, &event_bus })) |thread| {
+        if (std.Thread.spawn(.{ .stack_size = thread_stacks.DAEMON_SERVICE_STACK_SIZE }, schedulerThread, .{ allocator, config, &state, &event_bus })) |thread| {
             sched_thread = thread;
         } else |err| {
             state.markError("scheduler", @errorName(err));
@@ -791,7 +908,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     // Spawn channel supervisor thread (only if channels are configured)
     var chan_thread: ?std.Thread = null;
     if (has_supervised_channels) {
-        if (std.Thread.spawn(.{ .stack_size = 256 * 1024 }, channelSupervisorThread, .{
+        if (std.Thread.spawn(.{ .stack_size = thread_stacks.DAEMON_SERVICE_STACK_SIZE }, channelSupervisorThread, .{
             allocator, config, &state, &channel_registry, channel_rt, &event_bus,
         })) |thread| {
             chan_thread = thread;
@@ -804,7 +921,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     var inbound_thread: ?std.Thread = null;
     if (channel_rt) |rt| {
         state.addComponent("inbound_dispatcher");
-        if (std.Thread.spawn(.{ .stack_size = 512 * 1024 }, inboundDispatcherThread, .{
+        if (std.Thread.spawn(.{ .stack_size = thread_stacks.SESSION_TURN_STACK_SIZE }, inboundDispatcherThread, .{
             allocator, &event_bus, &channel_registry, rt, &state,
         })) |thread| {
             inbound_thread = thread;
@@ -821,7 +938,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     state.addComponent("outbound_dispatcher");
 
     var dispatcher_thread: ?std.Thread = null;
-    if (std.Thread.spawn(.{ .stack_size = 512 * 1024 }, dispatch.runOutboundDispatcher, .{
+    if (std.Thread.spawn(.{ .stack_size = thread_stacks.HEAVY_RUNTIME_STACK_SIZE }, dispatch.runOutboundDispatcher, .{
         allocator, &event_bus, &channel_registry, &dispatch_stats,
     })) |thread| {
         dispatcher_thread = thread;
@@ -889,6 +1006,55 @@ test "computeBackoff doubles up to max" {
 
 test "computeBackoff saturating" {
     try std.testing.expectEqual(std.math.maxInt(u64), computeBackoff(std.math.maxInt(u64), std.math.maxInt(u64)));
+}
+
+test "makeStreamingSinkForChannel filters web chunks" {
+    const Collector = struct {
+        buf: [128]u8 = undefined,
+        len: usize = 0,
+        got_final: bool = false,
+
+        fn callback(ctx: *anyopaque, event: streaming.Event) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            switch (event.stage) {
+                .chunk => {
+                    @memcpy(self.buf[self.len..][0..event.text.len], event.text);
+                    self.len += event.text.len;
+                },
+                .final => self.got_final = true,
+            }
+        }
+
+        fn sink(self: *@This()) streaming.Sink {
+            return .{ .callback = callback, .ctx = @ptrCast(self) };
+        }
+
+        fn text(self: *@This()) []const u8 {
+            return self.buf[0..self.len];
+        }
+    };
+
+    var collector = Collector{};
+    var filter: streaming.TagFilter = undefined;
+    const sink = makeStreamingSinkForChannel("web", collector.sink(), &filter).?;
+    sink.emitChunk("A<|tool_call_begin|>{\"name\":\"shell\"}<|tool_call_end|>B");
+    sink.emitFinal();
+
+    try std.testing.expectEqualStrings("AB", collector.text());
+    try std.testing.expect(collector.got_final);
+}
+
+test "makeStreamingSinkForChannel returns null for unsupported channel" {
+    const Noop = struct {
+        fn callback(_: *anyopaque, _: streaming.Event) void {}
+    };
+
+    var filter: streaming.TagFilter = undefined;
+    const sink = makeStreamingSinkForChannel("discord", .{
+        .callback = Noop.callback,
+        .ctx = undefined,
+    }, &filter);
+    try std.testing.expect(sink == null);
 }
 
 test "hasSupervisedChannels false for defaults" {
@@ -1289,6 +1455,44 @@ test "resolveInboundRouteSessionKey routes slack channel messages by chat_id" {
     try std.testing.expectEqualStrings("agent:slack-channel-agent:slack:channel:C12345", routed.?);
 }
 
+test "resolveInboundRouteSessionKey routes threaded slack channel messages by base channel_id" {
+    const allocator = std.testing.allocator;
+    const bindings = [_]agent_routing.AgentBinding{
+        .{
+            .agent_id = "slack-channel-agent",
+            .match = .{
+                .channel = "slack",
+                .account_id = "sl-main",
+                .peer = .{ .kind = .channel, .id = "C12345" },
+            },
+        },
+    };
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &bindings,
+        .channels = .{
+            .slack = &[_]@import("config_types.zig").SlackConfig{
+                .{ .account_id = "sl-main", .bot_token = "xoxb-token", .channel_id = "C12345" },
+            },
+        },
+    };
+    const msg = bus_mod.InboundMessage{
+        .channel = "slack",
+        .sender_id = "U777",
+        .chat_id = "C12345:1700.0",
+        .content = "threaded hello",
+        .session_key = "slack:sl-main:channel:C12345",
+        .metadata_json = "{\"account_id\":\"sl-main\",\"is_dm\":false,\"channel_id\":\"C12345\",\"message_id\":\"1700.1\",\"thread_id\":\"1700.0\"}",
+    };
+
+    const routed = resolveInboundRouteSessionKey(allocator, &config, &msg);
+    try std.testing.expect(routed != null);
+    defer allocator.free(routed.?);
+    try std.testing.expectEqualStrings("agent:slack-channel-agent:slack:channel:C12345:thread:1700.0", routed.?);
+}
+
 test "resolveInboundRouteSessionKey routes slack direct messages by sender" {
     const allocator = std.testing.allocator;
     const bindings = [_]agent_routing.AgentBinding{
@@ -1589,6 +1793,21 @@ test "resolveSlackStatusTarget prefers thread_id then falls back to message_id" 
     try std.testing.expectEqualStrings("1700.1", with_message_only.?.thread_ts);
 }
 
+test "hasSupervisedChannels true for nostr" {
+    const config_types = @import("config_types.zig");
+    var config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+    };
+    var ns_cfg = config_types.NostrConfig{
+        .private_key = "enc2:abc",
+        .owner_pubkey = "a" ** 64,
+    };
+    config.channels.nostr = &ns_cfg;
+    try std.testing.expect(hasSupervisedChannels(&config));
+}
+
 test "stateFilePath derives from config_path" {
     const config = Config{
         .workspace_dir = "/tmp/workspace",
@@ -1672,6 +1891,52 @@ test "mergeSchedulerTickChangesAndSave preserves externally added jobs" {
     try std.testing.expect(found_external);
 }
 
+test "daemon heartbeat thread stack matches session turn budget" {
+    try std.testing.expectEqual(thread_stacks.SESSION_TURN_STACK_SIZE, HEARTBEAT_THREAD_STACK_SIZE);
+}
+
+test "mergeSchedulerTickChangesAndSave preserves runtime agent fields" {
+    const allocator = std.testing.allocator;
+
+    var runtime = CronScheduler.init(allocator, 32, true);
+    defer runtime.deinit();
+    _ = try runtime.addAgentJob("* * * * *", "summarize merge state", "openrouter/anthropic/claude-sonnet-4");
+    runtime.jobs.items[runtime.jobs.items.len - 1].next_run_secs = 0;
+    try cron.saveJobs(&runtime);
+
+    var loaded = CronScheduler.init(allocator, 32, true);
+    defer loaded.deinit();
+    try cron.loadJobs(&loaded);
+
+    var before_tick: std.StringHashMapUnmanaged(SchedulerJobSnapshot) = .empty;
+    defer {
+        clearSchedulerSnapshot(allocator, &before_tick);
+        before_tick.deinit(allocator);
+    }
+    try buildSchedulerSnapshot(allocator, &loaded, &before_tick);
+
+    // Simulate concurrent rewrite removing jobs from disk; merge should restore
+    // runtime job with all agent fields.
+    var external = CronScheduler.init(allocator, 32, true);
+    defer external.deinit();
+    try cron.saveJobs(&external);
+
+    _ = loaded.tick(std.time.timestamp(), null);
+    try mergeSchedulerTickChangesAndSave(allocator, &loaded, &before_tick);
+
+    var merged = CronScheduler.init(allocator, 32, true);
+    defer merged.deinit();
+    try cron.loadJobsStrict(&merged);
+    try std.testing.expectEqual(@as(usize, 1), merged.listJobs().len);
+
+    const job = merged.listJobs()[0];
+    try std.testing.expectEqual(cron.JobType.agent, job.job_type);
+    try std.testing.expect(job.prompt != null);
+    try std.testing.expectEqualStrings("summarize merge state", job.prompt.?);
+    try std.testing.expect(job.model != null);
+    try std.testing.expectEqualStrings("openrouter/anthropic/claude-sonnet-4", job.model.?);
+}
+
 test "channelSupervisorThread respects shutdown" {
     // Pre-request shutdown so the supervisor exits immediately
     shutdown_requested.store(true, .release);
@@ -1691,7 +1956,7 @@ test "channelSupervisorThread respects shutdown" {
     defer channel_registry.deinit();
     var event_bus = bus_mod.Bus.init();
 
-    const thread = try std.Thread.spawn(.{ .stack_size = 256 * 1024 }, channelSupervisorThread, .{
+    const thread = try std.Thread.spawn(.{ .stack_size = thread_stacks.DAEMON_SERVICE_STACK_SIZE }, channelSupervisorThread, .{
         std.testing.allocator, &config, &state, &channel_registry, null, &event_bus,
     });
     thread.join();

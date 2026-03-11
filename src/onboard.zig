@@ -9,15 +9,18 @@
 //!   - Provider/model selection with curated defaults
 
 const std = @import("std");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
 const platform = @import("platform.zig");
 const config_mod = @import("config.zig");
 const Config = config_mod.Config;
 const channel_catalog = @import("channel_catalog.zig");
+const provider_names = @import("provider_names.zig");
 const memory_root = @import("memory/root.zig");
 const http_util = @import("http_util.zig");
 const json_util = @import("json_util.zig");
 const util = @import("util.zig");
+const bootstrap_mod = @import("bootstrap/root.zig");
 
 // ── Constants ────────────────────────────────────────────────────
 
@@ -80,9 +83,11 @@ pub const known_providers = [_]ProviderInfo{
     .{ .key = "openrouter", .label = "OpenRouter (multi-provider, recommended)", .default_model = "anthropic/claude-sonnet-4.6", .env_var = "OPENROUTER_API_KEY" },
     .{ .key = "anthropic", .label = "Anthropic (Claude direct)", .default_model = "claude-opus-4-6", .env_var = "ANTHROPIC_API_KEY" },
     .{ .key = "openai", .label = "OpenAI (GPT direct)", .default_model = "gpt-5.2", .env_var = "OPENAI_API_KEY" },
+    .{ .key = "azure", .label = "Azure OpenAI (GPT via Azure)", .default_model = "gpt-5.2-chat", .env_var = "AZURE_OPENAI_API_KEY" },
 
     // --- Tier 2: Major cloud providers (Feb 2026 models) ---
     .{ .key = "gemini", .label = "Google Gemini", .default_model = "gemini-2.5-pro", .env_var = "GEMINI_API_KEY" },
+    .{ .key = "vertex", .label = "Google Vertex AI (Gemini)", .default_model = "gemini-2.5-pro", .env_var = "VERTEX_API_KEY" },
     .{ .key = "deepseek", .label = "DeepSeek", .default_model = "deepseek-chat", .env_var = "DEEPSEEK_API_KEY" },
     .{ .key = "groq", .label = "Groq (fast inference)", .default_model = "llama-3.3-70b-versatile", .env_var = "GROQ_API_KEY" },
 
@@ -123,14 +128,15 @@ pub const known_providers = [_]ProviderInfo{
     // --- Tier 9: Local/self-hosted ---
     .{ .key = "ollama", .label = "Ollama (local CLI)", .default_model = "llama4", .env_var = "API_KEY" },
     .{ .key = "lm-studio", .label = "LM Studio (local GUI)", .default_model = "local-model", .env_var = "API_KEY" },
+
+    // --- Tier 10: CLI-based providers ---
+    .{ .key = "claude-cli", .label = "Claude CLI (claude code, local)", .default_model = "claude-opus-4-6", .env_var = "ANTHROPIC_API_KEY" },
+    .{ .key = "codex-cli", .label = "Codex CLI (OpenAI codex, local)", .default_model = "codex-mini-latest", .env_var = "OPENAI_API_KEY" },
 };
 
 /// Canonicalize provider name (handle aliases).
 pub fn canonicalProviderName(name: []const u8) []const u8 {
-    if (std.mem.eql(u8, name, "grok")) return "xai";
-    if (std.mem.eql(u8, name, "together")) return "together-ai";
-    if (std.mem.eql(u8, name, "google") or std.mem.eql(u8, name, "google-gemini")) return "gemini";
-    return name;
+    return provider_names.canonicalProviderName(name);
 }
 
 fn findProviderInfoByCanonical(name: []const u8) ?ProviderInfo {
@@ -140,9 +146,44 @@ fn findProviderInfoByCanonical(name: []const u8) ?ProviderInfo {
     return null;
 }
 
+fn hasVersionedApiSegment(url: []const u8) bool {
+    const proto_start = std.mem.indexOf(u8, url, "://") orelse return false;
+    var i: usize = proto_start + 3;
+    while (i + 2 < url.len) : (i += 1) {
+        if (url[i] != '/' or url[i + 1] != 'v') continue;
+        var j = i + 2;
+        var has_digit = false;
+        while (j < url.len and std.ascii.isDigit(url[j])) : (j += 1) {
+            has_digit = true;
+        }
+        if (!has_digit) continue;
+        if (j == url.len or (j < url.len and url[j] == '/')) return true;
+    }
+    return false;
+}
+
+fn isValidCustomProviderUrl(url: []const u8) bool {
+    if (url.len == 0) return false;
+    if (!(std.mem.startsWith(u8, url, "https://") or std.mem.startsWith(u8, url, "http://"))) return false;
+    return hasVersionedApiSegment(url);
+}
+
 /// Resolve a provider name used in quick setup.
 /// Accepts aliases (e.g. "grok" -> "xai") and returns provider metadata.
+/// Supports custom: prefix for OpenAI-compatible endpoints.
 pub fn resolveProviderForQuickSetup(name: []const u8) ?ProviderInfo {
+    // Support custom: prefix for OpenAI-compatible providers
+    if (std.mem.startsWith(u8, name, "custom:")) {
+        const custom_url = name["custom:".len..];
+        if (!isValidCustomProviderUrl(custom_url)) return null;
+        return .{
+            .key = name,
+            .label = "Custom OpenAI-compatible provider",
+            .default_model = "gpt-5.2",
+            .env_var = "API_KEY",
+        };
+    }
+
     const canonical = canonicalProviderName(name);
     return findProviderInfoByCanonical(canonical);
 }
@@ -190,8 +231,11 @@ pub fn fallbackModelsForProvider(provider: []const u8) []const []const u8 {
     if (std.mem.eql(u8, canonical, "groq")) return &groq_fallback;
     if (std.mem.eql(u8, canonical, "anthropic")) return &anthropic_fallback;
     if (std.mem.eql(u8, canonical, "gemini")) return &gemini_fallback;
+    if (std.mem.eql(u8, canonical, "vertex")) return &vertex_fallback;
     if (std.mem.eql(u8, canonical, "deepseek")) return &deepseek_fallback;
     if (std.mem.eql(u8, canonical, "ollama")) return &ollama_fallback;
+    if (std.mem.eql(u8, canonical, "claude-cli")) return &claude_cli_fallback;
+    if (std.mem.eql(u8, canonical, "codex-cli")) return &codex_cli_fallback;
 
     // For providers without a curated fallback list, return a single-item fallback
     // based on the onboarding default model for that provider.
@@ -255,6 +299,11 @@ const gemini_fallback = [_][]const u8{
     "gemini-2.5-flash",
     "gemini-2.0-flash",
 };
+const vertex_fallback = [_][]const u8{
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+};
 const deepseek_fallback = [_][]const u8{
     "deepseek-chat",
     "deepseek-reasoner",
@@ -264,6 +313,14 @@ const ollama_fallback = [_][]const u8{
     "llama3.2",
     "mistral",
     "phi3",
+};
+
+const claude_cli_fallback = [_][]const u8{
+    "claude-opus-4-6",
+};
+
+const codex_cli_fallback = [_][]const u8{
+    "codex-mini-latest",
 };
 
 const MAX_MODELS = 20;
@@ -314,8 +371,11 @@ pub fn fetchModelsFromApi(allocator: std.mem.Allocator, provider: []const u8, ap
     // Providers with no models-list API
     if (std.mem.eql(u8, canonical, "anthropic") or
         std.mem.eql(u8, canonical, "gemini") or
+        std.mem.eql(u8, canonical, "vertex") or
         std.mem.eql(u8, canonical, "deepseek") or
-        std.mem.eql(u8, canonical, "ollama"))
+        std.mem.eql(u8, canonical, "ollama") or
+        std.mem.eql(u8, canonical, "claude-cli") or
+        std.mem.eql(u8, canonical, "codex-cli"))
     {
         const fallback = fallbackModelsForProvider(canonical);
         var result: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -331,8 +391,11 @@ pub fn fetchModelsFromApi(allocator: std.mem.Allocator, provider: []const u8, ap
 
     // Determine URL, auth, and optional prefix filter
     var url: []const u8 = undefined;
+    var url_to_free: ?[]const u8 = null;
     var needs_auth = false;
     var prefix_filter: ?[]const u8 = null;
+    defer if (url_to_free) |u| allocator.free(u);
+
     if (std.mem.eql(u8, canonical, "openrouter")) {
         url = "https://openrouter.ai/api/v1/models";
         needs_auth = false; // OpenRouter models endpoint is public
@@ -343,6 +406,12 @@ pub fn fetchModelsFromApi(allocator: std.mem.Allocator, provider: []const u8, ap
     } else if (std.mem.eql(u8, canonical, "groq")) {
         url = "https://api.groq.com/openai/v1/models";
         needs_auth = true;
+    } else if (std.mem.startsWith(u8, canonical, "http://") or std.mem.startsWith(u8, canonical, "https://")) {
+        // Custom OpenAI-compatible API endpoint
+        url_to_free = try buildModelsUrl(allocator, canonical);
+        url = url_to_free.?;
+        needs_auth = true;
+        // No prefix filter for custom endpoints
     } else {
         return error.FetchFailed;
     }
@@ -398,6 +467,26 @@ fn fetchAndParseModels(allocator: std.mem.Allocator, url: []const u8, headers: [
 
     if (result.items.len == 0) return error.FetchFailed;
     return result.toOwnedSlice(allocator);
+}
+
+/// Build the models endpoint URL for an OpenAI-compatible API.
+/// Given a base URL like "https://api.example.com/v1", returns "https://api.example.com/v1/models".
+/// If the URL already ends with "/models", returns a duplicate of the input.
+/// Caller owns the returned string.
+fn buildModelsUrl(allocator: std.mem.Allocator, base_url: []const u8) ![]const u8 {
+    // Remove trailing slash if present
+    var url_to_use = base_url;
+    if (std.mem.endsWith(u8, base_url, "/")) {
+        url_to_use = base_url[0 .. base_url.len - 1];
+    }
+
+    // Check if URL already ends with /models (after removing trailing slash)
+    if (std.mem.endsWith(u8, url_to_use, "/models")) {
+        return try allocator.dupe(u8, base_url);
+    }
+
+    // Append /models
+    return try std.fmt.allocPrint(allocator, "{s}/models", .{url_to_use});
 }
 
 /// Load models with file-based cache. Cache expires after 12 hours.
@@ -531,7 +620,7 @@ pub fn parseModelIds(allocator: std.mem.Allocator, json_response: []const u8) ![
 
 /// Create a fresh Config backed by an arena (for when Config.load() fails).
 /// Caller must call cfg.deinit() when done.
-fn initFreshConfig(backing_allocator: std.mem.Allocator) !Config {
+pub fn initFreshConfig(backing_allocator: std.mem.Allocator) !Config {
     const arena_ptr = try backing_allocator.create(std.heap.ArenaAllocator);
     arena_ptr.* = std.heap.ArenaAllocator.init(backing_allocator);
     errdefer {
@@ -550,7 +639,7 @@ fn initFreshConfig(backing_allocator: std.mem.Allocator) !Config {
 // ── Quick setup ──────────────────────────────────────────────────
 
 /// Non-interactive setup: generates a sensible default config.
-pub fn runQuickSetup(allocator: std.mem.Allocator, api_key: ?[]const u8, provider: ?[]const u8, memory_backend: ?[]const u8) !void {
+pub fn runQuickSetup(allocator: std.mem.Allocator, api_key: ?[]const u8, provider: ?[]const u8, model: ?[]const u8, memory_backend: ?[]const u8) !void {
     var stdout_buf: [4096]u8 = undefined;
     var bw = std.fs.File.stdout().writer(&stdout_buf);
     const stdout = &bw.interface;
@@ -563,10 +652,15 @@ pub fn runQuickSetup(allocator: std.mem.Allocator, api_key: ?[]const u8, provide
 
     // Apply overrides
     var provider_overridden = false;
+    var custom_base_url: ?[]const u8 = null;
     if (provider) |p| {
         const info = resolveProviderForQuickSetup(p) orelse return error.UnknownProvider;
         cfg.default_provider = try cfg.allocator.dupe(u8, info.key);
         provider_overridden = true;
+        // Extract base_url for custom provider
+        if (std.mem.startsWith(u8, info.key, "custom:")) {
+            custom_base_url = info.key["custom:".len..];
+        }
     }
     if (api_key) |key| {
         // Store in providers section for the default provider (arena frees old values)
@@ -574,6 +668,7 @@ pub fn runQuickSetup(allocator: std.mem.Allocator, api_key: ?[]const u8, provide
         entries[0] = .{
             .name = try cfg.allocator.dupe(u8, cfg.default_provider),
             .api_key = try cfg.allocator.dupe(u8, key),
+            .base_url = custom_base_url,
         };
         cfg.providers = entries;
     }
@@ -585,7 +680,10 @@ pub fn runQuickSetup(allocator: std.mem.Allocator, api_key: ?[]const u8, provide
     }
 
     // Set default model based on provider
-    if (provider_overridden) {
+    if (model) |m| {
+        // Use the explicitly provided model
+        cfg.default_model = try cfg.allocator.dupe(u8, m);
+    } else if (provider_overridden) {
         cfg.default_model = defaultModelForProvider(cfg.default_provider);
     } else if (cfg.default_model == null or std.mem.eql(u8, cfg.default_model.?, "anthropic/claude-sonnet-4")) {
         cfg.default_model = defaultModelForProvider(cfg.default_provider);
@@ -604,7 +702,7 @@ pub fn runQuickSetup(allocator: std.mem.Allocator, api_key: ?[]const u8, provide
     };
 
     // Scaffold workspace files
-    try scaffoldWorkspace(allocator, cfg.workspace_dir, &ProjectContext{});
+    try scaffoldWorkspace(allocator, cfg.workspace_dir, &ProjectContext{}, null);
 
     // Save config so subsequent commands can find it
     try cfg.save();
@@ -755,9 +853,10 @@ fn promptChoice(out: *std.Io.Writer, buf: []u8, max: usize, default_idx: usize) 
     return num - 1;
 }
 
-const tunnel_options = [_][]const u8{ "none", "cloudflare", "ngrok", "tailscale" };
-const autonomy_options = [_][]const u8{ "supervised", "autonomous", "fully_autonomous" };
-const wizard_memory_backend_order = [_][]const u8{
+pub const tunnel_options = [_][]const u8{ "none", "cloudflare", "ngrok", "tailscale" };
+pub const autonomy_options = [_][]const u8{ "supervised", "autonomous", "fully_autonomous" };
+pub const wizard_memory_backend_order = [_][]const u8{
+    "hybrid",
     "sqlite",
     "markdown",
     "memory",
@@ -783,7 +882,8 @@ fn selectableBackendsForWizard(allocator: std.mem.Allocator) ![]const *const mem
     return out.toOwnedSlice(allocator);
 }
 
-fn memoryProfileForBackend(backend: []const u8) []const u8 {
+pub fn memoryProfileForBackend(backend: []const u8) []const u8 {
+    if (std.mem.eql(u8, backend, "hybrid")) return "hybrid_keyword";
     if (std.mem.eql(u8, backend, "sqlite")) return "local_keyword";
     if (std.mem.eql(u8, backend, "markdown")) return "markdown_only";
     if (std.mem.eql(u8, backend, "postgres")) return "postgres_keyword";
@@ -791,9 +891,9 @@ fn memoryProfileForBackend(backend: []const u8) []const u8 {
     return "custom";
 }
 
-fn isWizardInteractiveChannel(channel_id: channel_catalog.ChannelId) bool {
+pub fn isWizardInteractiveChannel(channel_id: channel_catalog.ChannelId) bool {
     return switch (channel_id) {
-        .telegram, .discord, .slack, .webhook, .mattermost, .matrix, .signal => true,
+        .telegram, .discord, .slack, .webhook, .mattermost, .matrix, .signal, .nostr => true,
         else => false,
     };
 }
@@ -908,6 +1008,7 @@ fn configureSingleChannel(
         .mattermost => configureMattermostChannel(cfg, out, input_buf, prefix),
         .signal => configureSignalChannel(cfg, out, input_buf, prefix),
         .webhook => configureWebhookChannel(cfg, out, input_buf, prefix),
+        .nostr => configureNostrChannel(cfg, out, input_buf, prefix),
         else => blk: {
             try out.print("{s}  {s}: interactive setup not implemented yet. Edit {s} manually.\n", .{ prefix, meta.label, cfg.config_path });
             break :blk false;
@@ -1153,6 +1254,166 @@ fn configureWebhookChannel(cfg: *Config, out: *std.Io.Writer, input_buf: []u8, p
     return true;
 }
 
+fn configureNostrChannel(cfg: *Config, out: *std.Io.Writer, input_buf: []u8, prefix: []const u8) !bool {
+    const nak_path = "nak";
+
+    // ── Bot keypair ──────────────────────────────────────────────
+    try out.print("{s}  Bot keypair:\n", .{prefix});
+    try out.print("{s}    [Y] Generate new keypair (first-time setup)\n", .{prefix});
+    try out.print("{s}    [n] Import existing nsec1\n", .{prefix});
+    try out.print("{s}  Generate new? [Y/n]: ", .{prefix});
+    const gen_input = prompt(out, input_buf, "", "y") orelse return false;
+    const generate_new = gen_input.len == 0 or gen_input[0] == 'y' or gen_input[0] == 'Y';
+
+    var bot_privkey_hex: ?[]u8 = null;
+    defer if (bot_privkey_hex) |k| cfg.allocator.free(k);
+    var bot_pubkey_hex: ?[]u8 = null;
+    defer if (bot_pubkey_hex) |k| cfg.allocator.free(k);
+
+    if (generate_new) {
+        const argv_gen = [_][]const u8{ nak_path, "key", "generate" };
+        const hex = nakRun(cfg.allocator, &argv_gen) orelse {
+            try out.print("{s}  -> Failed to generate keypair (is nak in PATH?)\n\n", .{prefix});
+            return false;
+        };
+        if (hex.len != 64) {
+            cfg.allocator.free(hex);
+            try out.print("{s}  -> nak key generate returned unexpected output\n\n", .{prefix});
+            return false;
+        }
+        bot_privkey_hex = hex;
+        const argv_pub = [_][]const u8{ nak_path, "key", "public", bot_privkey_hex.? };
+        if (nakRun(cfg.allocator, &argv_pub)) |bph| {
+            bot_pubkey_hex = bph;
+            const argv_enc = [_][]const u8{ nak_path, "encode", "npub", bph };
+            if (nakRun(cfg.allocator, &argv_enc)) |bot_npub| {
+                defer cfg.allocator.free(bot_npub);
+                try out.print("{s}  -> Bot npub: {s}\n", .{ prefix, bot_npub });
+            } else {
+                try out.print("{s}  -> Bot pubkey (hex): {s}\n", .{ prefix, bph });
+            }
+        }
+    } else {
+        try out.print("{s}  Bot nsec1 (paste existing bot identity key): ", .{prefix});
+        const key_input = prompt(out, input_buf, "", "") orelse return false;
+        if (key_input.len == 0) {
+            try out.print("{s}  -> Skipped (no key provided)\n\n", .{prefix});
+            return false;
+        }
+        if (std.mem.startsWith(u8, key_input, "nsec1")) {
+            const argv_dec = [_][]const u8{ nak_path, "decode", key_input };
+            const hex = nakRun(cfg.allocator, &argv_dec) orelse {
+                try out.print("{s}  -> Failed to decode nsec (invalid key?)\n\n", .{prefix});
+                return false;
+            };
+            bot_privkey_hex = hex;
+        } else {
+            bot_privkey_hex = try cfg.allocator.dupe(u8, key_input);
+        }
+        if (bot_privkey_hex) |privhex| {
+            const argv_pub = [_][]const u8{ nak_path, "key", "public", privhex };
+            bot_pubkey_hex = nakRun(cfg.allocator, &argv_pub);
+        }
+    }
+
+    const nostr_mod = @import("channels/nostr.zig");
+    if (bot_pubkey_hex == null or !nostr_mod.NostrChannel.isValidHexKey(bot_pubkey_hex.?)) {
+        try out.print("{s}  -> Failed to derive a valid bot pubkey from the provided key\n\n", .{prefix});
+        return false;
+    }
+
+    // ── Owner pubkey ─────────────────────────────────────────────
+    try out.print("{s}  Your owner pubkey (npub or 64-char hex): ", .{prefix});
+    const owner_input = prompt(out, input_buf, "", "") orelse return false;
+    if (owner_input.len == 0) {
+        try out.print("{s}  -> Skipped (no owner pubkey)\n\n", .{prefix});
+        return false;
+    }
+
+    var owner_hex: ?[]u8 = null;
+    defer if (owner_hex) |k| cfg.allocator.free(k);
+
+    if (std.mem.startsWith(u8, owner_input, "npub1")) {
+        const argv_dec = [_][]const u8{ nak_path, "decode", owner_input };
+        const hex = nakRun(cfg.allocator, &argv_dec) orelse {
+            try out.print("{s}  -> Failed to decode npub (invalid pubkey?)\n\n", .{prefix});
+            return false;
+        };
+        owner_hex = hex;
+    } else {
+        owner_hex = try cfg.allocator.dupe(u8, owner_input);
+    }
+
+    if (!nostr_mod.NostrChannel.isValidHexKey(owner_hex.?)) {
+        try out.print("{s}  -> owner pubkey must be 64-char hex or a valid npub\n\n", .{prefix});
+        return false;
+    }
+
+    const secrets = @import("security/secrets.zig");
+    const config_dir = std.fs.path.dirname(cfg.config_path) orelse ".";
+    const store = secrets.SecretStore.init(config_dir, cfg.secrets.encrypt);
+    const encrypted_key = try store.encryptSecret(cfg.allocator, bot_privkey_hex.?);
+
+    const ns = try cfg.allocator.create(@import("config_types.zig").NostrConfig);
+    ns.* = .{
+        .private_key = encrypted_key,
+        .owner_pubkey = try cfg.allocator.dupe(u8, owner_hex.?),
+        .bot_pubkey = try cfg.allocator.dupe(u8, bot_pubkey_hex.?),
+        .config_dir = config_dir,
+    };
+    cfg.channels.nostr = ns;
+    if (generate_new) {
+        try out.print("{s}  -> Keypair generated and encrypted at rest\n", .{prefix});
+    } else {
+        try out.print("{s}  -> Key encrypted at rest\n", .{prefix});
+    }
+    try out.print("{s}  -> Default relays: relay.damus.io, nos.lol, relay.nostr.band, auth.nostr1.com, relay.primal.net\n", .{prefix});
+    try out.print("{s}  -> Edit config to add: display_name, nip05, lnurl, dm_allowed_pubkeys\n\n", .{prefix});
+    return true;
+}
+
+/// Run a nak subprocess, capture stdout, trim whitespace, return owned slice or null on failure.
+fn nakRun(allocator: std.mem.Allocator, argv: []const []const u8) ?[]u8 {
+    var child = std.process.Child.init(argv, allocator);
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Ignore;
+    child.spawn() catch return null;
+    const stdout = child.stdout orelse {
+        _ = child.wait() catch {};
+        return null;
+    };
+    var out = std.ArrayListUnmanaged(u8).empty;
+    var buf: [256]u8 = undefined;
+    while (true) {
+        const n = stdout.read(&buf) catch break;
+        if (n == 0) break;
+        out.appendSlice(allocator, buf[0..n]) catch {
+            out.deinit(allocator);
+            _ = child.wait() catch {};
+            return null;
+        };
+    }
+    const term = child.wait() catch {
+        out.deinit(allocator);
+        return null;
+    };
+    switch (term) {
+        .Exited => |code| if (code != 0) {
+            out.deinit(allocator);
+            return null;
+        },
+        else => {
+            out.deinit(allocator);
+            return null;
+        },
+    }
+    const raw = out.toOwnedSlice(allocator) catch return null;
+    const trimmed = std.mem.trimRight(u8, raw, " \t\r\n");
+    if (trimmed.len == raw.len) return raw;
+    defer allocator.free(raw);
+    return allocator.dupe(u8, trimmed) catch null;
+}
+
 /// Interactive wizard entry point — runs the full setup interactively.
 pub fn runWizard(allocator: std.mem.Allocator) !void {
     var stdout_buf: [4096]u8 = undefined;
@@ -1175,18 +1436,82 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
     for (known_providers, 0..) |p, i| {
         try out.print("    [{d}] {s}\n", .{ i + 1, p.label });
     }
+    try out.print("    [{d}] Custom OpenAI-compatible provider (custom:https://.../v1)\n", .{known_providers.len + 1});
     try out.writeAll("  Choice [1]: ");
-    const provider_idx = promptChoice(out, &input_buf, known_providers.len, 0) orelse {
+    const provider_idx = promptChoice(out, &input_buf, known_providers.len + 1, 0) orelse {
         try out.writeAll("\n  Aborted.\n");
         try out.flush();
         return;
     };
-    const selected_provider = known_providers[provider_idx];
-    cfg.default_provider = selected_provider.key;
-    try out.print("  -> {s}\n\n", .{selected_provider.label});
+
+    if (provider_idx < known_providers.len) {
+        const provider = known_providers[provider_idx];
+        cfg.default_provider = provider.key;
+        try out.print("  -> {s}\n\n", .{provider.label});
+    } else {
+        // Custom provider - prompt for URL
+        var custom_url_buf: [512]u8 = undefined;
+        try out.writeAll("\n  Custom provider configuration:\n");
+        try out.writeAll("  Enter OpenAI-compatible endpoint URL (e.g., https://api.example.com/v1): ");
+        const custom_url = prompt(out, &custom_url_buf, "", "") orelse {
+            try out.writeAll("\n  Aborted.\n");
+            try out.flush();
+            return;
+        };
+        if (custom_url.len == 0) {
+            try out.writeAll("\n  Error: Custom provider URL cannot be empty\n");
+            try out.flush();
+            return;
+        }
+        if (!isValidCustomProviderUrl(custom_url)) {
+            try out.writeAll("\n  Error: endpoint must be http(s) and include a version segment like /v1\n");
+            try out.flush();
+            return;
+        }
+        const custom_provider_key = try std.fmt.allocPrint(cfg.allocator, "custom:{s}", .{custom_url});
+        cfg.default_provider = custom_provider_key;
+
+        // Add to providers section with base_url
+        const entries = try cfg.allocator.alloc(config_mod.ProviderEntry, 1);
+        entries[0] = .{ .name = try cfg.allocator.dupe(u8, cfg.default_provider), .base_url = try cfg.allocator.dupe(u8, custom_url) };
+        cfg.providers = entries;
+
+        try out.print("  -> Custom: {s}\n\n", .{custom_url});
+    }
+
+    const is_azure_provider = provider_idx < known_providers.len and
+        std.mem.eql(u8, known_providers[provider_idx].key, "azure");
+
+    var provider_base_url: ?[]const u8 = null;
+    if (cfg.providers.len > 0 and cfg.providers[0].base_url != null) {
+        provider_base_url = cfg.providers[0].base_url;
+    }
+
+    if (is_azure_provider) {
+        var azure_endpoint_buf: [512]u8 = undefined;
+        const default_endpoint = provider_base_url orelse "";
+        if (default_endpoint.len > 0) {
+            try out.print("  Azure OpenAI endpoint [{s}]: ", .{default_endpoint});
+        } else {
+            try out.writeAll("  Azure OpenAI endpoint (e.g., https://your-resource.openai.azure.com): ");
+        }
+        const azure_endpoint = prompt(out, &azure_endpoint_buf, "", default_endpoint) orelse {
+            try out.writeAll("\n  Aborted.\n");
+            try out.flush();
+            return;
+        };
+        if (azure_endpoint.len == 0) {
+            try out.writeAll("\n  Error: Azure OpenAI endpoint is required\n");
+            try out.flush();
+            return;
+        }
+        provider_base_url = try cfg.allocator.dupe(u8, azure_endpoint);
+        try out.writeAll("  Note: Azure OpenAI uses your model name as the deployment name in URLs.\n");
+        try out.writeAll("  Configure your Azure deployment with the same name as your model (e.g., gpt-5.2-chat).\n");
+    }
 
     // ── Step 2: API key ──
-    const env_hint = selected_provider.env_var;
+    const env_hint = if (provider_idx < known_providers.len) known_providers[provider_idx].env_var else "API_KEY";
     try out.print("  Step 2/8: Enter API key (or press Enter to use env var {s}): ", .{env_hint});
     const api_key_input = prompt(out, &input_buf, "", "") orelse {
         try out.writeAll("\n  Aborted.\n");
@@ -1194,41 +1519,86 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
         return;
     };
     if (api_key_input.len > 0) {
-        // Store in providers section (arena frees old values)
+        // Store in providers section (preserve base_url if already set for custom provider)
         const entries = try cfg.allocator.alloc(config_mod.ProviderEntry, 1);
-        entries[0] = .{ .name = try cfg.allocator.dupe(u8, cfg.default_provider), .api_key = try cfg.allocator.dupe(u8, api_key_input) };
+        entries[0] = .{
+            .name = try cfg.allocator.dupe(u8, cfg.default_provider),
+            .api_key = try cfg.allocator.dupe(u8, api_key_input),
+            .base_url = provider_base_url,
+        };
         cfg.providers = entries;
         try out.writeAll("  -> API key set\n\n");
     } else {
+        if (is_azure_provider) {
+            const entries = try cfg.allocator.alloc(config_mod.ProviderEntry, 1);
+            entries[0] = .{
+                .name = try cfg.allocator.dupe(u8, cfg.default_provider),
+                .base_url = provider_base_url,
+            };
+            cfg.providers = entries;
+        }
         try out.print("  -> Will use ${s} from environment\n\n", .{env_hint});
     }
 
     // ── Step 3: Model (with live fetching) ──
+    const default_model_for_provider = if (provider_idx < known_providers.len)
+        known_providers[provider_idx].default_model
+    else
+        "gpt-5.2";
+
     try out.writeAll("  Step 3/8: Select a model\n");
     try out.writeAll("  Fetching available models...\n");
     try out.flush();
 
-    const live_models = fetchModels(allocator, selected_provider.key, cfg.defaultProviderKey()) catch
-        try dupeFallbackModels(allocator, selected_provider.key);
-    defer {
-        for (live_models) |m| allocator.free(m);
-        allocator.free(live_models);
+    // Try to fetch models for both known and custom providers
+    var models_fetched = false;
+    var live_models: []const []const u8 = undefined;
+    var models_to_use: []const []const u8 = undefined;
+
+    const provider_for_fetch = if (std.mem.startsWith(u8, cfg.default_provider, "custom:"))
+        cfg.default_provider["custom:".len..]
+    else
+        cfg.default_provider;
+
+    if (fetchModels(allocator, provider_for_fetch, cfg.defaultProviderKey())) |models| {
+        models_fetched = true;
+        live_models = models;
+        models_to_use = live_models;
+    } else |_| {
+        try out.writeAll("  Could not fetch models (will use fallback)\n");
+        try out.flush();
+        models_to_use = try dupeFallbackModels(allocator, provider_for_fetch);
     }
 
-    // Show up to 15 models as numbered choices
-    const display_max: usize = @min(live_models.len, 15);
-    for (live_models[0..display_max], 0..) |m, i| {
-        const is_default = std.mem.eql(u8, m, selected_provider.default_model);
-        if (is_default) {
-            try out.print("    [{d}] {s} (default)\n", .{ i + 1, m });
+    defer {
+        if (models_fetched) {
+            for (live_models) |m| allocator.free(m);
+            allocator.free(live_models);
         } else {
-            try out.print("    [{d}] {s}\n", .{ i + 1, m });
+            for (models_to_use) |m| allocator.free(m);
+            allocator.free(models_to_use);
         }
     }
-    if (live_models.len > display_max) {
-        try out.print("    ... and {d} more (type name to use any model)\n", .{live_models.len - display_max});
+
+    // Show up to 15 models as numbered choices if we successfully fetched them
+    if (models_fetched) {
+        const display_max: usize = @min(models_to_use.len, 15);
+        for (models_to_use[0..display_max], 0..) |m, i| {
+            const is_default = std.mem.eql(u8, m, default_model_for_provider);
+            if (is_default) {
+                try out.print("    [{d}] {s} (default)\n", .{ i + 1, m });
+            } else {
+                try out.print("    [{d}] {s}\n", .{ i + 1, m });
+            }
+        }
+        if (models_to_use.len > display_max) {
+            try out.print("    ... and {d} more (type name to use any model)\n", .{models_to_use.len - display_max});
+        }
+        try out.print("  Choice [1] or model name [{s}]: ", .{default_model_for_provider});
+    } else {
+        try out.writeAll("  Enter model name directly:\n");
+        try out.print("  Model name [{s}]: ", .{default_model_for_provider});
     }
-    try out.print("  Choice [1] or model name [{s}]: ", .{selected_provider.default_model});
     const model_input = prompt(out, &input_buf, "", "") orelse {
         try out.writeAll("\n  Aborted.\n");
         try out.flush();
@@ -1236,21 +1606,28 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
     };
     if (model_input.len == 0) {
         // Default: use first model from the list (or provider default)
-        // Must dupe because live_models will be freed in defer block
-        cfg.default_model = if (live_models.len > 0)
-            try cfg.allocator.dupe(u8, live_models[0])
+        // Must dupe because models_to_use will be freed in defer block
+        cfg.default_model = if (models_to_use.len > 0)
+            try cfg.allocator.dupe(u8, models_to_use[0])
         else
-            try cfg.allocator.dupe(u8, selected_provider.default_model);
-    } else if (std.fmt.parseInt(usize, model_input, 10)) |num| {
-        if (num >= 1 and num <= display_max) {
-            // Must dupe because live_models will be freed in defer block
-            cfg.default_model = try cfg.allocator.dupe(u8, live_models[num - 1]);
-        } else {
-            // Must dupe because selected_provider.default_model is from const static data
-            cfg.default_model = try cfg.allocator.dupe(u8, selected_provider.default_model);
+            try cfg.allocator.dupe(u8, default_model_for_provider);
+    } else if (models_fetched) {
+        // If we successfully fetched models, try to parse as number (menu selection) or use as free-form model name
+        const display_max: usize = @min(models_to_use.len, 15);
+        if (std.fmt.parseInt(usize, model_input, 10)) |num| {
+            if (num >= 1 and num <= display_max) {
+                // Must dupe because models_to_use will be freed in defer block
+                cfg.default_model = try cfg.allocator.dupe(u8, models_to_use[num - 1]);
+            } else {
+                // Must dupe because default_model_for_provider is from const static data
+                cfg.default_model = try cfg.allocator.dupe(u8, default_model_for_provider);
+            }
+        } else |_| {
+            // Free-form model name typed by user
+            cfg.default_model = try cfg.allocator.dupe(u8, model_input);
         }
-    } else |_| {
-        // Free-form model name typed by user
+    } else {
+        // If we couldn't fetch models, use input as model name directly
         cfg.default_model = try cfg.allocator.dupe(u8, model_input);
     }
     try out.print("  -> {s}\n\n", .{cfg.default_model.?});
@@ -1362,7 +1739,7 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
     };
 
     // Scaffold workspace files
-    try scaffoldWorkspace(allocator, cfg.workspace_dir, &ProjectContext{});
+    try scaffoldWorkspace(allocator, cfg.workspace_dir, &ProjectContext{}, null);
 
     // Save config
     try cfg.save();
@@ -1380,7 +1757,9 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
     try out.print("  [OK] Config:     {s}\n", .{cfg.config_path});
     try out.writeAll("\n  Next steps:\n");
     if (cfg.defaultProviderKey() == null) {
-        try out.print("    1. Set your API key:  export {s}=\"sk-...\"\n", .{env_hint});
+        // Recalculate env_hint for the final display
+        const final_env_hint = if (provider_idx < known_providers.len) known_providers[provider_idx].env_var else "API_KEY";
+        try out.print("    1. Set your API key:  export {s}=\"sk-...\"\n", .{final_env_hint});
         try out.writeAll("    2. Chat:              nullclaw agent -m \"Hello!\"\n");
         try out.writeAll("    3. Gateway:           nullclaw gateway\n");
     } else {
@@ -1537,7 +1916,14 @@ pub fn runModelsRefresh(allocator: std.mem.Allocator) !void {
 // ── Workspace scaffolding ────────────────────────────────────────
 
 /// Create essential workspace files if they don't already exist.
-pub fn scaffoldWorkspace(allocator: std.mem.Allocator, workspace_dir: []const u8, ctx: *const ProjectContext) !void {
+/// When a `bootstrap_provider` is supplied and the backend does not use
+/// files, documents are written through the provider instead of to disk.
+pub fn scaffoldWorkspace(
+    allocator: std.mem.Allocator,
+    workspace_dir: []const u8,
+    ctx: *const ProjectContext,
+    bootstrap_provider: ?bootstrap_mod.BootstrapProvider,
+) !void {
     if (std.fs.path.dirname(workspace_dir)) |parent| {
         std.fs.makeDirAbsolute(parent) catch |err| switch (err) {
             error.PathAlreadyExists => {},
@@ -1554,26 +1940,26 @@ pub fn scaffoldWorkspace(allocator: std.mem.Allocator, workspace_dir: []const u8
     // SOUL.md (personality traits — loaded by prompt.zig)
     const soul_tmpl = try soulTemplate(allocator, ctx);
     defer allocator.free(soul_tmpl);
-    try writeIfMissing(allocator, workspace_dir, "SOUL.md", soul_tmpl);
+    try storeOrWriteIfMissing(allocator, workspace_dir, "SOUL.md", soul_tmpl, bootstrap_provider);
 
     // AGENTS.md (operational guidelines — loaded by prompt.zig)
-    try writeIfMissing(allocator, workspace_dir, "AGENTS.md", agentsTemplate());
+    try storeOrWriteIfMissing(allocator, workspace_dir, "AGENTS.md", agentsTemplate(), bootstrap_provider);
 
     // TOOLS.md (tool usage guide — loaded by prompt.zig)
-    try writeIfMissing(allocator, workspace_dir, "TOOLS.md", toolsTemplate());
+    try storeOrWriteIfMissing(allocator, workspace_dir, "TOOLS.md", toolsTemplate(), bootstrap_provider);
 
     // IDENTITY.md (identity config — loaded by prompt.zig)
     const identity_tmpl = try identityTemplate(allocator, ctx);
     defer allocator.free(identity_tmpl);
-    try writeIfMissing(allocator, workspace_dir, "IDENTITY.md", identity_tmpl);
+    try storeOrWriteIfMissing(allocator, workspace_dir, "IDENTITY.md", identity_tmpl, bootstrap_provider);
 
     // USER.md (user profile — loaded by prompt.zig)
     const user_tmpl = try userTemplate(allocator, ctx);
     defer allocator.free(user_tmpl);
-    try writeIfMissing(allocator, workspace_dir, "USER.md", user_tmpl);
+    try storeOrWriteIfMissing(allocator, workspace_dir, "USER.md", user_tmpl, bootstrap_provider);
 
     // HEARTBEAT.md (periodic tasks — loaded by prompt.zig)
-    try writeIfMissing(allocator, workspace_dir, "HEARTBEAT.md", heartbeatTemplate());
+    try storeOrWriteIfMissing(allocator, workspace_dir, "HEARTBEAT.md", heartbeatTemplate(), bootstrap_provider);
 
     // BOOTSTRAP.md lifecycle:
     // one-shot onboarding instructions with persisted state marker.
@@ -1598,6 +1984,7 @@ pub fn resetWorkspacePromptFiles(
     workspace_dir: []const u8,
     ctx: *const ProjectContext,
     options: ResetWorkspacePromptFilesOptions,
+    bootstrap_provider: ?bootstrap_mod.BootstrapProvider,
 ) !ResetWorkspacePromptFilesReport {
     if (std.fs.path.dirname(workspace_dir)) |parent| {
         std.fs.makeDirAbsolute(parent) catch |err| switch (err) {
@@ -1632,11 +2019,17 @@ pub fn resetWorkspacePromptFiles(
     };
 
     for (files) |entry| {
+        if (bootstrap_provider) |bp| {
+            if (!options.dry_run) try bp.store(entry.filename, entry.content);
+        }
         _ = try overwriteWorkspaceFile(allocator, workspace_dir, entry.filename, entry.content, options.dry_run);
         report.rewritten_files += 1;
     }
 
     if (options.include_bootstrap) {
+        if (bootstrap_provider) |bp| {
+            if (!options.dry_run) try bp.store("BOOTSTRAP.md", bootstrapTemplate());
+        }
         _ = try overwriteWorkspaceFile(allocator, workspace_dir, "BOOTSTRAP.md", bootstrapTemplate(), options.dry_run);
         report.rewritten_files += 1;
     }
@@ -1660,7 +2053,7 @@ fn overwriteWorkspaceFile(
     content: []const u8,
     dry_run: bool,
 ) !bool {
-    const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ workspace_dir, filename });
+    const path = try std.fs.path.join(allocator, &.{ workspace_dir, filename });
     defer allocator.free(path);
 
     if (dry_run) return true;
@@ -1677,7 +2070,7 @@ fn removeWorkspaceFileIfExists(
     filename: []const u8,
     dry_run: bool,
 ) !bool {
-    const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ workspace_dir, filename });
+    const path = try std.fs.path.join(allocator, &.{ workspace_dir, filename });
     defer allocator.free(path);
 
     if (dry_run) {
@@ -1692,7 +2085,7 @@ fn removeWorkspaceFileIfExists(
 }
 
 fn writeIfMissing(allocator: std.mem.Allocator, dir: []const u8, filename: []const u8, content: []const u8) !void {
-    const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, filename });
+    const path = try std.fs.path.join(allocator, &.{ dir, filename });
     defer allocator.free(path);
 
     // Only write if file doesn't exist
@@ -1712,6 +2105,24 @@ fn writeIfMissing(allocator: std.mem.Allocator, dir: []const u8, filename: []con
     try file.writeAll(content);
 }
 
+/// Write-if-missing with optional BootstrapProvider routing.
+/// When a provider is set, stores the content through the provider as well
+/// (the file write still happens so file-based backends stay consistent).
+fn storeOrWriteIfMissing(
+    allocator: std.mem.Allocator,
+    dir: []const u8,
+    filename: []const u8,
+    content: []const u8,
+    bp: ?bootstrap_mod.BootstrapProvider,
+) !void {
+    if (bp) |provider| {
+        if (!provider.exists(filename)) {
+            try provider.store(filename, content);
+        }
+    }
+    try writeIfMissing(allocator, dir, filename, content);
+}
+
 fn ensureBootstrapLifecycle(
     allocator: std.mem.Allocator,
     workspace_dir: []const u8,
@@ -1719,7 +2130,7 @@ fn ensureBootstrapLifecycle(
     user_template: []const u8,
     had_legacy_user_content: bool,
 ) !void {
-    const bootstrap_path = try std.fmt.allocPrint(allocator, "{s}/BOOTSTRAP.md", .{workspace_dir});
+    const bootstrap_path = try std.fs.path.join(allocator, &.{ workspace_dir, "BOOTSTRAP.md" });
     defer allocator.free(bootstrap_path);
 
     var state = try readWorkspaceOnboardingState(allocator, workspace_dir);
@@ -1770,9 +2181,9 @@ fn isLegacyOnboardingCompleted(
     user_template: []const u8,
     had_legacy_user_content: bool,
 ) !bool {
-    const identity_path = try std.fmt.allocPrint(allocator, "{s}/IDENTITY.md", .{workspace_dir});
+    const identity_path = try std.fs.path.join(allocator, &.{ workspace_dir, "IDENTITY.md" });
     defer allocator.free(identity_path);
-    const user_path = try std.fmt.allocPrint(allocator, "{s}/USER.md", .{workspace_dir});
+    const user_path = try std.fs.path.join(allocator, &.{ workspace_dir, "USER.md" });
     defer allocator.free(user_path);
 
     var templates_diverged = false;
@@ -1792,11 +2203,7 @@ fn isLegacyOnboardingCompleted(
 }
 
 fn workspaceStatePath(allocator: std.mem.Allocator, workspace_dir: []const u8) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
-        "{s}/{s}/{s}",
-        .{ workspace_dir, WORKSPACE_STATE_DIR, WORKSPACE_STATE_FILE },
-    );
+    return std.fs.path.join(allocator, &.{ workspace_dir, WORKSPACE_STATE_DIR, WORKSPACE_STATE_FILE });
 }
 
 fn readWorkspaceOnboardingState(
@@ -1931,11 +2338,11 @@ fn pathExistsAbsolute(path: []const u8) bool {
 }
 
 fn hasLegacyUserContentIndicators(allocator: std.mem.Allocator, workspace_dir: []const u8) !bool {
-    const memory_dir_path = try std.fmt.allocPrint(allocator, "{s}/memory", .{workspace_dir});
+    const memory_dir_path = try std.fs.path.join(allocator, &.{ workspace_dir, "memory" });
     defer allocator.free(memory_dir_path);
-    const memory_file_path = try std.fmt.allocPrint(allocator, "{s}/MEMORY.md", .{workspace_dir});
+    const memory_file_path = try std.fs.path.join(allocator, &.{ workspace_dir, "MEMORY.md" });
     defer allocator.free(memory_file_path);
-    const git_dir_path = try std.fmt.allocPrint(allocator, "{s}/.git", .{workspace_dir});
+    const git_dir_path = try std.fs.path.join(allocator, &.{ workspace_dir, ".git" });
     defer allocator.free(git_dir_path);
 
     return pathExistsAbsolute(memory_dir_path) or
@@ -2024,7 +2431,7 @@ pub fn selectableBackends() []const memory_root.BackendDescriptor {
 
 /// Get the default memory backend key.
 pub fn defaultBackendKey() []const u8 {
-    return "markdown";
+    return "hybrid";
 }
 
 // ── Path helpers ─────────────────────────────────────────────────
@@ -2048,12 +2455,18 @@ test "canonicalProviderName handles aliases" {
     try std.testing.expectEqualStrings("together-ai", canonicalProviderName("together"));
     try std.testing.expectEqualStrings("gemini", canonicalProviderName("google"));
     try std.testing.expectEqualStrings("gemini", canonicalProviderName("google-gemini"));
+    try std.testing.expectEqualStrings("vertex", canonicalProviderName("vertex-ai"));
+    try std.testing.expectEqualStrings("vertex", canonicalProviderName("google-vertex"));
+    try std.testing.expectEqualStrings("claude-cli", canonicalProviderName("claude-code"));
+    try std.testing.expectEqualStrings("azure", canonicalProviderName("azure-openai"));
+    try std.testing.expectEqualStrings("azure", canonicalProviderName("azure_openai"));
     try std.testing.expectEqualStrings("openai", canonicalProviderName("openai"));
 }
 
 test "defaultModelForProvider returns known models" {
     try std.testing.expectEqualStrings("claude-opus-4-6", defaultModelForProvider("anthropic"));
     try std.testing.expectEqualStrings("gpt-5.2", defaultModelForProvider("openai"));
+    try std.testing.expectEqualStrings("gpt-5.2-chat", defaultModelForProvider("azure"));
     try std.testing.expectEqualStrings("deepseek-chat", defaultModelForProvider("deepseek"));
     try std.testing.expectEqualStrings("llama4", defaultModelForProvider("ollama"));
 }
@@ -2066,6 +2479,7 @@ test "providerEnvVar known providers" {
     try std.testing.expectEqualStrings("OPENROUTER_API_KEY", providerEnvVar("openrouter"));
     try std.testing.expectEqualStrings("ANTHROPIC_API_KEY", providerEnvVar("anthropic"));
     try std.testing.expectEqualStrings("OPENAI_API_KEY", providerEnvVar("openai"));
+    try std.testing.expectEqualStrings("AZURE_OPENAI_API_KEY", providerEnvVar("azure"));
     try std.testing.expectEqualStrings("API_KEY", providerEnvVar("ollama"));
 }
 
@@ -2090,22 +2504,24 @@ test "selectableBackends returns enabled backends" {
         try std.testing.expect(memory_root.findBackend(desc.name) != null);
     }
 
-    if (memory_root.findBackend("markdown") != null) {
+    if (memory_root.findBackend("hybrid") != null) {
+        try std.testing.expectEqualStrings("hybrid", backends[0].name);
+    } else if (memory_root.findBackend("markdown") != null) {
         try std.testing.expectEqualStrings("markdown", backends[0].name);
     } else if (memory_root.findBackend("none") != null) {
         try std.testing.expectEqualStrings("none", backends[0].name);
     }
 }
 
-test "selectableBackendsForWizard prioritizes sqlite and keeps api last" {
+test "selectableBackendsForWizard prioritizes hybrid and keeps api last" {
     const backends = try selectableBackendsForWizard(std.testing.allocator);
     defer std.testing.allocator.free(backends);
 
-    if (memory_root.findBackend("sqlite") != null) {
-        try std.testing.expectEqualStrings("sqlite", backends[0].name);
+    if (memory_root.findBackend("hybrid") != null) {
+        try std.testing.expectEqualStrings("hybrid", backends[0].name);
     }
-    if (memory_root.findBackend("sqlite") != null and memory_root.findBackend("markdown") != null and backends.len >= 2) {
-        try std.testing.expectEqualStrings("markdown", backends[1].name);
+    if (memory_root.findBackend("hybrid") != null and memory_root.findBackend("sqlite") != null and backends.len >= 2) {
+        try std.testing.expectEqualStrings("sqlite", backends[1].name);
     }
     if (memory_root.findBackend("api") != null) {
         try std.testing.expectEqualStrings("api", backends[backends.len - 1].name);
@@ -2113,6 +2529,7 @@ test "selectableBackendsForWizard prioritizes sqlite and keeps api last" {
 }
 
 test "memoryProfileForBackend maps common backends" {
+    try std.testing.expectEqualStrings("hybrid_keyword", memoryProfileForBackend("hybrid"));
     try std.testing.expectEqualStrings("local_keyword", memoryProfileForBackend("sqlite"));
     try std.testing.expectEqualStrings("markdown_only", memoryProfileForBackend("markdown"));
     try std.testing.expectEqualStrings("postgres_keyword", memoryProfileForBackend("postgres"));
@@ -2127,6 +2544,7 @@ test "isWizardInteractiveChannel includes supported onboarding channels" {
     try std.testing.expect(isWizardInteractiveChannel(.slack));
     try std.testing.expect(isWizardInteractiveChannel(.matrix));
     try std.testing.expect(isWizardInteractiveChannel(.signal));
+    try std.testing.expect(isWizardInteractiveChannel(.nostr));
     try std.testing.expect(!isWizardInteractiveChannel(.whatsapp));
 }
 
@@ -2201,7 +2619,7 @@ test "scaffoldWorkspace creates core files and leaves MEMORY.md optional" {
     defer std.testing.allocator.free(base);
 
     const ctx = ProjectContext{};
-    try scaffoldWorkspace(std.testing.allocator, base, &ctx);
+    try scaffoldWorkspace(std.testing.allocator, base, &ctx, null);
 
     // Verify core files were created
     const agents = try tmp.dir.openFile("AGENTS.md", .{});
@@ -2222,9 +2640,9 @@ test "scaffoldWorkspace is idempotent" {
     defer std.testing.allocator.free(base);
 
     const ctx = ProjectContext{};
-    try scaffoldWorkspace(std.testing.allocator, base, &ctx);
+    try scaffoldWorkspace(std.testing.allocator, base, &ctx, null);
     // Running again should not fail
-    try scaffoldWorkspace(std.testing.allocator, base, &ctx);
+    try scaffoldWorkspace(std.testing.allocator, base, &ctx, null);
 }
 
 test "resetWorkspacePromptFiles overwrites prompt files with defaults" {
@@ -2245,7 +2663,7 @@ test "resetWorkspacePromptFiles overwrites prompt files with defaults" {
     const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
-    const report = try resetWorkspacePromptFiles(std.testing.allocator, base, &ProjectContext{}, .{});
+    const report = try resetWorkspacePromptFiles(std.testing.allocator, base, &ProjectContext{}, .{}, null);
     try std.testing.expectEqual(@as(usize, 6), report.rewritten_files);
     try std.testing.expectEqual(@as(usize, 0), report.removed_files);
 
@@ -2289,7 +2707,7 @@ test "resetWorkspacePromptFiles supports dry-run and clearing memory markdown fi
     const dry_report = try resetWorkspacePromptFiles(std.testing.allocator, base, &ProjectContext{}, .{
         .clear_memory_markdown = true,
         .dry_run = true,
-    });
+    }, null);
     try std.testing.expectEqual(@as(usize, 6), dry_report.rewritten_files);
     try std.testing.expect(dry_report.removed_files >= 1);
     const memory_file = try tmp.dir.openFile("MEMORY.md", .{});
@@ -2297,7 +2715,7 @@ test "resetWorkspacePromptFiles supports dry-run and clearing memory markdown fi
 
     const reset_report = try resetWorkspacePromptFiles(std.testing.allocator, base, &ProjectContext{}, .{
         .clear_memory_markdown = true,
-    });
+    }, null);
     try std.testing.expectEqual(@as(usize, 6), reset_report.rewritten_files);
     try std.testing.expect(reset_report.removed_files >= 1);
     try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("MEMORY.md", .{}));
@@ -2315,7 +2733,7 @@ test "resetWorkspacePromptFiles creates missing workspace directory" {
     const nested = try std.fmt.allocPrint(std.testing.allocator, "{s}/nested/workspace", .{base});
     defer std.testing.allocator.free(nested);
 
-    const report = try resetWorkspacePromptFiles(std.testing.allocator, nested, &ProjectContext{}, .{});
+    const report = try resetWorkspacePromptFiles(std.testing.allocator, nested, &ProjectContext{}, .{}, null);
     try std.testing.expectEqual(@as(usize, 6), report.rewritten_files);
 
     const agents_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/AGENTS.md", .{nested});
@@ -2331,7 +2749,7 @@ test "scaffoldWorkspace seeds bootstrap marker for new workspace" {
     const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
-    try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{});
+    try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{}, null);
 
     const bootstrap_file = try tmp.dir.openFile("BOOTSTRAP.md", .{});
     bootstrap_file.close();
@@ -2349,7 +2767,7 @@ test "scaffoldWorkspace does not recreate BOOTSTRAP after onboarding completion"
     const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
-    try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{});
+    try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{}, null);
 
     {
         const f = try tmp.dir.createFile("IDENTITY.md", .{ .truncate = true });
@@ -2365,7 +2783,7 @@ test "scaffoldWorkspace does not recreate BOOTSTRAP after onboarding completion"
     try tmp.dir.deleteFile("BOOTSTRAP.md");
     try tmp.dir.deleteFile("TOOLS.md");
 
-    try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{});
+    try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{}, null);
 
     try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("BOOTSTRAP.md", .{}));
     const tools_file = try tmp.dir.openFile("TOOLS.md", .{});
@@ -2394,7 +2812,7 @@ test "scaffoldWorkspace does not seed BOOTSTRAP for legacy completed workspace" 
     const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
-    try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{});
+    try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{}, null);
 
     try std.testing.expectError(error.FileNotFound, tmp.dir.openFile("BOOTSTRAP.md", .{}));
 
@@ -2421,7 +2839,7 @@ test "scaffoldWorkspace treats memory-backed workspace as existing and skips BOO
     const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
-    try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{});
+    try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{}, null);
 
     const identity_file = try tmp.dir.openFile("IDENTITY.md", .{});
     identity_file.close();
@@ -2451,7 +2869,7 @@ test "scaffoldWorkspace treats git-backed workspace as existing and skips BOOTST
     const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
-    try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{});
+    try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{}, null);
 
     const identity_file = try tmp.dir.openFile("IDENTITY.md", .{});
     identity_file.close();
@@ -2462,14 +2880,39 @@ test "scaffoldWorkspace treats git-backed workspace as existing and skips BOOTST
     try std.testing.expect(state.onboarding_completed_at != null);
 }
 
+test "scaffoldWorkspace handles trailing native separator on Windows paths" {
+    if (builtin.os.tag != .windows) return;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    const workspace_with_sep = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{s}{s}",
+        .{ base, std.fs.path.sep_str },
+    );
+    defer std.testing.allocator.free(workspace_with_sep);
+
+    try scaffoldWorkspace(std.testing.allocator, workspace_with_sep, &ProjectContext{}, null);
+
+    const bootstrap_file = try tmp.dir.openFile("BOOTSTRAP.md", .{});
+    bootstrap_file.close();
+}
+
 // ── Additional onboard tests ────────────────────────────────────
 
 test "canonicalProviderName passthrough for known providers" {
     try std.testing.expectEqualStrings("anthropic", canonicalProviderName("anthropic"));
     try std.testing.expectEqualStrings("openrouter", canonicalProviderName("openrouter"));
+    try std.testing.expectEqualStrings("vertex", canonicalProviderName("vertex"));
     try std.testing.expectEqualStrings("deepseek", canonicalProviderName("deepseek"));
     try std.testing.expectEqualStrings("groq", canonicalProviderName("groq"));
     try std.testing.expectEqualStrings("ollama", canonicalProviderName("ollama"));
+    try std.testing.expectEqualStrings("claude-cli", canonicalProviderName("claude-cli"));
+    try std.testing.expectEqualStrings("codex-cli", canonicalProviderName("codex-cli"));
 }
 
 test "canonicalProviderName unknown returns as-is" {
@@ -2487,6 +2930,25 @@ test "resolveProviderForQuickSetup handles known and alias names" {
 
 test "resolveProviderForQuickSetup rejects unknown provider" {
     try std.testing.expect(resolveProviderForQuickSetup("totally-unknown-provider") == null);
+}
+
+test "resolveProviderForQuickSetup supports custom: prefix" {
+    const custom = resolveProviderForQuickSetup("custom:https://example.com/v1") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("custom:https://example.com/v1", custom.key);
+    try std.testing.expectEqualStrings("Custom OpenAI-compatible provider", custom.label);
+    try std.testing.expectEqualStrings("gpt-5.2", custom.default_model);
+    try std.testing.expectEqualStrings("API_KEY", custom.env_var);
+}
+
+test "resolveProviderForQuickSetup supports custom: versioned endpoint beyond v1" {
+    const custom = resolveProviderForQuickSetup("custom:https://example.com/openai/v2") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("custom:https://example.com/openai/v2", custom.key);
+}
+
+test "resolveProviderForQuickSetup rejects invalid custom endpoint format" {
+    try std.testing.expect(resolveProviderForQuickSetup("custom:") == null);
+    try std.testing.expect(resolveProviderForQuickSetup("custom:https://example.com/api") == null);
+    try std.testing.expect(resolveProviderForQuickSetup("custom:example.com/v1") == null);
 }
 
 test "resolveMemoryBackendForQuickSetup validates enabled, disabled and unknown backends" {
@@ -2526,6 +2988,12 @@ test "defaultModelForProvider gemini via alias" {
     try std.testing.expectEqualStrings("gemini-2.5-pro", defaultModelForProvider("gemini"));
 }
 
+test "defaultModelForProvider vertex aliases" {
+    try std.testing.expectEqualStrings("gemini-2.5-pro", defaultModelForProvider("vertex"));
+    try std.testing.expectEqualStrings("gemini-2.5-pro", defaultModelForProvider("vertex-ai"));
+    try std.testing.expectEqualStrings("gemini-2.5-pro", defaultModelForProvider("google-vertex"));
+}
+
 test "defaultModelForProvider groq" {
     try std.testing.expectEqualStrings("llama-3.3-70b-versatile", defaultModelForProvider("groq"));
 }
@@ -2538,6 +3006,12 @@ test "providerEnvVar gemini aliases" {
     try std.testing.expectEqualStrings("GEMINI_API_KEY", providerEnvVar("gemini"));
     try std.testing.expectEqualStrings("GEMINI_API_KEY", providerEnvVar("google"));
     try std.testing.expectEqualStrings("GEMINI_API_KEY", providerEnvVar("google-gemini"));
+}
+
+test "providerEnvVar vertex aliases" {
+    try std.testing.expectEqualStrings("VERTEX_API_KEY", providerEnvVar("vertex"));
+    try std.testing.expectEqualStrings("VERTEX_API_KEY", providerEnvVar("vertex-ai"));
+    try std.testing.expectEqualStrings("VERTEX_API_KEY", providerEnvVar("google-vertex"));
 }
 
 test "providerEnvVar deepseek" {
@@ -2601,7 +3075,7 @@ test "scaffoldWorkspace does not create memory subdirectory by default" {
     const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
-    try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{});
+    try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{}, null);
     try std.testing.expectError(error.FileNotFound, tmp.dir.openDir("memory", .{}));
 }
 
@@ -2679,7 +3153,7 @@ test "catalog_providers names are unique" {
 test "wizard promptChoice returns default for out-of-range" {
     // This tests the logic without actual I/O by validating the
     // boundary: max providers is known_providers.len
-    try std.testing.expect(known_providers.len == 30);
+    try std.testing.expect(known_providers.len == 34);
     // The wizard would clamp to default (0) for out of range input
 }
 
@@ -2716,6 +3190,9 @@ test "agentsTemplate contains guidelines" {
     const tmpl = agentsTemplate();
     try std.testing.expect(std.mem.indexOf(u8, tmpl, "AGENTS.md - Your Workspace") != null);
     try std.testing.expect(std.mem.indexOf(u8, tmpl, "Every Session") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tmpl, "memory.backend") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tmpl, "memory_list") != null);
+    try std.testing.expect(std.mem.indexOf(u8, tmpl, "memory_recall") != null);
 }
 
 test "toolsTemplate contains tool docs" {
@@ -2756,7 +3233,7 @@ test "scaffoldWorkspace creates core prompt.zig files" {
     const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
-    try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{});
+    try scaffoldWorkspace(std.testing.allocator, base, &ProjectContext{}, null);
 
     // Verify core files that prompt.zig always loads exist.
     const files = [_][]const u8{
@@ -2792,12 +3269,26 @@ test "fallbackModelsForProvider returns models for known providers" {
 
     const gemini_models = fallbackModelsForProvider("gemini");
     try std.testing.expect(gemini_models.len >= 2);
+    const vertex_models = fallbackModelsForProvider("vertex");
+    try std.testing.expect(vertex_models.len >= 2);
+
+    const claude_cli_models = fallbackModelsForProvider("claude-cli");
+    try std.testing.expect(claude_cli_models.len >= 1);
+    try std.testing.expectEqualStrings("claude-opus-4-6", claude_cli_models[0]);
+
+    const codex_cli_models = fallbackModelsForProvider("codex-cli");
+    try std.testing.expect(codex_cli_models.len >= 1);
+    try std.testing.expectEqualStrings("codex-mini-latest", codex_cli_models[0]);
 }
 
 test "fallbackModelsForProvider handles aliases" {
     const models = fallbackModelsForProvider("google");
     try std.testing.expect(models.len >= 2);
     try std.testing.expectEqualStrings("gemini-2.5-pro", models[0]);
+
+    const vertex_models = fallbackModelsForProvider("vertex-ai");
+    try std.testing.expect(vertex_models.len >= 2);
+    try std.testing.expectEqualStrings("gemini-2.5-pro", vertex_models[0]);
 }
 
 test "fallbackModelsForProvider unknown returns anthropic fallback" {
