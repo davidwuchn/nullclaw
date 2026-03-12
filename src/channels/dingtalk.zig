@@ -582,7 +582,7 @@ fn download_bytes_to_local(
     if (comptime builtin.is_test) return null;
     if (!std.mem.startsWith(u8, source_url, "https://")) return null;
 
-    const bytes = http_util.curlGet(allocator, source_url, &.{}, "30") catch return null;
+    const bytes = http_util.curlGetMaxBytes(allocator, source_url, &.{}, "30", ATTACHMENT_MAX_BYTES) catch return null;
     defer allocator.free(bytes);
     if (bytes.len == 0 or bytes.len > ATTACHMENT_MAX_BYTES) return null;
 
@@ -1289,16 +1289,6 @@ pub const DingTalkChannel = struct {
             try std.fmt.allocPrint(self.allocator, "dingtalk:{s}:direct:{s}", .{ self.account_id, conversation_id });
         errdefer self.allocator.free(session_key);
 
-        var reply_state = SessionReplyTarget{
-            .webhook_url = try self.allocator.dupe(u8, session_webhook),
-            .sender_staff_id = if (sender_staff_id.len > 0) try self.allocator.dupe(u8, sender_staff_id) else null,
-            .conversation_id = try self.allocator.dupe(u8, conversation_id),
-            .is_group = is_group,
-            .expires_at_ms = session_webhook_expires_at,
-        };
-        defer reply_state.deinit(self.allocator);
-        try self.reply_targets.put(self.allocator, reply_target, reply_state);
-
         const owned_sender_id = try self.allocator.dupe(u8, direct_peer_id);
         errdefer self.allocator.free(owned_sender_id);
         const metadata_json = try self.buildMetadataJson(
@@ -1312,6 +1302,21 @@ pub const DingTalkChannel = struct {
             session_webhook_expires_at,
         );
         errdefer self.allocator.free(metadata_json);
+        const owned_media = try media_paths.toOwnedSlice(self.allocator);
+        errdefer {
+            for (owned_media) |path| self.allocator.free(path);
+            self.allocator.free(owned_media);
+        }
+
+        var reply_state = SessionReplyTarget{
+            .webhook_url = try self.allocator.dupe(u8, session_webhook),
+            .sender_staff_id = if (sender_staff_id.len > 0) try self.allocator.dupe(u8, sender_staff_id) else null,
+            .conversation_id = try self.allocator.dupe(u8, conversation_id),
+            .is_group = is_group,
+            .expires_at_ms = session_webhook_expires_at,
+        };
+        defer reply_state.deinit(self.allocator);
+        try self.reply_targets.put(self.allocator, reply_target, reply_state);
 
         return .{
             .sender_id = owned_sender_id,
@@ -1319,7 +1324,7 @@ pub const DingTalkChannel = struct {
             .content = final_content,
             .session_key = session_key,
             .metadata_json = metadata_json,
-            .media = try media_paths.toOwnedSlice(self.allocator),
+            .media = owned_media,
         };
     }
 
@@ -1803,6 +1808,61 @@ test "parseCallbackPayload falls back to message summary for file" {
     try std.testing.expectEqualStrings("report.pdf", parsed.content);
     try std.testing.expectEqualStrings("dingtalk:default:direct:cid-2", parsed.session_key);
     try std.testing.expect(std.mem.indexOf(u8, parsed.metadata_json, "\"peer_kind\":\"direct\"") != null);
+}
+
+test "parseCallbackPayload rolls back reply target cache on allocation failure" {
+    const payload =
+        \\{
+        \\  "senderId":"sender-1",
+        \\  "conversationId":"cid-2",
+        \\  "conversationType":"1",
+        \\  "sessionWebhook":"https://oapi.dingtalk.com/robot/sendBySession?session=abc",
+        \\  "msgId":"msg-2",
+        \\  "msgtype":"text",
+        \\  "text":{"content":"hello"}
+        \\}
+    ;
+
+    var counting = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var alloc_count: usize = 0;
+    {
+        var channel = DingTalkChannel.init(counting.allocator(), "cid", "secret", &.{"*"});
+        defer channel.clearEphemeralState();
+
+        var parsed = (try channel.parseCallbackPayload(payload)).?;
+        defer parsed.deinit(counting.allocator());
+        alloc_count = counting.alloc_index;
+    }
+    try std.testing.expect(alloc_count > 0);
+
+    var found_late_oom = false;
+    var fail_index = alloc_count;
+    while (fail_index > 0) : (fail_index -= 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+        failing.fail_index = fail_index;
+
+        var channel = DingTalkChannel.init(failing.allocator(), "cid", "secret", &.{"*"});
+        defer channel.clearEphemeralState();
+
+        const maybe_parsed = channel.parseCallbackPayload(payload) catch |err| blk: {
+            switch (err) {
+                error.OutOfMemory => {
+                    try std.testing.expectEqual(@as(usize, 0), channel.reply_targets.map.count());
+                    found_late_oom = true;
+                    break :blk null;
+                },
+                else => return err,
+            }
+        };
+        if (found_late_oom) break;
+
+        if (maybe_parsed) |parsed| {
+            var owned = parsed;
+            owned.deinit(failing.allocator());
+        }
+    }
+
+    try std.testing.expect(found_late_oom);
 }
 
 test "sendMessage rejects expired cached reply target" {
