@@ -6,7 +6,7 @@
 //!   - Body size limits (64KB max)
 //!   - Request timeouts (30s)
 //!   - Bearer token authentication (PairingGuard)
-//!   - Endpoints: /health, /ready, /pair, /webhook, /a2a, /.well-known/agent-card.json, /whatsapp, /telegram, /line, /lark, /qq, /max, /slack/events, /api/messages (Teams)
+//!   - Endpoints: /health, /ready, /pair, /webhook, /a2a, /.well-known/agent-card.json, /whatsapp, /telegram, /line, /lark, /wechat, /qq, /max, /slack/events, /api/messages (Teams)
 //!
 //! Uses std.http.Server (built-in, no external deps).
 
@@ -376,6 +376,11 @@ pub const GatewayState = struct {
     lark_app_secret: []const u8 = "",
     lark_account_id: []const u8 = "default",
     lark_allow_from: []const []const u8 = &.{},
+    wechat_account_id: []const u8 = "default",
+    wechat_allow_from: []const []const u8 = &.{},
+    wechat_callback_token: []const u8 = "",
+    wechat_encoding_aes_key: []const u8 = "",
+    wechat_app_id: []const u8 = "",
     wecom_account_id: []const u8 = "default",
     wecom_allow_from: []const []const u8 = &.{},
     wecom_callback_token: []const u8 = "",
@@ -1043,6 +1048,44 @@ fn findWeComConfigByAccountId(
         if (std.ascii.eqlIgnoreCase(wecom_cfg.account_id, account_id)) return wecom_cfg;
     }
     return null;
+}
+
+fn findWeChatConfigByAccountId(
+    cfg: *const Config,
+    account_id: []const u8,
+) ?*const config_types.WeChatConfig {
+    for (cfg.channels.wechat) |*wechat_cfg| {
+        if (std.ascii.eqlIgnoreCase(wechat_cfg.account_id, account_id)) return wechat_cfg;
+    }
+    return null;
+}
+
+fn selectWeChatConfig(
+    cfg_opt: ?*const Config,
+    target: []const u8,
+) ?*const config_types.WeChatConfig {
+    if (!build_options.enable_channel_wechat) return null;
+    const cfg = cfg_opt orelse return null;
+    if (cfg.channels.wechat.len == 0) return null;
+
+    if (parseQueryParam(target, "account_id")) |account_id| {
+        if (findWeChatConfigByAccountId(cfg, account_id)) |wechat_cfg| {
+            return wechat_cfg;
+        }
+    }
+    if (parseQueryParam(target, "account")) |account_id| {
+        if (findWeChatConfigByAccountId(cfg, account_id)) |wechat_cfg| {
+            return wechat_cfg;
+        }
+    }
+
+    if (cfg.channels.wechatPrimary()) |primary| {
+        if (findWeChatConfigByAccountId(cfg, primary.account_id)) |wechat_cfg| {
+            return wechat_cfg;
+        }
+    }
+
+    return &cfg.channels.wechat[0];
 }
 
 fn selectWeComConfig(
@@ -1742,6 +1785,28 @@ fn wecomSessionKey(buf: []u8, sender: []const u8) []const u8 {
     return std.fmt.bufPrint(buf, "wecom:{s}", .{sender}) catch "wecom:unknown";
 }
 
+fn wechatSessionKey(buf: []u8, sender: []const u8) []const u8 {
+    return std.fmt.bufPrint(buf, "wechat:{s}", .{sender}) catch "wechat:unknown";
+}
+
+fn wechatSessionKeyRouted(
+    allocator: std.mem.Allocator,
+    fallback_buf: []u8,
+    sender: []const u8,
+    cfg_opt: ?*const Config,
+    account_id: []const u8,
+) []const u8 {
+    const fallback = wechatSessionKey(fallback_buf, sender);
+    return resolveRouteSessionKey(
+        allocator,
+        cfg_opt,
+        "wechat",
+        account_id,
+        .{ .kind = .direct, .id = sender },
+        fallback,
+    );
+}
+
 fn wecomSessionKeyRouted(
     allocator: std.mem.Allocator,
     fallback_buf: []u8,
@@ -2020,6 +2085,7 @@ const webhook_route_descriptors = [_]WebhookRouteDescriptor{
     .{ .path = "/slack/events", .handler = handleSlackWebhookRoute },
     .{ .path = "/line", .handler = handleLineWebhookRoute },
     .{ .path = "/lark", .handler = handleLarkWebhookRoute },
+    .{ .path = "/wechat", .handler = handleWeChatWebhookRoute },
     .{ .path = "/wecom", .handler = handleWeComWebhookRoute },
     .{ .path = "/qq", .handler = handleQqWebhookRoute },
     .{ .path = "/max", .handler = handleMaxWebhookRoute },
@@ -2907,6 +2973,241 @@ fn handleLarkWebhookRoute(ctx: *WebhookHandlerContext) void {
     ctx.response_body = "{\"status\":\"ok\"}";
 }
 
+fn handleWeChatWebhookRoute(ctx: *WebhookHandlerContext) void {
+    if (!build_options.enable_channel_wechat) {
+        ctx.response_status = "404 Not Found";
+        ctx.response_body = "{\"error\":\"wechat channel disabled in this build\"}";
+        return;
+    }
+
+    var wechat_account_id = ctx.state.wechat_account_id;
+    var wechat_allow_from = ctx.state.wechat_allow_from;
+    var callback_token = ctx.state.wechat_callback_token;
+    var secure_aes_key = ctx.state.wechat_encoding_aes_key;
+    var expected_app_id = ctx.state.wechat_app_id;
+    if (selectWeChatConfig(ctx.config_opt, ctx.target)) |wechat_cfg| {
+        wechat_account_id = wechat_cfg.account_id;
+        wechat_allow_from = wechat_cfg.allow_from;
+        callback_token = wechat_cfg.callback_token;
+        secure_aes_key = wechat_cfg.encoding_aes_key orelse "";
+        expected_app_id = wechat_cfg.app_id orelse "";
+    }
+
+    const secure_enabled = callback_token.len > 0 and secure_aes_key.len > 0;
+
+    if (std.mem.eql(u8, ctx.method, "GET")) {
+        const echo = parseQueryParam(ctx.target, "echostr") orelse {
+            ctx.response_body = "{\"status\":\"ok\"}";
+            return;
+        };
+
+        if (callback_token.len > 0) {
+            const timestamp = parseQueryParam(ctx.target, "timestamp") orelse {
+                ctx.response_status = "400 Bad Request";
+                ctx.response_body = "{\"error\":\"missing timestamp\"}";
+                return;
+            };
+            const nonce = parseQueryParam(ctx.target, "nonce") orelse {
+                ctx.response_status = "400 Bad Request";
+                ctx.response_body = "{\"error\":\"missing nonce\"}";
+                return;
+            };
+
+            if (secure_enabled) {
+                const msg_signature = parseQueryParam(ctx.target, "msg_signature") orelse {
+                    ctx.response_status = "400 Bad Request";
+                    ctx.response_body = "{\"error\":\"missing msg_signature\"}";
+                    return;
+                };
+                if (!channels.wechat.verifyMessageSignature(callback_token, timestamp, nonce, echo, msg_signature)) {
+                    ctx.response_status = "403 Forbidden";
+                    ctx.response_body = "{\"error\":\"invalid signature\"}";
+                    return;
+                }
+
+                const expected_app_id_opt: ?[]const u8 = if (expected_app_id.len > 0) expected_app_id else null;
+                const plain_echo = channels.wechat.decryptSecurePayload(
+                    ctx.req_allocator,
+                    secure_aes_key,
+                    echo,
+                    expected_app_id_opt,
+                ) catch {
+                    ctx.response_status = "403 Forbidden";
+                    ctx.response_body = "{\"error\":\"decrypt failed\"}";
+                    return;
+                };
+                ctx.response_body = plain_echo;
+                return;
+            } else {
+                const signature = parseQueryParam(ctx.target, "signature") orelse {
+                    ctx.response_status = "400 Bad Request";
+                    ctx.response_body = "{\"error\":\"missing signature\"}";
+                    return;
+                };
+                if (!channels.wechat.verifySignature(callback_token, timestamp, nonce, signature)) {
+                    ctx.response_status = "403 Forbidden";
+                    ctx.response_body = "{\"error\":\"invalid signature\"}";
+                    return;
+                }
+            }
+        }
+
+        ctx.response_body = echo;
+        return;
+    }
+
+    if (!std.mem.eql(u8, ctx.method, "POST")) {
+        ctx.response_status = "405 Method Not Allowed";
+        ctx.response_body = "{\"error\":\"method not allowed\"}";
+        return;
+    }
+
+    if (!ctx.state.rate_limiter.allowWebhook(ctx.state.allocator, "wechat")) {
+        ctx.response_status = "429 Too Many Requests";
+        ctx.response_body = "{\"error\":\"rate limited\"}";
+        return;
+    }
+
+    const body = extractBody(ctx.raw_request) orelse {
+        ctx.response_body = "success";
+        return;
+    };
+
+    const inbound_payload = if (secure_enabled) blk: {
+        const encrypted = channels.wechat.extractEncryptedField(body) orelse {
+            ctx.response_status = "400 Bad Request";
+            ctx.response_body = "{\"error\":\"missing Encrypt field\"}";
+            return;
+        };
+        const msg_signature = parseQueryParam(ctx.target, "msg_signature") orelse {
+            ctx.response_status = "400 Bad Request";
+            ctx.response_body = "{\"error\":\"missing msg_signature\"}";
+            return;
+        };
+        const timestamp = parseQueryParam(ctx.target, "timestamp") orelse {
+            ctx.response_status = "400 Bad Request";
+            ctx.response_body = "{\"error\":\"missing timestamp\"}";
+            return;
+        };
+        const nonce = parseQueryParam(ctx.target, "nonce") orelse {
+            ctx.response_status = "400 Bad Request";
+            ctx.response_body = "{\"error\":\"missing nonce\"}";
+            return;
+        };
+
+        if (!channels.wechat.verifyMessageSignature(callback_token, timestamp, nonce, encrypted, msg_signature)) {
+            ctx.response_status = "403 Forbidden";
+            ctx.response_body = "{\"error\":\"invalid signature\"}";
+            return;
+        }
+
+        const expected_app_id_opt: ?[]const u8 = if (expected_app_id.len > 0) expected_app_id else null;
+        break :blk channels.wechat.decryptSecurePayload(
+            ctx.req_allocator,
+            secure_aes_key,
+            encrypted,
+            expected_app_id_opt,
+        ) catch {
+            ctx.response_status = "403 Forbidden";
+            ctx.response_body = "{\"error\":\"decrypt failed\"}";
+            return;
+        };
+    } else blk: {
+        if (callback_token.len > 0) {
+            const signature = parseQueryParam(ctx.target, "signature") orelse {
+                ctx.response_status = "400 Bad Request";
+                ctx.response_body = "{\"error\":\"missing signature\"}";
+                return;
+            };
+            const timestamp = parseQueryParam(ctx.target, "timestamp") orelse {
+                ctx.response_status = "400 Bad Request";
+                ctx.response_body = "{\"error\":\"missing timestamp\"}";
+                return;
+            };
+            const nonce = parseQueryParam(ctx.target, "nonce") orelse {
+                ctx.response_status = "400 Bad Request";
+                ctx.response_body = "{\"error\":\"missing nonce\"}";
+                return;
+            };
+            if (!channels.wechat.verifySignature(callback_token, timestamp, nonce, signature)) {
+                ctx.response_status = "403 Forbidden";
+                ctx.response_body = "{\"error\":\"invalid signature\"}";
+                return;
+            }
+        }
+
+        break :blk ctx.req_allocator.dupe(u8, body) catch {
+            ctx.response_status = "500 Internal Server Error";
+            ctx.response_body = "{\"error\":\"out of memory\"}";
+            return;
+        };
+    };
+    defer ctx.req_allocator.free(inbound_payload);
+
+    var inbound = channels.wechat.parseIncomingPayload(ctx.req_allocator, inbound_payload) catch {
+        ctx.response_body = "success";
+        return;
+    } orelse {
+        ctx.response_body = "success";
+        return;
+    };
+    defer inbound.deinit(ctx.req_allocator);
+
+    if (wechat_allow_from.len > 0 and !channels.isAllowed(wechat_allow_from, inbound.from_user)) {
+        ctx.response_body = "success";
+        return;
+    }
+
+    if (ctx.state.event_bus) |eb| {
+        var key_buf: [128]u8 = undefined;
+        const session_key = wechatSessionKeyRouted(
+            ctx.req_allocator,
+            &key_buf,
+            inbound.from_user,
+            ctx.config_opt,
+            wechat_account_id,
+        );
+        var meta_buf: [320]u8 = undefined;
+        const meta = std.fmt.bufPrint(&meta_buf, "{{\"account_id\":\"{s}\",\"peer_kind\":\"direct\",\"peer_id\":\"{s}\"}}", .{
+            wechat_account_id,
+            inbound.from_user,
+        }) catch null;
+        _ = publishToBus(eb, ctx.state.allocator, "wechat", inbound.from_user, inbound.from_user, inbound.content, session_key, meta);
+        ctx.response_body = "success";
+        return;
+    }
+
+    if (ctx.session_mgr_opt) |sm| {
+        var key_buf: [128]u8 = undefined;
+        const session_key = wechatSessionKeyRouted(
+            ctx.req_allocator,
+            &key_buf,
+            inbound.from_user,
+            ctx.config_opt,
+            wechat_account_id,
+        );
+        const reply: ?[]const u8 = sm.processMessage(session_key, inbound.content, null) catch null;
+        if (reply) |r| {
+            defer ctx.root_allocator.free(r);
+            const now_secs = std.time.timestamp();
+            const xml = channels.wechat.buildPassiveTextReply(
+                ctx.req_allocator,
+                inbound.from_user,
+                inbound.to_user,
+                r,
+                now_secs,
+            ) catch {
+                ctx.response_body = "success";
+                return;
+            };
+            ctx.response_body = xml;
+            return;
+        }
+    }
+
+    ctx.response_body = "success";
+}
+
 fn handleWeComWebhookRoute(ctx: *WebhookHandlerContext) void {
     if (!build_options.enable_channel_wecom) {
         ctx.response_status = "404 Not Found";
@@ -3635,7 +3936,7 @@ fn spawnA2aStreamingWorker(
 }
 
 /// Run the HTTP gateway. Binds to host:port and serves HTTP requests.
-/// Endpoints: GET /health, GET /ready, POST /pair, POST /webhook, GET|POST /whatsapp, POST /telegram, POST /slack/events, POST /line, POST /lark, GET|POST /wecom, POST /qq, POST /max
+/// Endpoints: GET /health, GET /ready, POST /pair, POST /webhook, GET|POST /whatsapp, POST /telegram, POST /slack/events, POST /line, POST /lark, GET|POST /wechat, GET|POST /wecom, POST /qq, POST /max
 /// If config_ptr is null, loads config internally (for backward compatibility).
 pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr: ?*const Config, event_bus: ?*bus_mod.Bus) !void {
     health.markComponentOk("gateway");
@@ -3711,6 +4012,13 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
             state.lark_app_secret = lark_cfg.app_secret;
             state.lark_allow_from = lark_cfg.allow_from;
             state.lark_account_id = lark_cfg.account_id;
+        }
+        if (cfg.channels.wechatPrimary()) |wechat_cfg| {
+            state.wechat_allow_from = wechat_cfg.allow_from;
+            state.wechat_account_id = wechat_cfg.account_id;
+            state.wechat_callback_token = wechat_cfg.callback_token;
+            state.wechat_encoding_aes_key = wechat_cfg.encoding_aes_key orelse "";
+            state.wechat_app_id = wechat_cfg.app_id orelse "";
         }
         if (cfg.channels.wecomPrimary()) |wecom_cfg| {
             state.wecom_allow_from = wecom_cfg.allow_from;
@@ -4197,6 +4505,7 @@ test "findWebhookRouteDescriptor resolves known webhook paths" {
     try std.testing.expect(findWebhookRouteDescriptor("/slack/events") != null);
     try std.testing.expect(findWebhookRouteDescriptor("/line") != null);
     try std.testing.expect(findWebhookRouteDescriptor("/lark") != null);
+    try std.testing.expect(findWebhookRouteDescriptor("/wechat") != null);
     try std.testing.expect(findWebhookRouteDescriptor("/wecom") != null);
     try std.testing.expect(findWebhookRouteDescriptor("/qq") != null);
     try std.testing.expect(findWebhookRouteDescriptor("/max") != null);
@@ -4938,6 +5247,35 @@ test "selectWeComConfig picks account by query account_id" {
     try std.testing.expectEqualStrings("backup", selected.?.account_id);
 }
 
+test "selectWeChatConfig picks account by query account_id" {
+    const wechat_accounts = [_]config_types.WeChatConfig{
+        .{
+            .account_id = "main",
+            .callback_token = "token-main",
+        },
+        .{
+            .account_id = "backup",
+            .callback_token = "token-backup",
+        },
+    };
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .wechat = &wechat_accounts,
+        },
+    };
+
+    const selected = selectWeChatConfig(&cfg, "/wechat?account_id=backup");
+    if (!build_options.enable_channel_wechat) {
+        try std.testing.expect(selected == null);
+        return;
+    }
+    try std.testing.expect(selected != null);
+    try std.testing.expectEqualStrings("backup", selected.?.account_id);
+}
+
 test "selectQqConfig picks account by X-Bot-Appid header" {
     const qq_accounts = [_]config_types.QQConfig{
         .{
@@ -5043,6 +5381,177 @@ test "handleQqWebhookRoute rejects invalid json payload" {
     handleQqWebhookRoute(&ctx);
     try std.testing.expectEqualStrings("400 Bad Request", ctx.response_status);
     try std.testing.expectEqualStrings("{\"error\":\"invalid json payload\"}", ctx.response_body);
+}
+
+fn testEncodeWeChatSecurePayload(
+    allocator: std.mem.Allocator,
+    encoding_aes_key: []const u8,
+    app_id: []const u8,
+    plain_xml: []const u8,
+) ![]u8 {
+    if (encoding_aes_key.len != 43) return error.InvalidWeChatEncodingAesKey;
+
+    var key_padded: [44]u8 = undefined;
+    @memcpy(key_padded[0..43], encoding_aes_key);
+    key_padded[43] = '=';
+    var key: [32]u8 = undefined;
+    _ = std.base64.standard.Decoder.decode(&key, &key_padded) catch return error.InvalidWeChatEncodingAesKey;
+
+    var plain: std.ArrayListUnmanaged(u8) = .empty;
+    defer plain.deinit(allocator);
+    try plain.appendSlice(allocator, "0123456789ABCDEF");
+
+    const msg_len = plain_xml.len;
+    try plain.append(allocator, @as(u8, @truncate((msg_len >> 24) & 0xff)));
+    try plain.append(allocator, @as(u8, @truncate((msg_len >> 16) & 0xff)));
+    try plain.append(allocator, @as(u8, @truncate((msg_len >> 8) & 0xff)));
+    try plain.append(allocator, @as(u8, @truncate(msg_len & 0xff)));
+    try plain.appendSlice(allocator, plain_xml);
+    try plain.appendSlice(allocator, app_id);
+
+    const block_size: usize = 32;
+    const rem = plain.items.len % block_size;
+    const pad_len: usize = if (rem == 0) block_size else (block_size - rem);
+    var i: usize = 0;
+    while (i < pad_len) : (i += 1) {
+        try plain.append(allocator, @as(u8, @intCast(pad_len)));
+    }
+
+    const cipher = try allocator.dupe(u8, plain.items);
+    errdefer allocator.free(cipher);
+
+    const Aes256 = std.crypto.core.aes.Aes256;
+    const enc = Aes256.initEnc(key);
+    var prev = key[0..16].*;
+    var offset: usize = 0;
+    while (offset < cipher.len) : (offset += 16) {
+        var block: [16]u8 = undefined;
+        @memcpy(block[0..], cipher[offset .. offset + 16]);
+        var j: usize = 0;
+        while (j < 16) : (j += 1) {
+            block[j] ^= prev[j];
+        }
+        var out_block: [16]u8 = undefined;
+        enc.encrypt(&out_block, &block);
+        @memcpy(cipher[offset .. offset + 16], out_block[0..]);
+        prev = out_block;
+    }
+
+    const encoded_len = std.base64.standard.Encoder.calcSize(cipher.len);
+    const encoded = try allocator.alloc(u8, encoded_len);
+    _ = std.base64.standard.Encoder.encode(encoded, cipher);
+    allocator.free(cipher);
+    return encoded;
+}
+
+fn testWeChatMsgSignature(
+    allocator: std.mem.Allocator,
+    token: []const u8,
+    timestamp: []const u8,
+    nonce: []const u8,
+    encrypted: []const u8,
+) ![]u8 {
+    var parts = [4][]const u8{ token, timestamp, nonce, encrypted };
+
+    var i: usize = 0;
+    while (i < parts.len) : (i += 1) {
+        var j: usize = i + 1;
+        while (j < parts.len) : (j += 1) {
+            if (std.mem.lessThan(u8, parts[j], parts[i])) {
+                const tmp = parts[i];
+                parts[i] = parts[j];
+                parts[j] = tmp;
+            }
+        }
+    }
+
+    var sha1 = std.crypto.hash.Sha1.init(.{});
+    for (parts) |p| sha1.update(p);
+    var digest: [std.crypto.hash.Sha1.digest_length]u8 = undefined;
+    sha1.final(&digest);
+    const hex = std.fmt.bytesToHex(digest, .lower);
+    return allocator.dupe(u8, hex[0..]);
+}
+
+test "handleWeChatWebhookRoute accepts secure encrypted callback" {
+    if (!build_options.enable_channel_wechat) return;
+
+    const token = "wechat-token";
+    const app_id = "wx_test_app";
+    var raw_key: [32]u8 = undefined;
+    for (&raw_key, 0..) |*b, idx| b.* = @as(u8, @intCast(idx));
+    var key_b64: [44]u8 = undefined;
+    _ = std.base64.standard.Encoder.encode(&key_b64, &raw_key);
+    const encoding_aes_key = key_b64[0..43];
+    const timestamp = "1710000000";
+    const nonce = "123456";
+    const plain_xml =
+        "<xml>" ++
+        "<ToUserName><![CDATA[gh_abcdef]]></ToUserName>" ++
+        "<FromUserName><![CDATA[o_user123]]></FromUserName>" ++
+        "<CreateTime>1710000000</CreateTime>" ++
+        "<MsgType><![CDATA[text]]></MsgType>" ++
+        "<Content><![CDATA[hello secure]]></Content>" ++
+        "</xml>";
+
+    const encrypted = try testEncodeWeChatSecurePayload(std.testing.allocator, encoding_aes_key, app_id, plain_xml);
+    defer std.testing.allocator.free(encrypted);
+    const msg_sig = try testWeChatMsgSignature(std.testing.allocator, token, timestamp, nonce, encrypted);
+    defer std.testing.allocator.free(msg_sig);
+
+    const secure_body = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "<xml><ToUserName><![CDATA[gh_abcdef]]></ToUserName><Encrypt><![CDATA[{s}]]></Encrypt></xml>",
+        .{encrypted},
+    );
+    defer std.testing.allocator.free(secure_body);
+
+    const target = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "/wechat?timestamp={s}&nonce={s}&msg_signature={s}",
+        .{ timestamp, nonce, msg_sig },
+    );
+    defer std.testing.allocator.free(target);
+
+    const raw_request = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "POST {s} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/xml\r\n\r\n{s}",
+        .{ target, secure_body },
+    );
+    defer std.testing.allocator.free(raw_request);
+
+    const wechat_accounts = [_]config_types.WeChatConfig{
+        .{
+            .account_id = "main",
+            .callback_token = token,
+            .encoding_aes_key = encoding_aes_key,
+            .app_id = app_id,
+        },
+    };
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .channels = .{ .wechat = &wechat_accounts },
+    };
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+
+    var ctx = WebhookHandlerContext{
+        .root_allocator = std.testing.allocator,
+        .req_allocator = std.testing.allocator,
+        .raw_request = raw_request,
+        .method = "POST",
+        .target = target,
+        .config_opt = &cfg,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+
+    handleWeChatWebhookRoute(&ctx);
+    try std.testing.expectEqualStrings("200 OK", ctx.response_status);
+    try std.testing.expectEqualStrings("success", ctx.response_body);
 }
 
 test "whatsappSessionKey builds direct key by sender" {
@@ -5540,6 +6049,32 @@ test "wecomSessionKeyRouted uses route engine when config exists" {
 
     const key = wecomSessionKeyRouted(allocator, &key_buf, "zhangsan", &cfg, "wecom-main");
     try std.testing.expectEqualStrings("agent:wecom-dm-agent:wecom:direct:zhangsan", key);
+}
+
+test "wechatSessionKeyRouted uses route engine when config exists" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var key_buf: [128]u8 = undefined;
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &[_]agent_routing.AgentBinding{
+            .{
+                .agent_id = "wechat-dm-agent",
+                .match = .{
+                    .channel = "wechat",
+                    .account_id = "wechat-main",
+                    .peer = .{ .kind = .direct, .id = "openid_123" },
+                },
+            },
+        },
+    };
+
+    const key = wechatSessionKeyRouted(allocator, &key_buf, "openid_123", &cfg, "wechat-main");
+    try std.testing.expectEqualStrings("agent:wechat-dm-agent:wechat:direct:openid_123", key);
 }
 
 test "maxSessionKeyRouted uses sender identity for direct chats" {
