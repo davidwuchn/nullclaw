@@ -393,16 +393,8 @@ pub const AnthropicProvider = struct {
         return sse.curlStreamAnthropic(allocator, url, body, headers_buf[0..hdr_count], callback, callback_ctx) catch |err| {
             if (err == error.CurlWaitError or err == error.CurlFailed) {
                 log.warn("Anthropic streaming failed with {}; falling back to non-streaming response", .{err});
-                const fallback = try chatImpl(ptr, allocator, request, model, temperature);
-                if (fallback.content) |text| {
-                    callback(callback_ctx, root.StreamChunk.textDelta(text));
-                }
-                callback(callback_ctx, root.StreamChunk.finalChunk());
-                return .{
-                    .content = fallback.content,
-                    .usage = fallback.usage,
-                    .model = fallback.model,
-                };
+                var fallback = try chatImpl(ptr, allocator, request, model, temperature);
+                return root.emitChatResponseAsStream(allocator, &fallback, callback, callback_ctx);
             }
             return err;
         };

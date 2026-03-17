@@ -374,16 +374,8 @@ pub const VertexProvider = struct {
         ) catch |err| {
             if (err == error.CurlWaitError or err == error.CurlFailed) {
                 log.warn("Vertex streaming failed with {}; falling back to non-streaming response", .{err});
-                const fallback = try chatImpl(ptr, allocator, request, model, temperature);
-                if (fallback.content) |text| {
-                    callback(callback_ctx, root.StreamChunk.textDelta(text));
-                }
-                callback(callback_ctx, root.StreamChunk.finalChunk());
-                return .{
-                    .content = fallback.content,
-                    .usage = fallback.usage,
-                    .model = fallback.model,
-                };
+                var fallback = try chatImpl(ptr, allocator, request, model, temperature);
+                return root.emitChatResponseAsStream(allocator, &fallback, callback, callback_ctx);
             }
             return err;
         };
