@@ -447,10 +447,8 @@ pub const WebChannel = struct {
             }
         } else if (self.relay_pairing_guard) |*guard| {
             if (guard.pairingCode()) |code| {
-                log.info("Web relay pairing code (one-time, {d}s TTL): {s}", .{
-                    self.relay_pairing_code_ttl_secs,
-                    code,
-                });
+                var pairing_log_buf: [160]u8 = undefined;
+                log.info("{s}", .{relayPairingLogMessage(&pairing_log_buf, self.relay_pairing_code_ttl_secs, null, code)});
             }
         }
     }
@@ -468,6 +466,24 @@ pub const WebChannel = struct {
         return self.relayPairingCodeExpiredLocked();
     }
 
+    fn relayPairingLogMessage(buf: []u8, ttl_secs: u32, reason: ?[]const u8, code: []const u8) []const u8 {
+        _ = code;
+        if (reason) |why| {
+            return std.fmt.bufPrint(buf, "Web relay pairing code rotated ({s}, one-time, {d}s TTL, value hidden)", .{
+                why,
+                ttl_secs,
+            }) catch "Web relay pairing code rotated (value hidden)";
+        }
+        return std.fmt.bufPrint(buf, "Web relay pairing code generated (one-time, {d}s TTL, value hidden)", .{
+            ttl_secs,
+        }) catch "Web relay pairing code generated (value hidden)";
+    }
+
+    fn localPairingLogMessage(code: []const u8) []const u8 {
+        _ = code;
+        return "Web local pairing code active (fixed, value hidden)";
+    }
+
     fn rotateRelayPairingCodeLocked(self: *WebChannel, reason: []const u8) void {
         if (self.transport == .local) {
             if (self.relay_pairing_guard) |*guard| {
@@ -477,7 +493,7 @@ pub const WebChannel = struct {
                 };
                 self.relay_pairing_issued_at = std.time.timestamp();
                 if (!std.mem.eql(u8, reason, "consumed")) {
-                    log.info("Web local pairing code active (fixed): {s}", .{code});
+                    log.info("{s}", .{localPairingLogMessage(code)});
                 }
             }
             return;
@@ -485,12 +501,9 @@ pub const WebChannel = struct {
 
         if (self.relay_pairing_guard) |*guard| {
             if (guard.regeneratePairingCode()) |code| {
+                var pairing_log_buf: [160]u8 = undefined;
                 self.relay_pairing_issued_at = std.time.timestamp();
-                log.info("Web relay pairing code rotated ({s}, one-time, {d}s TTL): {s}", .{
-                    reason,
-                    self.relay_pairing_code_ttl_secs,
-                    code,
-                });
+                log.info("{s}", .{relayPairingLogMessage(&pairing_log_buf, self.relay_pairing_code_ttl_secs, reason, code)});
             }
         }
     }
@@ -2318,6 +2331,20 @@ test "WebChannel local pairing code never expires" {
 
     ch.relay_pairing_issued_at = std.time.timestamp() - 86_400;
     try std.testing.expect(!ch.relayPairingCodeExpired());
+}
+
+test "WebChannel relay pairing log message hides code" {
+    var buf: [160]u8 = undefined;
+    const msg = WebChannel.relayPairingLogMessage(&buf, 300, "expired", "654321");
+    try std.testing.expect(std.mem.indexOf(u8, msg, "654321") == null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "expired") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "value hidden") != null);
+}
+
+test "WebChannel local pairing log message hides fixed code" {
+    const msg = WebChannel.localPairingLogMessage("123456");
+    try std.testing.expect(std.mem.indexOf(u8, msg, "123456") == null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "value hidden") != null);
 }
 
 test "WebChannel relay encrypted user_message is published to bus" {
