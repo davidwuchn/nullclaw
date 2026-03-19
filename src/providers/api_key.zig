@@ -455,6 +455,28 @@ test "resolveApiKeyFromConfig falls through to env for missing provider" {
     if (result) |r| std.testing.allocator.free(r);
 }
 
+test "resolveApiKeyFromConfig falls through to env when provider entry omits api key" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const c = @cImport({
+        @cInclude("stdlib.h");
+    });
+
+    const api_key_z = try std.testing.allocator.dupeZ(u8, "OPENROUTER_API_KEY");
+    defer std.testing.allocator.free(api_key_z);
+    const api_value_z = try std.testing.allocator.dupeZ(u8, "env-openrouter-key");
+    defer std.testing.allocator.free(api_value_z);
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(api_key_z.ptr, api_value_z.ptr, 1));
+    defer _ = c.unsetenv(api_key_z.ptr);
+
+    const entries = [_]config_mod.ProviderEntry{
+        .{ .name = "openrouter" },
+    };
+    const result = try resolveApiKeyFromConfig(std.testing.allocator, "openrouter", &entries);
+    defer if (result) |value| std.testing.allocator.free(value);
+    try std.testing.expect(result != null);
+    try std.testing.expectEqualStrings("env-openrouter-key", result.?);
+}
+
 test "parseQwenCredentialsJson parses access token" {
     const creds = parseQwenCredentialsJson(std.testing.allocator, "{\"access_token\":\"test-token\"}").?;
     defer creds.deinit(std.testing.allocator);
