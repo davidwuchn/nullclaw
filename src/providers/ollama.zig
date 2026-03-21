@@ -171,6 +171,7 @@ fn appendOllamaImageValue(
 fn appendThinkField(
     buf: *std.ArrayListUnmanaged(u8),
     allocator: std.mem.Allocator,
+    model: []const u8,
     reasoning_effort: ?[]const u8,
 ) !void {
     const effort = root.normalizeOpenAiReasoningEffort(reasoning_effort) orelse {
@@ -182,7 +183,22 @@ fn appendThinkField(
         return;
     }
     try buf.appendSlice(allocator, ",\"think\":");
-    try root.appendJsonString(buf, allocator, effort);
+    if (ollamaUsesThinkLevels(model)) {
+        try root.appendJsonString(buf, allocator, effort);
+        return;
+    }
+    try buf.appendSlice(allocator, "true");
+}
+
+// GPT-OSS is the documented Ollama exception: it requires string levels rather than booleans.
+fn ollamaUsesThinkLevels(model: []const u8) bool {
+    var lower_buf: [160]u8 = undefined;
+    const lower_len = @min(model.len, lower_buf.len);
+    for (model[0..lower_len], 0..) |c, idx| {
+        lower_buf[idx] = std.ascii.toLower(c);
+    }
+    const lower = lower_buf[0..lower_len];
+    return std.mem.indexOf(u8, lower, "gpt-oss") != null;
 }
 
 /// Ollama LLM provider.
@@ -418,7 +434,7 @@ fn buildChatRequestBody(
     }
 
     try buf.append(allocator, ']');
-    try appendThinkField(&buf, allocator, request.reasoning_effort);
+    try appendThinkField(&buf, allocator, model, request.reasoning_effort);
 
     if (request.tools) |tools| {
         if (tools.len > 0) {
@@ -664,7 +680,7 @@ test "ollama buildChatRequestBody sends think disabled by default" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"think\":false") != null);
 }
 
-test "ollama buildChatRequestBody maps reasoning_effort to think level" {
+test "ollama buildChatRequestBody enables think for standard thinking models" {
     const alloc = std.testing.allocator;
     var msgs = [_]root.ChatMessage{
         root.ChatMessage.user("Hello"),
@@ -675,7 +691,29 @@ test "ollama buildChatRequestBody maps reasoning_effort to think level" {
         .reasoning_effort = "high",
     }, "qwen3", 0.7);
     defer alloc.free(body);
-    try std.testing.expect(std.mem.indexOf(u8, body, "\"think\":\"high\"") != null);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const think = parsed.value.object.get("think").?;
+    try std.testing.expect(think == .bool);
+    try std.testing.expect(think.bool);
+}
+
+test "ollama buildChatRequestBody maps reasoning_effort to think level for gpt-oss" {
+    const alloc = std.testing.allocator;
+    var msgs = [_]root.ChatMessage{
+        root.ChatMessage.user("Hello"),
+    };
+    const body = try buildChatRequestBody(alloc, .{
+        .messages = &msgs,
+        .model = "gpt-oss:20b",
+        .reasoning_effort = "xhigh",
+    }, "gpt-oss:20b", 0.7);
+    defer alloc.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const think = parsed.value.object.get("think").?;
+    try std.testing.expect(think == .string);
+    try std.testing.expectEqualStrings("high", think.string);
 }
 
 test "extractToolNameAndArgs with nested tool_call wrapper" {
