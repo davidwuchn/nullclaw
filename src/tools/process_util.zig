@@ -42,6 +42,7 @@ pub const RunResult = struct {
     success: bool,
     exit_code: ?u32 = null,
     interrupted: bool = false,
+    timed_out: bool = false,
 
     /// Free both stdout and stderr buffers.
     pub fn deinit(self: *const RunResult, allocator: std.mem.Allocator) void {
@@ -56,26 +57,53 @@ pub const RunOptions = struct {
     env_map: ?*std.process.EnvMap = null,
     max_output_bytes: usize = 1_048_576,
     cancel_flag: ?*const AtomicBool = null,
+    timeout_ns: ?u64 = null,
 };
 
-const CancelWatcherCtx = struct {
+const ProcessWatcherCtx = struct {
     child: *std.process.Child,
-    cancel_flag: *const AtomicBool,
+    cancel_flag: ?*const AtomicBool,
+    timeout_ns: ?u64,
     done: *AtomicBool,
+    timed_out: *AtomicBool,
 };
 
-fn cancelWatcherMain(ctx: *CancelWatcherCtx) void {
-    while (!ctx.done.load(.acquire)) {
-        if (ctx.cancel_flag.load(.acquire)) {
-            if (comptime @import("builtin").os.tag == .windows) {
-                std.os.windows.TerminateProcess(ctx.child.id, 1) catch {};
-            } else {
-                std.posix.kill(ctx.child.id, std.posix.SIG.TERM) catch {};
-            }
-            break;
-        }
-        std.Thread.sleep(20 * std.time.ns_per_ms);
+fn terminateChild(child: *std.process.Child) void {
+    if (comptime @import("builtin").os.tag == .windows) {
+        std.os.windows.TerminateProcess(child.id, 1) catch {};
+    } else {
+        std.posix.kill(child.id, std.posix.SIG.TERM) catch {};
     }
+}
+
+fn processWatcherMain(ctx: *ProcessWatcherCtx) void {
+    const poll_ns = 20 * std.time.ns_per_ms;
+    var waited_ns: u64 = 0;
+
+    while (!ctx.done.load(.acquire)) {
+        if (ctx.cancel_flag) |flag| {
+            if (flag.load(.acquire)) {
+                terminateChild(ctx.child);
+                break;
+            }
+        }
+        if (ctx.timeout_ns) |limit| {
+            if (waited_ns >= limit) {
+                ctx.timed_out.store(true, .release);
+                terminateChild(ctx.child);
+                break;
+            }
+        }
+        std.Thread.sleep(poll_ns);
+        waited_ns +|= poll_ns;
+    }
+}
+
+fn wasInterrupted(cancel_flag: ?*const AtomicBool) bool {
+    if (cancel_flag) |flag| {
+        return flag.load(.acquire);
+    }
+    return false;
 }
 
 fn appendUtf8Replacement(out: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator) !void {
@@ -132,8 +160,6 @@ fn tryDecodeWindowsCodePageToUtf8(
     if (input.len == 0 or code_page == 0) return null;
 
     const in_len: i32 = std.math.cast(i32, input.len) orelse return null;
-    // Keep UTF-8 strict so a console forced to CP_UTF8 does not swallow
-    // ACP/GBK bytes with U+FFFD substitutions before we can try fallbacks.
     const decode_flags: std.os.windows.DWORD = if (code_page == CP_UTF8) MB_ERR_INVALID_CHARS else 0;
 
     const wide_len = MultiByteToWideChar(code_page, decode_flags, input.ptr, in_len, null, 0);
@@ -161,9 +187,6 @@ fn tryDecodeWindowsOutputToUtf8(allocator: std.mem.Allocator, input: []const u8)
     const console_cp = std.os.windows.kernel32.GetConsoleOutputCP();
     if (try tryDecodeWindowsCodePageToUtf8(allocator, input, console_cp)) |decoded| return decoded;
 
-    // Prefer GBK before ACP: Western single-byte ACPs like CP1252 will happily
-    // decode arbitrary high bytes into mojibake ("ÖÐÎÄ"), which would mask
-    // genuine GBK console output that we can still recover losslessly.
     const ansi_cp = GetACP();
     if (console_cp != CP_GBK and ansi_cp != CP_GBK) {
         if (try tryDecodeWindowsCodePageToUtf8(allocator, input, CP_GBK)) |decoded| return decoded;
@@ -201,6 +224,9 @@ pub fn run(
     opts: RunOptions,
 ) !RunResult {
     var child = std.process.Child.init(argv, allocator);
+    // Shell tool requests do not provide stdin; inheriting it can let
+    // interactive programs stall waiting for input from the parent process.
+    child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
     if (opts.cwd) |cwd| child.cwd = cwd;
@@ -210,15 +236,18 @@ pub fn run(
 
     const effective_cancel_flag = opts.cancel_flag orelse thread_interrupt_flag;
     var cancel_done = AtomicBool.init(false);
+    var timed_out = AtomicBool.init(false);
     var cancel_watcher: ?std.Thread = null;
-    var watcher_ctx: CancelWatcherCtx = undefined;
-    if (effective_cancel_flag) |flag| {
+    var watcher_ctx: ProcessWatcherCtx = undefined;
+    if (effective_cancel_flag != null or opts.timeout_ns != null) {
         watcher_ctx = .{
             .child = &child,
-            .cancel_flag = flag,
+            .cancel_flag = effective_cancel_flag,
+            .timeout_ns = opts.timeout_ns,
             .done = &cancel_done,
+            .timed_out = &timed_out,
         };
-        cancel_watcher = std.Thread.spawn(.{}, cancelWatcherMain, .{&watcher_ctx}) catch null;
+        cancel_watcher = std.Thread.spawn(.{}, processWatcherMain, .{&watcher_ctx}) catch null;
     }
     defer {
         cancel_done.store(true, .release);
@@ -227,7 +256,7 @@ pub fn run(
 
     var stdout = if (child.stdout) |stdout_file| blk: {
         break :blk stdout_file.readToEndAlloc(allocator, opts.max_output_bytes) catch |err| {
-            if (effective_cancel_flag != null and effective_cancel_flag.?.load(.acquire)) {
+            if (wasInterrupted(effective_cancel_flag) or timed_out.load(.acquire)) {
                 break :blk try allocator.dupe(u8, "");
             }
             return err;
@@ -238,7 +267,7 @@ pub fn run(
 
     var stderr = if (child.stderr) |stderr_file| blk: {
         break :blk stderr_file.readToEndAlloc(allocator, opts.max_output_bytes) catch |err| {
-            if (effective_cancel_flag != null and effective_cancel_flag.?.load(.acquire)) {
+            if (wasInterrupted(effective_cancel_flag) or timed_out.load(.acquire)) {
                 break :blk try allocator.dupe(u8, "");
             }
             return err;
@@ -248,7 +277,8 @@ pub fn run(
     stderr = try normalizeCapturedOutputOwned(allocator, stderr);
 
     const term = try child.wait();
-    const interrupted = if (effective_cancel_flag) |flag| flag.load(.acquire) else false;
+    const interrupted = wasInterrupted(effective_cancel_flag);
+    const did_time_out = timed_out.load(.acquire);
 
     return switch (term) {
         .Exited => |code| .{
@@ -257,6 +287,7 @@ pub fn run(
             .success = code == 0,
             .exit_code = code,
             .interrupted = interrupted,
+            .timed_out = did_time_out,
         },
         else => .{
             .stdout = stdout,
@@ -264,6 +295,7 @@ pub fn run(
             .success = false,
             .exit_code = null,
             .interrupted = interrupted,
+            .timed_out = did_time_out,
         },
     };
 }
@@ -341,6 +373,21 @@ test "run honors cancel flag and interrupts child" {
     defer result.deinit(allocator);
     try std.testing.expect(!result.success);
     try std.testing.expect(result.interrupted);
+    try std.testing.expect(!result.timed_out);
+}
+
+test "run timeout interrupts child" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    const result = try run(allocator, &.{ "sh", "-c", "sleep 5" }, .{
+        .timeout_ns = 100 * std.time.ns_per_ms,
+    });
+    defer result.deinit(allocator);
+
+    try std.testing.expect(!result.success);
+    try std.testing.expect(!result.interrupted);
+    try std.testing.expect(result.timed_out);
 }
 
 test "RunResult deinit frees buffers" {
