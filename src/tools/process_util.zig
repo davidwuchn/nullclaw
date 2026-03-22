@@ -69,10 +69,22 @@ const ProcessWatcherCtx = struct {
 };
 
 fn terminateChild(child: *std.process.Child) void {
-    if (comptime @import("builtin").os.tag == .windows) {
+    if (comptime builtin.os.tag == .windows) {
         std.os.windows.TerminateProcess(child.id, 1) catch {};
+    } else if (comptime builtin.os.tag == .wasi) {
+        return;
     } else {
-        std.posix.kill(child.id, std.posix.SIG.TERM) catch {};
+        const process_group_id: std.posix.pid_t = -child.id;
+        std.posix.kill(process_group_id, std.posix.SIG.TERM) catch {
+            std.posix.kill(child.id, std.posix.SIG.TERM) catch {};
+            return;
+        };
+
+        std.Thread.sleep(100 * std.time.ns_per_ms);
+        std.posix.kill(process_group_id, std.posix.SIG.KILL) catch |err| switch (err) {
+            error.ProcessNotFound => {},
+            else => {},
+        };
     }
 }
 
@@ -104,6 +116,14 @@ fn wasInterrupted(cancel_flag: ?*const AtomicBool) bool {
         return flag.load(.acquire);
     }
     return false;
+}
+
+fn processExists(pid: std.posix.pid_t) bool {
+    std.posix.kill(pid, 0) catch |err| switch (err) {
+        error.ProcessNotFound => return false,
+        else => return true,
+    };
+    return true;
 }
 
 fn appendUtf8Replacement(out: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator) !void {
@@ -160,6 +180,8 @@ fn tryDecodeWindowsCodePageToUtf8(
     if (input.len == 0 or code_page == 0) return null;
 
     const in_len: i32 = std.math.cast(i32, input.len) orelse return null;
+    // Keep UTF-8 strict so a console forced to CP_UTF8 does not swallow
+    // ACP/GBK bytes with U+FFFD substitutions before we can try fallbacks.
     const decode_flags: std.os.windows.DWORD = if (code_page == CP_UTF8) MB_ERR_INVALID_CHARS else 0;
 
     const wide_len = MultiByteToWideChar(code_page, decode_flags, input.ptr, in_len, null, 0);
@@ -187,6 +209,9 @@ fn tryDecodeWindowsOutputToUtf8(allocator: std.mem.Allocator, input: []const u8)
     const console_cp = std.os.windows.kernel32.GetConsoleOutputCP();
     if (try tryDecodeWindowsCodePageToUtf8(allocator, input, console_cp)) |decoded| return decoded;
 
+    // Prefer GBK before ACP: Western single-byte ACPs like CP1252 will happily
+    // decode arbitrary high bytes into mojibake ("ÖÐÎÄ"), which would mask
+    // genuine GBK console output that we can still recover losslessly.
     const ansi_cp = GetACP();
     if (console_cp != CP_GBK and ansi_cp != CP_GBK) {
         if (try tryDecodeWindowsCodePageToUtf8(allocator, input, CP_GBK)) |decoded| return decoded;
@@ -224,11 +249,16 @@ pub fn run(
     opts: RunOptions,
 ) !RunResult {
     var child = std.process.Child.init(argv, allocator);
-    // Shell tool requests do not provide stdin; inheriting it can let
-    // interactive programs stall waiting for input from the parent process.
+    // Captured child processes are non-interactive; inheriting stdin can let
+    // spawned commands stall waiting for input from the parent process.
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
+    if (comptime builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+        // Isolate the child into its own process group so timeout/cancel signals
+        // can terminate shell wrappers together with any descendants they spawn.
+        child.pgid = 0;
+    }
     if (opts.cwd) |cwd| child.cwd = cwd;
     if (opts.env_map) |env| child.env_map = env;
 
@@ -388,6 +418,53 @@ test "run timeout interrupts child" {
     try std.testing.expect(!result.success);
     try std.testing.expect(!result.interrupted);
     try std.testing.expect(result.timed_out);
+}
+
+test "run timeout kills spawned shell descendants" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+    const pid_path = try std.fs.path.join(allocator, &.{ tmp_path, "child.pid" });
+    defer allocator.free(pid_path);
+    const command = try std.fmt.allocPrint(allocator, "(sleep 30) & echo $! > \"{s}\"; wait", .{pid_path});
+    defer allocator.free(command);
+
+    // Regression: timing out `sh -c ...` must not leave a background child
+    // running after the wrapper shell exits.
+    const result = try run(allocator, &.{ "sh", "-c", command }, .{
+        .timeout_ns = 200 * std.time.ns_per_ms,
+    });
+    defer result.deinit(allocator);
+
+    try std.testing.expect(result.timed_out);
+
+    const pid_bytes = try std.fs.cwd().readFileAlloc(allocator, pid_path, 32);
+    defer allocator.free(pid_bytes);
+    const child_pid = try std.fmt.parseInt(
+        std.posix.pid_t,
+        std.mem.trim(u8, pid_bytes, " \t\r\n"),
+        10,
+    );
+    defer if (processExists(child_pid)) {
+        std.posix.kill(child_pid, std.posix.SIG.KILL) catch {};
+    };
+
+    var exited = false;
+    var i: usize = 0;
+    while (i < 20) : (i += 1) {
+        if (!processExists(child_pid)) {
+            exited = true;
+            break;
+        }
+        std.Thread.sleep(50 * std.time.ns_per_ms);
+    }
+
+    try std.testing.expect(exited);
 }
 
 test "RunResult deinit frees buffers" {
