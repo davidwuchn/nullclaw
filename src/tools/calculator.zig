@@ -1,0 +1,622 @@
+const std = @import("std");
+const root = @import("root.zig");
+const Tool = root.Tool;
+const ToolResult = root.ToolResult;
+const JsonObjectMap = root.JsonObjectMap;
+const JsonValue = root.JsonValue;
+
+pub const CalculatorTool = struct {
+    pub const tool_name = "calculator";
+    pub const tool_description = "Perform mathematical calculations accurately. Supports arithmetic (add, subtract, multiply, divide, pow, sqrt), logarithms (log, ln, exp), rounding (abs, floor, ceil, round), and statistics (average, median, stdev, min, max, count, percentile).";
+    pub const tool_params =
+        \\{"type":"object","properties":{"operation":{"type":"string","enum":["add","subtract","multiply","divide","pow","sqrt","log","ln","exp","average","median","stdev","min","max","count","percentile","abs","floor","ceil","round"],"description":"Calculation operation to perform"},"values":{"type":"array","items":{"type":"number"},"description":"Numeric values for the calculation"},"percentile_rank":{"type":"integer","description":"Percentile rank 0-100, required for percentile operation"}},"required":["operation","values"]}
+    ;
+
+    pub const vtable = root.ToolVTable(@This());
+
+    pub fn tool(self: *CalculatorTool) Tool {
+        return .{
+            .ptr = @ptrCast(self),
+            .vtable = &vtable,
+        };
+    }
+
+    pub fn execute(_: *CalculatorTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
+        const operation = root.getString(args, "operation") orelse {
+            return ToolResult{ .success = false, .output = try std.fmt.allocPrint(allocator, "missing required parameter: operation", .{}) };
+        };
+
+        const values_arr = root.getStringArray(args, "values") orelse {
+            return ToolResult{ .success = false, .output = try std.fmt.allocPrint(allocator, "missing required parameter: values", .{}) };
+        };
+
+        if (values_arr.len == 0) {
+            return ToolResult{ .success = false, .output = try std.fmt.allocPrint(allocator, "values array must not be empty", .{}) };
+        }
+
+        const values = try extractValues(allocator, values_arr);
+        defer allocator.free(values);
+
+        const result = compute(allocator, operation, values, args) catch |err| {
+            return ToolResult{ .success = false, .output = try std.fmt.allocPrint(allocator, "{s}", .{@errorName(err)}) };
+        };
+
+        return ToolResult{ .success = true, .output = result };
+    }
+
+    fn extractValues(allocator: std.mem.Allocator, arr: []const JsonValue) ![]f64 {
+        const values = try allocator.alloc(f64, arr.len);
+        errdefer allocator.free(values);
+        for (arr, 0..) |item, i| {
+            values[i] = jsonToFloat(item) orelse {
+                allocator.free(values);
+                return error.InvalidNumber;
+            };
+        }
+        return values;
+    }
+
+    fn jsonToFloat(val: JsonValue) ?f64 {
+        return switch (val) {
+            .integer => |i| @floatFromInt(i),
+            .float => |f| f,
+            else => null,
+        };
+    }
+
+    fn compute(allocator: std.mem.Allocator, operation: []const u8, values: []const f64, args: JsonObjectMap) ![]const u8 {
+        if (std.mem.eql(u8, operation, "add")) {
+            if (values.len < 1) return error.AddRequiresValues;
+            var sum: f64 = 0.0;
+            for (values) |v| sum += v;
+            return formatResult(allocator, sum);
+        }
+        if (std.mem.eql(u8, operation, "subtract")) {
+            if (values.len != 2) return error.SubtractRequiresTwoValues;
+            return formatResult(allocator, values[0] - values[1]);
+        }
+        if (std.mem.eql(u8, operation, "multiply")) {
+            if (values.len < 1) return error.MultiplyRequiresValues;
+            var product: f64 = 1.0;
+            for (values) |v| product *= v;
+            return formatResult(allocator, product);
+        }
+        if (std.mem.eql(u8, operation, "divide")) {
+            if (values.len != 2) return error.DivideRequiresTwoValues;
+            if (values[1] == 0.0) return error.DivisionByZero;
+            return formatResult(allocator, values[0] / values[1]);
+        }
+        if (std.mem.eql(u8, operation, "pow")) {
+            if (values.len != 2) return error.PowRequiresTwoValues;
+            return formatResult(allocator, std.math.pow(f64, values[0], values[1]));
+        }
+        if (std.mem.eql(u8, operation, "sqrt")) {
+            if (values.len != 1) return error.SqrtRequiresOneValue;
+            if (values[0] < 0.0) return error.SqrtNegativeValue;
+            return formatResult(allocator, @sqrt(values[0]));
+        }
+        if (std.mem.eql(u8, operation, "log")) {
+            if (values.len != 1) return error.LogRequiresOneValue;
+            if (values[0] <= 0.0) return error.LogRequiresPositiveValue;
+            return formatResult(allocator, std.math.log10(values[0]));
+        }
+        if (std.mem.eql(u8, operation, "ln")) {
+            if (values.len != 1) return error.LnRequiresOneValue;
+            if (values[0] <= 0.0) return error.LnRequiresPositiveValue;
+            return formatResult(allocator, @log(values[0]));
+        }
+        if (std.mem.eql(u8, operation, "exp")) {
+            if (values.len != 1) return error.ExpRequiresOneValue;
+            return formatResult(allocator, @exp(values[0]));
+        }
+        if (std.mem.eql(u8, operation, "average")) {
+            if (values.len < 1) return error.AverageRequiresValues;
+            var sum: f64 = 0.0;
+            for (values) |v| sum += v;
+            return formatResult(allocator, sum / @as(f64, @floatFromInt(values.len)));
+        }
+        if (std.mem.eql(u8, operation, "median")) {
+            if (values.len < 1) return error.MedianRequiresValues;
+            return formatResult(allocator, median(values));
+        }
+        if (std.mem.eql(u8, operation, "stdev")) {
+            if (values.len < 2) return error.StdevRequiresTwoValues;
+            return formatResult(allocator, populationStdev(values));
+        }
+        if (std.mem.eql(u8, operation, "min")) {
+            if (values.len < 1) return error.MinRequiresValues;
+            var m = values[0];
+            for (values[1..]) |v| {
+                if (v < m) m = v;
+            }
+            return formatResult(allocator, m);
+        }
+        if (std.mem.eql(u8, operation, "max")) {
+            if (values.len < 1) return error.MaxRequiresValues;
+            var m = values[0];
+            for (values[1..]) |v| {
+                if (v > m) m = v;
+            }
+            return formatResult(allocator, m);
+        }
+        if (std.mem.eql(u8, operation, "count")) {
+            if (values.len < 1) return error.CountRequiresValues;
+            return formatResult(allocator, @floatFromInt(values.len));
+        }
+        if (std.mem.eql(u8, operation, "percentile")) {
+            if (values.len < 1) return error.PercentileRequiresValues;
+            const rank_raw = root.getInt(args, "percentile_rank") orelse {
+                return error.PercentileRequiresRank;
+            };
+            const rank: i64 = if (rank_raw >= 0 and rank_raw <= 100) rank_raw else {
+                return error.PercentileRankOutOfRange;
+            };
+            return formatResult(allocator, percentile(values, @floatFromInt(rank)));
+        }
+        if (std.mem.eql(u8, operation, "abs")) {
+            if (values.len != 1) return error.AbsRequiresOneValue;
+            return formatResult(allocator, @abs(values[0]));
+        }
+        if (std.mem.eql(u8, operation, "floor")) {
+            if (values.len != 1) return error.FloorRequiresOneValue;
+            return formatResult(allocator, @floor(values[0]));
+        }
+        if (std.mem.eql(u8, operation, "ceil")) {
+            if (values.len != 1) return error.CeilRequiresOneValue;
+            return formatResult(allocator, @ceil(values[0]));
+        }
+        if (std.mem.eql(u8, operation, "round")) {
+            if (values.len != 1) return error.RoundRequiresOneValue;
+            return formatResult(allocator, @round(values[0]));
+        }
+
+        return error.UnknownOperation;
+    }
+
+    fn median(values: []const f64) f64 {
+        const sorted = sortCopy(values);
+        const n = values.len;
+        if (n % 2 == 1) {
+            return sorted[n / 2];
+        }
+        return (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0;
+    }
+
+    fn populationStdev(values: []const f64) f64 {
+        const n: f64 = @floatFromInt(values.len);
+        var sum: f64 = 0.0;
+        for (values) |v| sum += v;
+        const mean = sum / n;
+        var sq_diff_sum: f64 = 0.0;
+        for (values) |v| {
+            const diff = v - mean;
+            sq_diff_sum += diff * diff;
+        }
+        return @sqrt(sq_diff_sum / n);
+    }
+
+    fn percentile(values: []const f64, rank: f64) f64 {
+        const sorted = sortCopy(values);
+        const n = values.len;
+        if (n == 1) return sorted[0];
+        const idx = (rank / 100.0) * (@as(f64, @floatFromInt(n)) - 1.0);
+        const lower: usize = @intFromFloat(@floor(idx));
+        const upper: usize = @min(lower + 1, n - 1);
+        const frac = idx - @as(f64, @floatFromInt(lower));
+        return sorted[lower] + frac * (sorted[upper] - sorted[lower]);
+    }
+
+    fn sortCopy(values: []const f64) [MAX_SORT_LEN]f64 {
+        var buf: [MAX_SORT_LEN]f64 = undefined;
+        const len = @min(values.len, MAX_SORT_LEN);
+        @memcpy(buf[0..len], values[0..len]);
+        if (len > 1) {
+            std.mem.sort(f64, buf[0..len], {}, struct {
+                fn lessThan(_: void, a: f64, b: f64) bool {
+                    return a < b;
+                }
+            }.lessThan);
+        }
+        return buf;
+    }
+
+    fn formatResult(allocator: std.mem.Allocator, value: f64) ![]const u8 {
+        var buf: [64]u8 = undefined;
+        const str = std.fmt.bufPrint(&buf, "{d:.6}", .{value}) catch "0";
+        const trimmed = trimFloatStr(str);
+        return allocator.dupe(u8, trimmed);
+    }
+
+    fn trimFloatStr(s: []const u8) []const u8 {
+        const dot = std.mem.indexOfScalar(u8, s, '.') orelse return s;
+        var end = s.len;
+        while (end > dot + 1 and s[end - 1] == '0') : (end -= 1) {}
+        return if (s[end - 1] == '.') s[0 .. end - 1] else s[0..end];
+    }
+};
+
+const MAX_SORT_LEN = 1024;
+
+test "calculator tool name and description" {
+    var ct = CalculatorTool{};
+    const t = ct.tool();
+    try std.testing.expectEqualStrings("calculator", t.name());
+    try std.testing.expect(t.description().len > 0);
+    try std.testing.expect(t.parametersJson().len > 0);
+}
+
+test "calculator add two numbers" {
+    var ct = CalculatorTool{};
+    const t = ct.tool();
+    const parsed = try root.parseTestArgs("{\"operation\":\"add\",\"values\":[3,5]}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expectEqualStrings("8", result.output);
+}
+
+test "calculator add multiple numbers" {
+    var ct = CalculatorTool{};
+    const t = ct.tool();
+    const parsed = try root.parseTestArgs("{\"operation\":\"add\",\"values\":[1,2,3,4,5]}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expectEqualStrings("15", result.output);
+}
+
+test "calculator add with float values" {
+    var ct = CalculatorTool{};
+    const t = ct.tool();
+    const parsed = try root.parseTestArgs("{\"operation\":\"add\",\"values\":[1.5,2.5]}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expectEqualStrings("4", result.output);
+}
+
+test "calculator subtract" {
+    var ct = CalculatorTool{};
+    const t = ct.tool();
+    const parsed = try root.parseTestArgs("{\"operation\":\"subtract\",\"values\":[10,3]}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expectEqualStrings("7", result.output);
+}
+
+test "calculator subtract negative result" {
+    var ct = CalculatorTool{};
+    const t = ct.tool();
+    const parsed = try root.parseTestArgs("{\"operation\":\"subtract\",\"values\":[3,10]}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expectEqualStrings("-7", result.output);
+}
+
+test "calculator multiply" {
+    var ct = CalculatorTool{};
+    const t = ct.tool();
+    const parsed = try root.parseTestArgs("{\"operation\":\"multiply\",\"values\":[3,4,5]}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expectEqualStrings("60", result.output);
+}
+
+test "calculator divide" {
+    var ct = CalculatorTool{};
+    const t = ct.tool();
+    const parsed = try root.parseTestArgs("{\"operation\":\"divide\",\"values\":[22,7]}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expectEqualStrings("3.142857", result.output);
+}
+
+test "calculator divide by zero" {
+    var ct = CalculatorTool{};
+    const t = ct.tool();
+    const parsed = try root.parseTestArgs("{\"operation\":\"divide\",\"values\":[10,0]}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(!result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "DivisionByZero") != null);
+}
+
+test "calculator pow" {
+    var ct = CalculatorTool{};
+    const t = ct.tool();
+    const parsed = try root.parseTestArgs("{\"operation\":\"pow\",\"values\":[2,10]}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expectEqualStrings("1024", result.output);
+}
+
+test "calculator sqrt" {
+    var ct = CalculatorTool{};
+    const t = ct.tool();
+    const parsed = try root.parseTestArgs("{\"operation\":\"sqrt\",\"values\":[144]}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expectEqualStrings("12", result.output);
+}
+
+test "calculator sqrt negative" {
+    var ct = CalculatorTool{};
+    const t = ct.tool();
+    const parsed = try root.parseTestArgs("{\"operation\":\"sqrt\",\"values\":[-4]}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(!result.success);
+}
+
+test "calculator log" {
+    var ct = CalculatorTool{};
+    const t = ct.tool();
+    const parsed = try root.parseTestArgs("{\"operation\":\"log\",\"values\":[1000]}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expectEqualStrings("3", result.output);
+}
+
+test "calculator ln" {
+    var ct = CalculatorTool{};
+    const t = ct.tool();
+    const parsed = try root.parseTestArgs("{\"operation\":\"ln\",\"values\":[2.718281828]}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "1") != null);
+}
+
+test "calculator exp" {
+    var ct = CalculatorTool{};
+    const t = ct.tool();
+    const parsed = try root.parseTestArgs("{\"operation\":\"exp\",\"values\":[0]}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "1") != null);
+}
+
+test "calculator average" {
+    var ct = CalculatorTool{};
+    const t = ct.tool();
+    const parsed = try root.parseTestArgs("{\"operation\":\"average\",\"values\":[10,20,30]}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expectEqualStrings("20", result.output);
+}
+
+test "calculator median odd count" {
+    var ct = CalculatorTool{};
+    const t = ct.tool();
+    const parsed = try root.parseTestArgs("{\"operation\":\"median\",\"values\":[5,2,8,1,9]}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expectEqualStrings("5", result.output);
+}
+
+test "calculator median even count" {
+    var ct = CalculatorTool{};
+    const t = ct.tool();
+    const parsed = try root.parseTestArgs("{\"operation\":\"median\",\"values\":[4,1,3,2]}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expectEqualStrings("2.5", result.output);
+}
+
+test "calculator stdev" {
+    var ct = CalculatorTool{};
+    const t = ct.tool();
+    const parsed = try root.parseTestArgs("{\"operation\":\"stdev\",\"values\":[2,4,4,4,5,5,7,9]}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "2") != null);
+}
+
+test "calculator stdev single value rejected" {
+    var ct = CalculatorTool{};
+    const t = ct.tool();
+    const parsed = try root.parseTestArgs("{\"operation\":\"stdev\",\"values\":[42]}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(!result.success);
+}
+
+test "calculator min" {
+    var ct = CalculatorTool{};
+    const t = ct.tool();
+    const parsed = try root.parseTestArgs("{\"operation\":\"min\",\"values\":[5,3,8,1,9]}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expectEqualStrings("1", result.output);
+}
+
+test "calculator max" {
+    var ct = CalculatorTool{};
+    const t = ct.tool();
+    const parsed = try root.parseTestArgs("{\"operation\":\"max\",\"values\":[5,3,8,1,9]}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expectEqualStrings("9", result.output);
+}
+
+test "calculator count" {
+    var ct = CalculatorTool{};
+    const t = ct.tool();
+    const parsed = try root.parseTestArgs("{\"operation\":\"count\",\"values\":[1,2,3,4,5,6,7]}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expectEqualStrings("7", result.output);
+}
+
+test "calculator percentile" {
+    var ct = CalculatorTool{};
+    const t = ct.tool();
+    const parsed = try root.parseTestArgs("{\"operation\":\"percentile\",\"values\":[1,2,3,4,5,6,7,8,9,10],\"percentile_rank\":50}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expectEqualStrings("5.5", result.output);
+}
+
+test "calculator percentile p25" {
+    var ct = CalculatorTool{};
+    const t = ct.tool();
+    const parsed = try root.parseTestArgs("{\"operation\":\"percentile\",\"values\":[10,20,30,40,50],\"percentile_rank\":25}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expectEqualStrings("20", result.output);
+}
+
+test "calculator percentile missing rank" {
+    var ct = CalculatorTool{};
+    const t = ct.tool();
+    const parsed = try root.parseTestArgs("{\"operation\":\"percentile\",\"values\":[1,2,3]}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(!result.success);
+}
+
+test "calculator abs" {
+    var ct = CalculatorTool{};
+    const t = ct.tool();
+    const parsed = try root.parseTestArgs("{\"operation\":\"abs\",\"values\":[-42]}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expectEqualStrings("42", result.output);
+}
+
+test "calculator floor" {
+    var ct = CalculatorTool{};
+    const t = ct.tool();
+    const parsed = try root.parseTestArgs("{\"operation\":\"floor\",\"values\":[3.7]}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expectEqualStrings("3", result.output);
+}
+
+test "calculator ceil" {
+    var ct = CalculatorTool{};
+    const t = ct.tool();
+    const parsed = try root.parseTestArgs("{\"operation\":\"ceil\",\"values\":[3.2]}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expectEqualStrings("4", result.output);
+}
+
+test "calculator round" {
+    var ct = CalculatorTool{};
+    const t = ct.tool();
+    const parsed = try root.parseTestArgs("{\"operation\":\"round\",\"values\":[3.5]}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expectEqualStrings("4", result.output);
+}
+
+test "calculator missing operation" {
+    var ct = CalculatorTool{};
+    const t = ct.tool();
+    const parsed = try root.parseTestArgs("{\"values\":[1,2]}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(!result.success);
+}
+
+test "calculator missing values" {
+    var ct = CalculatorTool{};
+    const t = ct.tool();
+    const parsed = try root.parseTestArgs("{\"operation\":\"add\"}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(!result.success);
+}
+
+test "calculator unknown operation" {
+    var ct = CalculatorTool{};
+    const t = ct.tool();
+    const parsed = try root.parseTestArgs("{\"operation\":\"fibonacci\",\"values\":[10]}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(!result.success);
+}
+
+test "calculator subtract wrong arg count" {
+    var ct = CalculatorTool{};
+    const t = ct.tool();
+    const parsed = try root.parseTestArgs("{\"operation\":\"subtract\",\"values\":[10]}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(!result.success);
+}
+
+test "calculator empty values array" {
+    var ct = CalculatorTool{};
+    const t = ct.tool();
+    const parsed = try root.parseTestArgs("{\"operation\":\"add\",\"values\":[]}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(!result.success);
+}
+
+test "calculator log zero" {
+    var ct = CalculatorTool{};
+    const t = ct.tool();
+    const parsed = try root.parseTestArgs("{\"operation\":\"log\",\"values\":[0]}");
+    defer parsed.deinit();
+    const result = try t.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(!result.success);
+}
