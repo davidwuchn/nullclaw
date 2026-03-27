@@ -64,6 +64,8 @@ pub const ChannelMessage = struct {
     reply_target: ?[]const u8 = null,
     /// Platform message ID (e.g. Telegram message_id for reply-to).
     message_id: ?i64 = null,
+    /// Whether the reply should replace the originating platform message.
+    replace_message: bool = false,
     /// Sender's first name (for personalized greetings).
     first_name: ?[]const u8 = null,
     /// Whether the message came from a group chat.
