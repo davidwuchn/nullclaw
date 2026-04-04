@@ -485,15 +485,21 @@ test "run timeout kills Windows shell descendants" {
     defer allocator.free(tmp_path);
     const pid_path = try std.fs.path.join(allocator, &.{ tmp_path, "child.pid" });
     defer allocator.free(pid_path);
-    const command = try std.fmt.allocPrint(
-        allocator,
-        "powershell.exe -NoProfile -Command \"$PID | Set-Content -NoNewline -Path '{s}'; Start-Sleep -Seconds 8\"",
-        .{pid_path},
-    );
-    defer allocator.free(command);
+    try tmp_dir.dir.writeFile(.{
+        .sub_path = "wrapper.cmd",
+        // Keep the PowerShell payload in a temporary batch file so the test
+        // exercises cmd.exe descendant cleanup without brittle nested quoting.
+        .data =
+        \\@echo off
+        \\powershell.exe -NoProfile -Command "$PID | Set-Content -NoNewline -LiteralPath $args[0]; Start-Sleep -Seconds 8" -- "%~dp0child.pid"
+        \\
+        ,
+    });
+    const script_path = try std.fs.path.join(allocator, &.{ tmp_path, "wrapper.cmd" });
+    defer allocator.free(script_path);
 
-    const result = try run(allocator, &.{ "cmd.exe", "/c", command }, .{
-        .timeout_ns = 1 * std.time.ns_per_s,
+    const result = try run(allocator, &.{ "cmd.exe", "/c", script_path }, .{
+        .timeout_ns = 2 * std.time.ns_per_s,
     });
     defer result.deinit(allocator);
 
