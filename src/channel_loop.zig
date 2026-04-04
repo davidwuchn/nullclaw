@@ -28,6 +28,7 @@ const thread_stacks = @import("thread_stacks.zig");
 const control_plane = @import("control_plane.zig");
 const agent_bindings_config = @import("agent_bindings_config.zig");
 const fs_compat = @import("fs_compat.zig");
+const provider_probe = @import("provider_probe.zig");
 
 const signal = @import("channels/signal.zig");
 const matrix = @import("channels/matrix.zig");
@@ -36,6 +37,71 @@ const channels_mod = @import("channels/root.zig");
 const Atomic = @import("portable_atomic.zig").Atomic;
 
 const log = std.log.scoped(.channel_loop);
+
+fn hasNonEmptyCredential(value: ?[]const u8) bool {
+    const credential = value orelse return false;
+    return std.mem.trim(u8, credential, " \t\r\n").len > 0;
+}
+
+fn providerHasStartupCredentials(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    provider_name: []const u8,
+) bool {
+    const resolved_key = providers.resolveApiKeyFromConfig(
+        allocator,
+        provider_name,
+        config.providers,
+    ) catch null;
+    defer if (resolved_key) |key| allocator.free(key);
+
+    if (hasNonEmptyCredential(resolved_key)) return true;
+
+    var holder = providers.ProviderHolder.fromConfigWithApiMode(
+        allocator,
+        provider_name,
+        null,
+        config.getProviderBaseUrl(provider_name),
+        config.getProviderNativeTools(provider_name),
+        config.getProviderUserAgent(provider_name),
+        config.getProviderApiMode(provider_name),
+        config.getProviderMaxStreamingPromptBytes(provider_name),
+    );
+    defer holder.deinit();
+
+    return switch (holder) {
+        .ollama => true,
+        .claude_cli, .codex_cli, .gemini_cli => true,
+        .openai_codex => |provider| provider.access_token != null,
+        .gemini => |provider| provider.auth != null,
+        .vertex => |provider| provider.auth != null and provider.base != null,
+        .compatible => !provider_probe.providerRequiresApiKey(provider_name, config.getProviderBaseUrl(provider_name)),
+        else => false,
+    };
+}
+
+fn hasReliabilityCredentialFallback(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+) bool {
+    for (config.reliability.api_keys) |key| {
+        if (std.mem.trim(u8, key, " \t\r\n").len > 0) return true;
+    }
+
+    for (config.reliability.fallback_providers) |provider_name| {
+        if (providerHasStartupCredentials(allocator, config, provider_name)) return true;
+    }
+
+    return false;
+}
+
+pub fn hasStartupProviderCredentials(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+) bool {
+    if (providerHasStartupCredentials(allocator, config, config.default_provider)) return true;
+    return hasReliabilityCredentialFallback(allocator, config);
+}
 
 /// Set ScheduleTool's default chat_id for delivery context.
 fn setScheduleToolContext(

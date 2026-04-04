@@ -1158,15 +1158,24 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     // Channel runtime for supervised polling (provider, tools, sessions)
     var channel_rt: ?*channel_loop.ChannelRuntime = null;
     if (has_runtime_dependent_channels) {
-        channel_rt = channel_loop.ChannelRuntime.init(allocator, config) catch |err| blk: {
-            state.markError("channels", @errorName(err));
-            health.markComponentError("channels", "runtime init failed");
+        if (!channel_loop.hasStartupProviderCredentials(allocator, config)) {
+            state.markError("channels", "missing_provider_credentials");
+            health.markComponentError("channels", "missing_provider_credentials");
             stdout.print(
-                "Warning: channel runtime init failed ({s}); runtime-dependent channels disabled.\n",
-                .{@errorName(err)},
+                "Warning: channel runtime disabled; no usable startup credentials for provider {s}.\n",
+                .{config.default_provider},
             ) catch {};
-            break :blk null;
-        };
+        } else {
+            channel_rt = channel_loop.ChannelRuntime.init(allocator, config) catch |err| blk: {
+                state.markError("channels", @errorName(err));
+                health.markComponentError("channels", "runtime init failed");
+                stdout.print(
+                    "Warning: channel runtime init failed ({s}); runtime-dependent channels disabled.\n",
+                    .{@errorName(err)},
+                ) catch {};
+                break :blk null;
+            };
+        }
     }
     defer if (channel_rt) |rt| rt.deinit();
 
