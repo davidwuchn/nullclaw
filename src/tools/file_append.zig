@@ -13,6 +13,7 @@ const JsonObjectMap = root.JsonObjectMap;
 const isPathSafe = @import("path_security.zig").isPathSafe;
 const isResolvedPathAllowed = @import("path_security.zig").isResolvedPathAllowed;
 const bootstrap_mod = @import("../bootstrap/root.zig");
+const memory_root = @import("../memory/root.zig");
 
 /// Default maximum file size to read before appending (10MB).
 const DEFAULT_MAX_FILE_SIZE: usize = 10 * 1024 * 1024;
@@ -180,6 +181,19 @@ pub const FileAppendTool = struct {
             };
             break :blk st.mode;
         };
+
+        // Ensure parent directory exists after policy checks pass.
+        if (std.fs.path.dirname(write_path)) |parent_dir_path| {
+            std.fs.makeDirAbsolute(parent_dir_path) catch |err| switch (err) {
+                error.PathAlreadyExists => {},
+                else => {
+                    fs_compat.makePath(parent_dir_path) catch |e| {
+                        const msg = try std.fmt.allocPrint(allocator, "Failed to create directory: {}", .{e});
+                        return ToolResult{ .success = false, .output = "", .error_msg = msg };
+                    };
+                },
+            };
+        }
 
         const parent = std.fs.path.dirname(write_path) orelse write_path;
         const basename = std.fs.path.basename(write_path);
@@ -393,6 +407,27 @@ test "FileAppendTool creates new file" {
     try testing.expectEqualStrings("hello", actual);
 }
 
+test "FileAppendTool creates parent dirs for new file" {
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const ws_path = try tmp_dir.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(ws_path);
+
+    var fat = FileAppendTool{ .workspace_dir = ws_path };
+    const parsed = try root.parseTestArgs("{\"path\":\"logs/2026/output.txt\",\"content\":\"hello\"}");
+    defer parsed.deinit();
+    const result = try fat.execute(testing.allocator, parsed.value.object);
+    defer if (result.output.len > 0) testing.allocator.free(result.output);
+    defer if (result.error_msg) |e| testing.allocator.free(e);
+
+    try testing.expect(result.success);
+
+    const actual = try fs_compat.readFileAlloc(tmp_dir.dir, testing.allocator, "logs/2026/output.txt", 4096);
+    defer testing.allocator.free(actual);
+    try testing.expectEqualStrings("hello", actual);
+}
+
 test "FileAppendTool appends to empty file" {
     var tmp_dir = testing.tmpDir(.{});
     defer tmp_dir.cleanup();
@@ -477,7 +512,7 @@ test "FileAppendTool appends bootstrap file in memory backend" {
     try testing.expectError(error.FileNotFound, tmp_dir.dir.openFile("USER.md", .{}));
 }
 
-test "FileAppendTool rejects disallowed absolute path without creating file" {
+test "FileAppendTool rejects disallowed absolute path without creating parent directories" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
 
     var ws_tmp = testing.tmpDir(.{});
@@ -490,7 +525,9 @@ test "FileAppendTool rejects disallowed absolute path without creating file" {
     const outside_path = try outside_tmp.dir.realpathAlloc(testing.allocator, ".");
     defer testing.allocator.free(outside_path);
 
-    const outside_file = try std.fs.path.join(testing.allocator, &.{ outside_path, "rejected.txt" });
+    const outside_parent = try std.fs.path.join(testing.allocator, &.{ outside_path, "created_by_rejected_append" });
+    defer testing.allocator.free(outside_parent);
+    const outside_file = try std.fs.path.join(testing.allocator, &.{ outside_parent, "rejected.txt" });
     defer testing.allocator.free(outside_file);
 
     const json_args = try std.fmt.allocPrint(testing.allocator, "{{\"path\":\"{s}\",\"content\":\"x\"}}", .{outside_file});
@@ -505,15 +542,15 @@ test "FileAppendTool rejects disallowed absolute path without creating file" {
     try testing.expect(!result.success);
     try testing.expect(std.mem.indexOf(u8, result.error_msg.?, "outside allowed areas") != null);
 
-    const file_exists = blk: {
-        const file = std.fs.openFileAbsolute(outside_file, .{}) catch |err| switch (err) {
+    const dir_exists = blk: {
+        var dir = std.fs.openDirAbsolute(outside_parent, .{}) catch |err| switch (err) {
             error.FileNotFound => break :blk false,
             else => return err,
         };
-        file.close();
+        dir.close();
         break :blk true;
     };
-    try testing.expect(!file_exists);
+    try testing.expect(!dir_exists);
 }
 
 test "FileAppendTool blocks symlink parent escape outside workspace" {
@@ -622,6 +659,67 @@ test "FileAppendTool keeps symlink and updates target" {
     const target_actual = try fs_compat.readFileAlloc(ws_tmp.dir, testing.allocator, "target.txt", 1024);
     defer testing.allocator.free(target_actual);
     try testing.expectEqualStrings("oldnew", target_actual);
+}
+
+test "FileAppendTool does not bypass allowed_paths for bootstrap memory appends" {
+    var ws_tmp = testing.tmpDir(.{});
+    defer ws_tmp.cleanup();
+    var outside_tmp = testing.tmpDir(.{});
+    defer outside_tmp.cleanup();
+
+    const ws_path = try ws_tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(ws_path);
+    const outside_path = try outside_tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(outside_path);
+
+    try outside_tmp.dir.writeFile(.{ .sub_path = "AGENTS.md", .data = "outside-before" });
+    const outside_file = try std.fs.path.join(testing.allocator, &.{ outside_path, "AGENTS.md" });
+    defer testing.allocator.free(outside_file);
+
+    var escaped_buf: [1024]u8 = undefined;
+    var esc_len: usize = 0;
+    for (outside_file) |c| {
+        if (c == '\\') {
+            escaped_buf[esc_len] = '\\';
+            esc_len += 1;
+        }
+        escaped_buf[esc_len] = c;
+        esc_len += 1;
+    }
+
+    const json_args = try std.fmt.allocPrint(
+        testing.allocator,
+        "{{\"path\":\"{s}\",\"content\":\"\\ndenied\"}}",
+        .{escaped_buf[0..esc_len]},
+    );
+    defer testing.allocator.free(json_args);
+
+    var lru = memory_root.InMemoryLruMemory.init(testing.allocator, 16);
+    defer lru.deinit();
+    var bp_impl = bootstrap_mod.MemoryBootstrapProvider.init(testing.allocator, lru.memory(), null);
+    try bp_impl.provider().store("AGENTS.md", "alpha");
+
+    var fat = FileAppendTool{
+        .workspace_dir = ws_path,
+        .allowed_paths = &.{ws_path},
+        .bootstrap_provider = bp_impl.provider(),
+        .backend_name = "sqlite",
+    };
+    const parsed = try root.parseTestArgs(json_args);
+    defer parsed.deinit();
+
+    const result = try fat.execute(testing.allocator, parsed.value.object);
+    defer if (result.output.len > 0) testing.allocator.free(result.output);
+    try testing.expect(!result.success);
+    try testing.expect(std.mem.indexOf(u8, result.error_msg.?, "outside allowed areas") != null);
+
+    const content = try bp_impl.provider().load(testing.allocator, "AGENTS.md") orelse return error.TestUnexpectedResult;
+    defer testing.allocator.free(content);
+    try testing.expectEqualStrings("alpha", content);
+
+    const outside_after = try fs_compat.readFileAlloc(outside_tmp.dir, testing.allocator, "AGENTS.md", 1024);
+    defer testing.allocator.free(outside_after);
+    try testing.expectEqualStrings("outside-before", outside_after);
 }
 
 test "FileAppendTool schema has required params" {

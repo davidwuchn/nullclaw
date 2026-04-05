@@ -258,7 +258,7 @@ pub fn assertToolInterface(comptime T: type) void {
     _ = vt.parameters_json;
 }
 
-/// Create the default tool set (shell, file_read, file_write).
+/// Create the default tool set (shell, file_read, file_write, file_edit, file_append).
 pub fn defaultTools(
     allocator: std.mem.Allocator,
     workspace_dir: []const u8,
@@ -608,8 +608,8 @@ pub fn deinitTools(allocator: std.mem.Allocator, tools: []const Tool) void {
 }
 
 /// Create restricted tool set for subagents.
-/// Includes: shell, file_read, file_write, file_edit, file_read_hashed,
-/// file_edit_hashed, git, http (if enabled).
+/// Includes: shell, file_read, file_write, file_edit, file_append, file_delete,
+/// file_read_hashed, file_edit_hashed, git, http (if enabled).
 /// Excludes: message, spawn, delegate, schedule, memory, composio, browser —
 /// to prevent infinite loops and cross-channel side effects.
 pub fn subagentTools(
