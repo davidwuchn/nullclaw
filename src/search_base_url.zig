@@ -61,3 +61,53 @@ fn validated(raw: []const u8) ?[]const u8 {
 
     return trimmed;
 }
+
+test "isValid accepts valid https URL" {
+    try std.testing.expect(isValid("https://example.com"));
+    try std.testing.expect(isValid("https://searx.example.com/search"));
+}
+
+test "isValid rejects empty string" {
+    try std.testing.expect(!isValid(""));
+    try std.testing.expect(!isValid("   "));
+}
+
+test "isValid rejects http for non-localhost" {
+    try std.testing.expect(!isValid("http://example.com"));
+    try std.testing.expect(!isValid("http://searx.example.com/search"));
+}
+
+test "isValid accepts http for localhost" {
+    try std.testing.expect(isValid("http://localhost"));
+    try std.testing.expect(isValid("http://localhost:8888"));
+    try std.testing.expect(isValid("http://127.0.0.1:8888/search"));
+}
+
+test "isValid rejects unknown schemes" {
+    try std.testing.expect(!isValid("ftp://example.com"));
+    try std.testing.expect(!isValid("file:///etc/passwd"));
+}
+
+test "isValid rejects URLs with query or fragment" {
+    try std.testing.expect(!isValid("https://example.com?q=test"));
+    try std.testing.expect(!isValid("https://example.com#section"));
+}
+
+test "normalizeEndpoint appends /search when missing" {
+    const allocator = std.testing.allocator;
+    const result = try normalizeEndpoint(allocator, "https://example.com");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("https://example.com/search", result);
+}
+
+test "normalizeEndpoint preserves existing /search" {
+    const allocator = std.testing.allocator;
+    const result = try normalizeEndpoint(allocator, "https://example.com/search");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("https://example.com/search", result);
+}
+
+test "normalizeEndpoint returns error for invalid URL" {
+    try std.testing.expectError(error.InvalidSearchBaseUrl, normalizeEndpoint(std.testing.allocator, ""));
+    try std.testing.expectError(error.InvalidSearchBaseUrl, normalizeEndpoint(std.testing.allocator, "ftp://bad"));
+}
