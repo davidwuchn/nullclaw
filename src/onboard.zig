@@ -817,6 +817,7 @@ fn readCachedModels(allocator: std.mem.Allocator, cache_path: []const u8, provid
     }
 
     if (result.items.len == 0) return error.CacheEmpty;
+    sortModelIds(result.items);
     return result.toOwnedSlice(allocator);
 }
 
@@ -924,14 +925,8 @@ pub fn runQuickSetup(allocator: std.mem.Allocator, api_key: ?[]const u8, provide
         }
     }
     if (api_key) |key| {
-        // Store in providers section for the default provider (arena frees old values)
-        const entries = try cfg.allocator.alloc(config_mod.ProviderEntry, 1);
-        entries[0] = .{
-            .name = try cfg.allocator.dupe(u8, cfg.default_provider),
-            .api_key = try cfg.allocator.dupe(u8, key),
-            .base_url = custom_base_url,
-        };
-        cfg.providers = entries;
+        const provider_base_url = if (custom_base_url) |configured| configured else cfg.getProviderBaseUrl(cfg.default_provider);
+        try appendOrReplaceProviderEntry(&cfg, cfg.default_provider, key, provider_base_url);
     }
     if (memory_backend) |mb| {
         const desc = try resolveMemoryBackendForQuickSetup(mb);
@@ -1152,7 +1147,7 @@ const ProviderSelection = struct {
     base_url: ?[]const u8 = null,
 };
 
-fn appendOrReplaceProviderEntry(
+pub fn appendOrReplaceProviderEntry(
     cfg: *Config,
     provider_name: []const u8,
     api_key: ?[]const u8,
@@ -1160,7 +1155,7 @@ fn appendOrReplaceProviderEntry(
 ) !void {
     var replace_idx: ?usize = null;
     for (cfg.providers, 0..) |entry, idx| {
-        if (std.mem.eql(u8, entry.name, provider_name)) {
+        if (provider_names.providerNamesMatch(entry.name, provider_name)) {
             replace_idx = idx;
             break;
         }
@@ -1176,6 +1171,11 @@ fn appendOrReplaceProviderEntry(
                 .name = try cfg.allocator.dupe(u8, provider_name),
                 .api_key = if (api_key) |value| try cfg.allocator.dupe(u8, value) else null,
                 .base_url = if (base_url) |value| try cfg.allocator.dupe(u8, value) else null,
+                .native_tools = entry.native_tools,
+                .user_agent = entry.user_agent,
+                .api_mode = entry.api_mode,
+                .chat_template_enable_thinking_param = entry.chat_template_enable_thinking_param,
+                .max_streaming_prompt_bytes = entry.max_streaming_prompt_bytes,
             };
         } else {
             entries[out_idx] = entry;
@@ -2078,10 +2078,7 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
 
     const is_azure_provider = std.mem.eql(u8, canonicalProviderName(cfg.default_provider), "azure");
 
-    var provider_base_url: ?[]const u8 = null;
-    if (cfg.providers.len > 0 and cfg.providers[0].base_url != null) {
-        provider_base_url = cfg.providers[0].base_url;
-    }
+    var provider_base_url = cfg.getProviderBaseUrl(cfg.default_provider);
 
     if (is_azure_provider) {
         var azure_endpoint_buf: [512]u8 = undefined;
@@ -3411,6 +3408,64 @@ test "appendOrReplaceProviderEntry replaces existing provider entry in place" {
     try std.testing.expectEqualStrings("https://openrouter.ai/api/v1", cfg.providers[0].base_url.?);
 }
 
+test "appendOrReplaceProviderEntry preserves advanced provider overrides when updating credentials" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+        .providers = &.{.{
+            .name = "sub2api",
+            .api_key = "sk-old",
+            .base_url = "https://old.example/v1",
+            .native_tools = false,
+            .user_agent = "nullclaw-test/1.0",
+            .api_mode = .responses,
+            .chat_template_enable_thinking_param = true,
+            .max_streaming_prompt_bytes = 65536,
+        }},
+    };
+
+    try appendOrReplaceProviderEntry(&cfg, "sub2api", "sk-new", "https://new.example/v1");
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.providers.len);
+    try std.testing.expectEqualStrings("sub2api", cfg.providers[0].name);
+    try std.testing.expectEqualStrings("sk-new", cfg.providers[0].api_key.?);
+    try std.testing.expectEqualStrings("https://new.example/v1", cfg.providers[0].base_url.?);
+    try std.testing.expect(!cfg.providers[0].native_tools);
+    try std.testing.expectEqualStrings("nullclaw-test/1.0", cfg.providers[0].user_agent.?);
+    try std.testing.expectEqual(config_mod.ProviderEntry.ApiMode.responses, cfg.providers[0].api_mode);
+    try std.testing.expect(cfg.providers[0].chat_template_enable_thinking_param);
+    try std.testing.expectEqual(@as(?usize, 65536), cfg.providers[0].max_streaming_prompt_bytes);
+}
+
+test "appendOrReplaceProviderEntry replaces canonical alias matches instead of appending duplicates" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+        .providers = &.{.{
+            .name = "google-vertex",
+            .api_key = "vertex-old",
+            .base_url = "https://vertex.example/v1",
+        }},
+    };
+
+    try appendOrReplaceProviderEntry(&cfg, "vertex", "vertex-new", "https://vertex-new.example/v1");
+
+    try std.testing.expectEqual(@as(usize, 1), cfg.providers.len);
+    try std.testing.expectEqualStrings("vertex", cfg.providers[0].name);
+    try std.testing.expectEqualStrings("vertex-new", cfg.getProviderKey("google-vertex").?);
+    try std.testing.expectEqualStrings("https://vertex-new.example/v1", cfg.getProviderBaseUrl("vertex-ai").?);
+}
+
 test "scaffoldWorkspace creates core files and leaves MEMORY.md optional" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4528,6 +4583,38 @@ test "cache round-trip: write then read fresh cache" {
     try std.testing.expectEqualStrings("model-alpha", loaded[0]);
     try std.testing.expectEqualStrings("model-beta", loaded[1]);
     try std.testing.expectEqualStrings("model-gamma", loaded[2]);
+}
+
+test "cache read sorts stale model ordering on load" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    const cache_path = try std.fs.path.join(std.testing.allocator, &.{ base, "models_cache.json" });
+    defer std.testing.allocator.free(cache_path);
+
+    const cache_json = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"fetched_at\": {d}, \"openrouter\": [\"z-model\", \"a-model:free\", \"m-model\"]}}",
+        .{std.time.timestamp()},
+    );
+    defer std.testing.allocator.free(cache_json);
+
+    const file = try tmp.dir.createFile("models_cache.json", .{});
+    defer file.close();
+    try file.writeAll(cache_json);
+
+    const loaded = try readCachedModels(std.testing.allocator, cache_path, "openrouter");
+    defer {
+        for (loaded) |m| std.testing.allocator.free(m);
+        std.testing.allocator.free(loaded);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), loaded.len);
+    try std.testing.expectEqualStrings("a-model:free", loaded[0]);
+    try std.testing.expectEqualStrings("m-model", loaded[1]);
+    try std.testing.expectEqualStrings("z-model", loaded[2]);
 }
 
 test "cache read returns error for wrong provider" {
