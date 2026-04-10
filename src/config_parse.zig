@@ -2178,18 +2178,8 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     }
                     if (sb.object.get("backend")) |v| {
                         if (v == .string) {
-                            if (std.mem.eql(u8, v.string, "auto")) {
-                                self.security.sandbox.backend = .auto;
-                            } else if (std.mem.eql(u8, v.string, "landlock")) {
-                                self.security.sandbox.backend = .landlock;
-                            } else if (std.mem.eql(u8, v.string, "firejail")) {
-                                self.security.sandbox.backend = .firejail;
-                            } else if (std.mem.eql(u8, v.string, "bubblewrap")) {
-                                self.security.sandbox.backend = .bubblewrap;
-                            } else if (std.mem.eql(u8, v.string, "docker")) {
-                                self.security.sandbox.backend = .docker;
-                            } else if (std.mem.eql(u8, v.string, "none")) {
-                                self.security.sandbox.backend = .none;
+                            if (std.meta.stringToEnum(types.SandboxBackend, v.string)) |backend| {
+                                self.security.sandbox.backend = backend;
                             }
                         }
                     }

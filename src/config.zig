@@ -3684,6 +3684,29 @@ test "json parse security section" {
     allocator.free(cfg.security.audit.log_path);
 }
 
+test "json parse security sandbox backend values" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct {
+        name: []const u8,
+        backend: SandboxBackend,
+    }{
+        .{ .name = "auto", .backend = .auto },
+        .{ .name = "landlock", .backend = .landlock },
+        .{ .name = "firejail", .backend = .firejail },
+        .{ .name = "bubblewrap", .backend = .bubblewrap },
+        .{ .name = "docker", .backend = .docker },
+        .{ .name = "none", .backend = .none },
+    };
+
+    inline for (cases) |case| {
+        var json_buf: [96]u8 = undefined;
+        const json = try std.fmt.bufPrint(&json_buf, "{{\"security\": {{\"sandbox\": {{\"backend\": \"{s}\"}}}}}}", .{case.name});
+        var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+        try cfg.parseJson(json);
+        try std.testing.expectEqual(case.backend, cfg.security.sandbox.backend);
+    }
+}
+
 test "json parse browser section" {
     const allocator = std.testing.allocator;
     const json =
