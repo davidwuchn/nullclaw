@@ -444,8 +444,8 @@ fn runService(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
                 std.debug.print("Verify `rc-service`, `rc-update`, and `openrc-run` are installed.\n", .{});
             },
             error.SystemctlUnavailable => {
-                std.debug.print("`systemctl` is not available; Linux service commands require systemd user services.\n", .{});
-                std.debug.print("Run `nullclaw gateway` in the foreground or use another supervisor.\n", .{});
+                std.debug.print("`systemctl` is not available and no supported Linux fallback service manager was detected.\n", .{});
+                std.debug.print("Install OpenRC or SysVinit support, or run `nullclaw gateway` in the foreground.\n", .{});
             },
             error.SystemdUserUnavailable => {
                 std.debug.print("systemd user services are unavailable (`systemctl --user`).\n", .{});
