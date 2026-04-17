@@ -9,7 +9,7 @@ Read `AGENTS.md` before any code change. It is the authoritative engineering pro
 ## Build & Test Commands
 
 ```bash
-# Requires exactly Zig 0.15.2 (verify: zig version)
+# Requires exactly Zig 0.16.0 (verify: zig version)
 zig build                           # dev build
 zig build -Doptimize=ReleaseSmall   # release build (target: <1 MB binary)
 zig build test --summary all        # run all 5,300+ tests (must pass with 0 leaks)
@@ -45,7 +45,7 @@ git config core.hooksPath .githooks
 
 ## Project Overview
 
-NullClaw is an autonomous AI assistant runtime written in Zig 0.15.2. Hard constraints: 678 KB binary, ~1 MB peak RSS, <2 ms startup. Every dependency and abstraction has a measurable size/memory cost. Only two external dependencies: vendored SQLite (with build-time SHA256 hash verification) and `websocket.zig` (pinned commit).
+NullClaw is an autonomous AI assistant runtime written in Zig 0.16.0. Hard constraints: 678 KB binary, ~1 MB peak RSS, <2 ms startup. Every dependency and abstraction has a measurable size/memory cost. Only two external dependencies: vendored SQLite (with build-time SHA256 hash verification) and `websocket.zig` (pinned commit).
 
 ## Architecture
 
@@ -106,7 +106,7 @@ defer cfg.deinit();
 
 Key config sections: `models.providers` (API keys/endpoints), `agents` (named agent configs), `channels` (per-channel settings), `memory` (backend/search/lifecycle), `gateway` (port/host/pairing), `security` (sandbox/audit/autonomy), `autonomy` (level/limits/allowlists), `runtime` (native/docker/wasm).
 
-## Zig 0.15.2 API Gotchas
+## Zig 0.16.0 API Gotchas
 
 - `std.io.getStdOut()` does NOT exist. Use `std.fs.File.stdout()`.
 - HTTP client: `std.http.Client.fetch()` with `std.Io.Writer.Allocating`.

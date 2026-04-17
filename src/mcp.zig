@@ -292,7 +292,6 @@ pub const McpServer = struct {
         var timeout_buf: [16]u8 = undefined;
         const timeout_str = std.fmt.bufPrint(&timeout_buf, "{d}", .{timeout_secs}) catch unreachable;
 
-        // std.http.Client.fetch has no request timeout control in Zig 0.15.
         // Use curl so timeouts are enforced.
         var header_lines: std.ArrayListUnmanaged([]u8) = .empty;
         defer {

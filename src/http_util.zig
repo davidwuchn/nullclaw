@@ -1,7 +1,7 @@
 //! Shared HTTP utilities via curl subprocess.
 //!
 //! Replaces 9+ local `curlPost` / `curlGet` duplicates across the codebase.
-//! Uses curl to avoid Zig 0.15 std.http.Client segfaults.
+//! Uses curl to keep timeout handling explicit and avoid std.http regressions.
 
 const std = @import("std");
 const std_compat = @import("compat");
