@@ -5,9 +5,9 @@
 //! spawn agent jobs without depending on the scheduler.
 
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
-
-const log = std.log.scoped(.agent_runner);
+const platform = @import("platform.zig");
 
 pub const AgentRunResult = struct {
     success: bool,
@@ -26,58 +26,102 @@ fn pathAgentExecutableName() []const u8 {
 fn hasTimeoutExpired(start_ns: i128, timeout_secs: u64) bool {
     if (timeout_secs == 0) return false;
     const timeout_ns = @as(i128, @intCast(timeout_secs)) * std.time.ns_per_s;
-    const now_ns = std.time.nanoTimestamp();
+    const now_ns = std_compat.time.nanoTimestamp();
     return now_ns - start_ns >= timeout_ns;
 }
 
 fn collectChildOutputWithTimeout(
-    child: *std.process.Child,
+    child: *std_compat.process.Child,
     allocator: std.mem.Allocator,
     stdout: *std.ArrayList(u8),
     stderr: *std.ArrayList(u8),
     timeout_secs: u64,
     start_ns: i128,
 ) !bool {
-    var poller = std.Io.poll(allocator, enum { stdout, stderr }, .{
-        .stdout = child.stdout.?,
-        .stderr = child.stderr.?,
-    });
-    defer poller.deinit();
-
-    const stdout_r = poller.reader(.stdout);
-    stdout_r.buffer = stdout.allocatedSlice();
-    stdout_r.seek = 0;
-    stdout_r.end = stdout.items.len;
-
-    const stderr_r = poller.reader(.stderr);
-    stderr_r.buffer = stderr.allocatedSlice();
-    stderr_r.seek = 0;
-    stderr_r.end = stderr.items.len;
-
-    defer {
-        stdout.* = .{
-            .items = stdout_r.buffer[0..stdout_r.end],
-            .capacity = stdout_r.buffer.len,
-        };
-        stderr.* = .{
-            .items = stderr_r.buffer[0..stderr_r.end],
-            .capacity = stderr_r.buffer.len,
-        };
-        stdout_r.buffer = &.{};
-        stderr_r.buffer = &.{};
-    }
-
+    const stdout_file = child.stdout.?;
+    const stderr_file = child.stderr.?;
+    var stdout_open = true;
+    var stderr_open = true;
     var timed_out = false;
+    var read_buf: [4096]u8 = undefined;
     while (true) {
-        const keep_polling = if (timeout_secs == 0 or timed_out)
-            try poller.poll()
-        else
-            try poller.pollTimeout(POLL_STEP_NS);
+        if (!stdout_open and !stderr_open) break;
 
-        if (stdout_r.bufferedLen() > MAX_OUTPUT_BYTES) return error.StdoutStreamTooLong;
-        if (stderr_r.bufferedLen() > MAX_OUTPUT_BYTES) return error.StderrStreamTooLong;
+        if (comptime builtin.os.tag == .windows) {
+            if (stdout_open) {
+                const n = stdout_file.read(&read_buf) catch |err| switch (err) {
+                    error.WouldBlock => 0,
+                    else => return err,
+                };
+                if (n == 0) {
+                    stdout_open = false;
+                } else {
+                    try stdout.appendSlice(allocator, read_buf[0..n]);
+                    if (stdout.items.len > MAX_OUTPUT_BYTES) return error.StdoutStreamTooLong;
+                }
+            }
 
-        if (!keep_polling) break;
+            if (stderr_open) {
+                const n = stderr_file.read(&read_buf) catch |err| switch (err) {
+                    error.WouldBlock => 0,
+                    else => return err,
+                };
+                if (n == 0) {
+                    stderr_open = false;
+                } else {
+                    try stderr.appendSlice(allocator, read_buf[0..n]);
+                    if (stderr.items.len > MAX_OUTPUT_BYTES) return error.StderrStreamTooLong;
+                }
+            }
+
+            if (stdout_open or stderr_open) {
+                std_compat.thread.sleep(POLL_STEP_NS);
+            }
+        } else {
+            const poll_ms: i32 = if (timeout_secs == 0 or timed_out)
+                -1
+            else
+                @intCast(@divTrunc(POLL_STEP_NS, std.time.ns_per_ms));
+            var poll_fds = [_]std.posix.pollfd{
+                .{
+                    .fd = if (stdout_open) stdout_file.handle else -1,
+                    .events = if (stdout_open) std.posix.POLL.IN | std.posix.POLL.HUP else 0,
+                    .revents = 0,
+                },
+                .{
+                    .fd = if (stderr_open) stderr_file.handle else -1,
+                    .events = if (stderr_open) std.posix.POLL.IN | std.posix.POLL.HUP else 0,
+                    .revents = 0,
+                },
+            };
+            _ = try std.posix.poll(&poll_fds, poll_ms);
+
+            if (stdout_open and (poll_fds[0].revents & (std.posix.POLL.IN | std.posix.POLL.HUP)) != 0) {
+                const n = stdout_file.read(&read_buf) catch |err| switch (err) {
+                    error.WouldBlock => 0,
+                    else => return err,
+                };
+                if (n == 0) {
+                    stdout_open = false;
+                } else {
+                    try stdout.appendSlice(allocator, read_buf[0..n]);
+                    if (stdout.items.len > MAX_OUTPUT_BYTES) return error.StdoutStreamTooLong;
+                }
+            }
+
+            if (stderr_open and (poll_fds[1].revents & (std.posix.POLL.IN | std.posix.POLL.HUP)) != 0) {
+                const n = stderr_file.read(&read_buf) catch |err| switch (err) {
+                    error.WouldBlock => 0,
+                    else => return err,
+                };
+                if (n == 0) {
+                    stderr_open = false;
+                } else {
+                    try stderr.appendSlice(allocator, read_buf[0..n]);
+                    if (stderr.items.len > MAX_OUTPUT_BYTES) return error.StderrStreamTooLong;
+                }
+            }
+        }
 
         if (!timed_out and hasTimeoutExpired(start_ns, timeout_secs)) {
             try terminateChildHard(child);
@@ -88,12 +132,9 @@ fn collectChildOutputWithTimeout(
     return timed_out;
 }
 
-fn terminateChildHard(child: *std.process.Child) !void {
+fn terminateChildHard(child: *std_compat.process.Child) !void {
     if (comptime builtin.os.tag == .windows) {
-        _ = child.killWindows(1) catch |err| switch (err) {
-            error.AlreadyTerminated => return,
-            else => return err,
-        };
+        _ = child.kill() catch return;
         return;
     }
     if (comptime builtin.os.tag == .wasi) return error.UnsupportedOperation;
@@ -139,7 +180,7 @@ pub fn run(
     model: ?[]const u8,
     timeout_secs: u64,
 ) !AgentRunResult {
-    const exe_path = try std.fs.selfExePathAlloc(allocator);
+    const exe_path = try std_compat.fs.selfExePathAlloc(allocator);
     defer allocator.free(exe_path);
 
     var exec_path = preferExecPath(exe_path);
@@ -151,7 +192,7 @@ pub fn run(
     var argv: std.ArrayListUnmanaged([]const u8) = .empty;
     defer argv.deinit(allocator);
 
-    var child: std.process.Child = undefined;
+    var child: std_compat.process.Child = undefined;
     spawn_loop: while (true) {
         argv.clearRetainingCapacity();
         try argv.append(allocator, exec_path);
@@ -163,7 +204,7 @@ pub fn run(
         try argv.append(allocator, "-m");
         try argv.append(allocator, prompt);
 
-        child = std.process.Child.init(argv.items, allocator);
+        child = std_compat.process.Child.init(argv.items, allocator);
         child.stdin_behavior = .Ignore;
         child.stdout_behavior = .Pipe;
         child.stderr_behavior = .Pipe;
@@ -212,7 +253,7 @@ pub fn run(
         _ = child.wait() catch {};
     }
 
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = std_compat.time.nanoTimestamp();
 
     var stdout: std.ArrayList(u8) = .empty;
     defer stdout.deinit(allocator);
@@ -230,7 +271,7 @@ pub fn run(
 
     const term = try child.wait();
     const success = !timed_out and switch (term) {
-        .Exited => |code| code == 0,
+        .exited => |code| code == 0,
         else => false,
     };
     const output = try buildAgentOutput(allocator, stdout.items, stderr.items, timeout_secs, timed_out);
@@ -239,13 +280,11 @@ pub fn run(
 
 // ── Tests ──────────────────────────────────────────────────────────
 
-const platform = @import("platform.zig");
-
 test "collectChildOutputWithTimeout disables timeout when set to zero" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
-    var child = std.process.Child.init(&.{ platform.getShell(), platform.getShellFlag(), "echo ready" }, allocator);
+    var child = std_compat.process.Child.init(&.{ platform.getShell(), platform.getShellFlag(), "echo ready" }, allocator);
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
@@ -266,13 +305,13 @@ test "collectChildOutputWithTimeout disables timeout when set to zero" {
         &stdout,
         &stderr,
         0,
-        std.time.nanoTimestamp(),
+        std_compat.time.nanoTimestamp(),
     );
     const term = try child.wait();
 
     try std.testing.expect(!timed_out);
     switch (term) {
-        .Exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
+        .exited => |code| try std.testing.expectEqual(@as(u8, 0), code),
         else => try std.testing.expect(false),
     }
     try std.testing.expect(std.mem.indexOf(u8, stdout.items, "ready") != null);
@@ -282,7 +321,7 @@ test "collectChildOutputWithTimeout kills process after deadline" {
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
-    var child = std.process.Child.init(&.{ platform.getShell(), platform.getShellFlag(), "sleep 2; echo never" }, allocator);
+    var child = std_compat.process.Child.init(&.{ platform.getShell(), platform.getShellFlag(), "sleep 2; echo never" }, allocator);
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Pipe;
     child.stderr_behavior = .Pipe;
@@ -303,13 +342,13 @@ test "collectChildOutputWithTimeout kills process after deadline" {
         &stdout,
         &stderr,
         1,
-        std.time.nanoTimestamp(),
+        std_compat.time.nanoTimestamp(),
     );
     const term = try child.wait();
 
     try std.testing.expect(timed_out);
     const completed_ok = switch (term) {
-        .Exited => |code| code == 0,
+        .exited => |code| code == 0,
         else => false,
     };
     try std.testing.expect(!completed_ok);

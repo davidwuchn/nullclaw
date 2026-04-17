@@ -10,7 +10,7 @@
 
 ## 前置要求
 
-- 如果走源码构建：必须使用 **Zig 0.15.2**。
+- 如果走源码构建：必须使用 **Zig 0.16.0**。
 - Git（源码安装需要）。
 
 检查 Zig 版本：
@@ -19,7 +19,7 @@
 zig version
 ```
 
-输出必须是 `0.15.2`。
+输出必须是 `0.16.0`。
 
 ## 方式一：使用二进制文件
 ### Homebrew（macOS/Linux推荐）
@@ -32,12 +32,12 @@ nullclaw --help
 
 ### 命令行（CMD）(Windows)
 
-直接将下载的nullclaw二进制文件（.exe)在命令行中作为命令执行即可，
+从发布页下载 Windows `.zip` 压缩包并解压后，即可直接在命令行中运行其中的 `nullclaw.exe`。
 
 比如检查nullclaw版本号的命令如下：
 
 ```cmd
-x:\path\nullclaw-xxx version
+x:\path\nullclaw.exe --version
 ```
 
 ## 方式二：官方容器镜像（Docker / Podman）
@@ -93,6 +93,10 @@ docker run --rm -it \
 ```bash
 docker compose --profile agent run --rm agent onboard --interactive
 ```
+
+在官方容器流程里，workspace 提示直接回车即可保留挂载卷里的默认路径：
+
+- 工作区：`/nullclaw-data/workspace`
 
 交互式 agent 会话：
 
@@ -154,7 +158,7 @@ zig build -Doptimize=ReleaseSmall
 
 说明：
 
-- 必须使用 **Zig 0.15.2**
+- 必须使用 **Zig 0.16.0**
 - 如果 `zig build` 一开始就失败，先确认 Zig 版本
 - Termux 原生构建使用当前环境的 native target，通常不需要手动传 `-Dtarget`
 - 在 Android / Termux 上，建议先跑前台命令（如 `agent`、`gateway`），确认没问题后再考虑后台托管
@@ -203,12 +207,12 @@ if (-not ($user_path -split ";" | Where-Object { $_ -eq $bin })) {
 $env:Path = "$env:Path;$bin"
 ```
 
-### 直接使用下载的二进制文件（Windows,Powershell)
-可将下载的nullclaw二进制文件（.exe)改名为nullclaw.exe，再以管理员权限在Powershell中执行如下命令，将该文件所在的路径加入到windows系统变量PATH中：
+### 直接使用下载的二进制文件（Windows, Powershell)
+从发布页下载 Windows `.zip` 压缩包并解压后，可在管理员权限的 Powershell 中执行如下命令，将 `nullclaw.exe` 所在目录加入 Windows 的 `PATH` 环境变量：
 
 ```Powershell 
 $old = [Environment]::GetEnvironmentVariable("Path", "Machine")
-$new = "$old;x:\nullclaw二进制文件所在目录"
+$new = "$old;x:\path\to\nullclaw"
 [Environment]::SetEnvironmentVariable("Path", $new, "Machine")
 ```
 

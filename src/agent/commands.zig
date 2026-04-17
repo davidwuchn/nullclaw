@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const builtin = @import("builtin");
 const providers = @import("../providers/root.zig");
 const Tool = @import("../tools/root.zig").Tool;
@@ -8,8 +9,11 @@ const subagent_mod = @import("../subagent.zig");
 const memory_mod = @import("../memory/root.zig");
 const config_types = @import("../config_types.zig");
 const config_module = @import("../config.zig");
+const config_paths = @import("../config_paths.zig");
 const capabilities_mod = @import("../capabilities.zig");
 const config_mutator = @import("../config_mutator.zig");
+const interaction_choices = @import("../interactions/choices.zig");
+const onboard = @import("../onboard.zig");
 const context_tokens = @import("context_tokens.zig");
 const max_tokens_resolver = @import("max_tokens.zig");
 const control_plane = @import("../control_plane.zig");
@@ -17,6 +21,7 @@ const model_refs = @import("../model_refs.zig");
 const provider_names = @import("../provider_names.zig");
 const version = @import("../version.zig");
 const command_summary = @import("../command_summary.zig");
+const util = @import("../util.zig");
 const log = std.log.scoped(.agent);
 
 const SlashCommand = control_plane.SlashCommand;
@@ -25,6 +30,8 @@ const isSlashName = control_plane.isSlashName;
 
 pub const BARE_SESSION_RESET_PROMPT =
     "A new session was started via /new or /reset. Execute your Session Startup sequence now - read the required files before responding to the user. Then greet the user in your configured persona, if one is provided. Be yourself - use your defined voice, mannerisms, and mood. Keep it to 1-3 sentences and ask what they want to do. If the runtime model differs from default_model in the system prompt, mention the default model. Do not mention internal steps, files, tools, or reasoning.";
+
+const MODEL_MENU_PAGE_SIZE: usize = 10;
 
 pub fn bareSessionResetPrompt(message: []const u8) ?[]const u8 {
     const cmd = parseSlashCommand(message) orelse return null;
@@ -202,6 +209,355 @@ fn parsePositiveUsize(raw: []const u8) ?usize {
     return n;
 }
 
+fn interactiveModelMenuChannel(session_id: ?[]const u8, context_channel: ?[]const u8) ?[]const u8 {
+    if (context_channel) |channel| {
+        if (provider_names.providerNamesMatchIgnoreCase(channel, "telegram")) return "telegram";
+        if (provider_names.providerNamesMatchIgnoreCase(channel, "discord")) return "discord";
+        if (provider_names.providerNamesMatchIgnoreCase(channel, "slack")) return "slack";
+        if (provider_names.providerNamesMatchIgnoreCase(channel, "lark")) return "lark";
+    }
+    const sid = session_id orelse return null;
+
+    if (std.mem.startsWith(u8, sid, "agent:")) {
+        const after_agent = sid["agent:".len..];
+        const agent_sep = std.mem.indexOfScalar(u8, after_agent, ':') orelse return null;
+        const routed = after_agent[agent_sep + 1 ..];
+        if (std.mem.startsWith(u8, routed, "telegram:")) return "telegram";
+        if (std.mem.startsWith(u8, routed, "discord:")) return "discord";
+        if (std.mem.startsWith(u8, routed, "slack:")) return "slack";
+        if (std.mem.startsWith(u8, routed, "lark:")) return "lark";
+    }
+
+    if (std.mem.startsWith(u8, sid, "telegram:")) return "telegram";
+    if (std.mem.startsWith(u8, sid, "discord:")) return "discord";
+    if (std.mem.startsWith(u8, sid, "slack:")) return "slack";
+    if (std.mem.startsWith(u8, sid, "lark:")) return "lark";
+    return null;
+}
+
+fn modelMenuChoiceLabel(allocator: std.mem.Allocator, model_id: []const u8, is_current: bool) ![]u8 {
+    const prefix = if (is_current) "* " else "";
+    const max_model_len = interaction_choices.MAX_LABEL_LEN - prefix.len;
+    const visible_model = if (model_id.len <= max_model_len) model_id else model_id[0..max_model_len];
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix, visible_model });
+}
+
+fn freeOwnedStringSlice(allocator: std.mem.Allocator, items: [][]const u8) void {
+    for (items) |item| allocator.free(item);
+    allocator.free(items);
+}
+
+fn providerMenuChoiceLabel(allocator: std.mem.Allocator, provider_name: []const u8, is_current: bool) ![]u8 {
+    const prefix = if (is_current) "* " else "";
+    const max_provider_len = interaction_choices.MAX_LABEL_LEN - prefix.len;
+    const visible_provider = if (provider_name.len <= max_provider_len) provider_name else provider_name[0..max_provider_len];
+    return std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix, visible_provider });
+}
+
+fn appendUniqueOwnedString(
+    allocator: std.mem.Allocator,
+    items: *std.ArrayListUnmanaged([]const u8),
+    value: []const u8,
+) !void {
+    for (items.items) |existing| {
+        if (provider_names.providerNamesMatchIgnoreCase(existing, value)) return;
+    }
+    try items.append(allocator, try allocator.dupe(u8, value));
+}
+
+fn collectInteractiveProviderNames(self: anytype, allocator: std.mem.Allocator) ![][]const u8 {
+    var items: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer freeOwnedStringSlice(allocator, items.items);
+
+    if (@hasField(@TypeOf(self.*), "default_provider") and self.default_provider.len > 0) {
+        try appendUniqueOwnedString(allocator, &items, self.default_provider);
+    }
+    if (@hasField(@TypeOf(self.*), "configured_providers")) {
+        for (self.configured_providers) |entry| {
+            if (entry.name.len == 0) continue;
+            try appendUniqueOwnedString(allocator, &items, entry.name);
+        }
+    }
+    return try items.toOwnedSlice(allocator);
+}
+
+fn renderInteractiveProviderMenuFromProviders(
+    allocator: std.mem.Allocator,
+    current_provider: []const u8,
+    current_model: []const u8,
+    page_number: usize,
+    providers_list: []const []const u8,
+) !?[]u8 {
+    if (providers_list.len == 0) return null;
+
+    const total_pages = @max(@as(usize, 1), std.math.divCeil(usize, providers_list.len, MODEL_MENU_PAGE_SIZE) catch 1);
+    const clamped_page = @min(@max(page_number, 1), total_pages);
+    const start = (clamped_page - 1) * MODEL_MENU_PAGE_SIZE;
+    const end = @min(start + MODEL_MENU_PAGE_SIZE, providers_list.len);
+
+    const ChoiceDraft = struct {
+        id: []const u8,
+        label: []const u8,
+        submit_text: []const u8,
+    };
+
+    var options: [interaction_choices.MAX_OPTIONS]ChoiceDraft = undefined;
+    var option_id_bufs: [interaction_choices.MAX_OPTIONS][interaction_choices.MAX_ID_LEN]u8 = undefined;
+    var submit_text_bufs: [interaction_choices.MAX_OPTIONS][interaction_choices.MAX_SUBMIT_TEXT_LEN]u8 = undefined;
+    var option_count: usize = 0;
+    var labels_to_free: [interaction_choices.MAX_OPTIONS]?[]u8 = .{null} ** interaction_choices.MAX_OPTIONS;
+    defer {
+        for (labels_to_free) |label_opt| {
+            if (label_opt) |label| allocator.free(label);
+        }
+    }
+
+    for (providers_list[start..end], 0..) |provider_name, idx| {
+        const label = try providerMenuChoiceLabel(allocator, provider_name, provider_names.providerNamesMatchIgnoreCase(provider_name, current_provider));
+        labels_to_free[option_count] = label;
+        const submit_text = try std.fmt.bufPrint(&submit_text_bufs[option_count], "/model provider {s}", .{provider_name});
+        const option_id = try std.fmt.bufPrint(&option_id_bufs[option_count], "p{d}", .{idx + 1});
+        options[option_count] = .{
+            .id = option_id,
+            .label = label,
+            .submit_text = submit_text,
+        };
+        option_count += 1;
+    }
+
+    if (clamped_page > 1 and option_count < interaction_choices.MAX_OPTIONS) {
+        const submit_text = try std.fmt.bufPrint(&submit_text_bufs[option_count], "/model page {d}", .{clamped_page - 1});
+        options[option_count] = .{ .id = "prev", .label = "Prev", .submit_text = submit_text };
+        option_count += 1;
+    }
+    if (clamped_page < total_pages and option_count < interaction_choices.MAX_OPTIONS) {
+        const submit_text = try std.fmt.bufPrint(&submit_text_bufs[option_count], "/model page {d}", .{clamped_page + 1});
+        options[option_count] = .{ .id = "next", .label = "Next", .submit_text = submit_text };
+        option_count += 1;
+    }
+
+    if (option_count < interaction_choices.MIN_OPTIONS) return null;
+
+    const visible = try std.fmt.allocPrint(
+        allocator,
+        "Current model: {s}\nProvider: {s}\nChoose a provider (page {d}/{d}).",
+        .{ current_model, current_provider, clamped_page, total_pages },
+    );
+    defer allocator.free(visible);
+
+    return try interaction_choices.renderAssistantChoices(allocator, visible, options[0..option_count]);
+}
+fn renderInteractiveModelMenuFromModels(
+    allocator: std.mem.Allocator,
+    provider: []const u8,
+    current_model: []const u8,
+    page_number: usize,
+    models: []const []const u8,
+) !?[]u8 {
+    if (models.len == 0) return null;
+
+    const total_pages = @max(@as(usize, 1), std.math.divCeil(usize, models.len, MODEL_MENU_PAGE_SIZE) catch 1);
+    const clamped_page = @min(@max(page_number, 1), total_pages);
+    const start = (clamped_page - 1) * MODEL_MENU_PAGE_SIZE;
+    const end = @min(start + MODEL_MENU_PAGE_SIZE, models.len);
+
+    const ChoiceDraft = struct {
+        id: []const u8,
+        label: []const u8,
+        submit_text: []const u8,
+    };
+
+    var options: [interaction_choices.MAX_OPTIONS]ChoiceDraft = undefined;
+    var option_id_bufs: [interaction_choices.MAX_OPTIONS][interaction_choices.MAX_ID_LEN]u8 = undefined;
+    var submit_text_bufs: [interaction_choices.MAX_OPTIONS][interaction_choices.MAX_SUBMIT_TEXT_LEN]u8 = undefined;
+    var option_count: usize = 0;
+    var labels_to_free: [interaction_choices.MAX_OPTIONS]?[]u8 = .{null} ** interaction_choices.MAX_OPTIONS;
+    defer {
+        for (labels_to_free) |label_opt| {
+            if (label_opt) |label| allocator.free(label);
+        }
+    }
+
+    for (models[start..end], 0..) |model_id, idx| {
+        const label = try modelMenuChoiceLabel(allocator, model_id, std.mem.eql(u8, model_id, current_model));
+        labels_to_free[option_count] = label;
+        const submit_text = try std.fmt.bufPrint(&submit_text_bufs[option_count], "/model {s}", .{model_id});
+        const option_id = try std.fmt.bufPrint(&option_id_bufs[option_count], "m{d}", .{idx + 1});
+
+        options[option_count] = .{
+            .id = option_id,
+            .label = label,
+            .submit_text = submit_text,
+        };
+        option_count += 1;
+    }
+
+    if (clamped_page > 1) {
+        const submit_text = try std.fmt.bufPrint(&submit_text_bufs[option_count], "/model provider {s} page {d}", .{ provider, clamped_page - 1 });
+        options[option_count] = .{
+            .id = "prev",
+            .label = "Prev",
+            .submit_text = submit_text,
+        };
+        option_count += 1;
+    }
+    if (clamped_page < total_pages) {
+        const submit_text = try std.fmt.bufPrint(&submit_text_bufs[option_count], "/model provider {s} page {d}", .{ provider, clamped_page + 1 });
+        options[option_count] = .{
+            .id = "next",
+            .label = "Next",
+            .submit_text = submit_text,
+        };
+        option_count += 1;
+    }
+
+    if (option_count < interaction_choices.MIN_OPTIONS) return null;
+
+    const visible = try std.fmt.allocPrint(
+        allocator,
+        "Current model: {s}\nProvider: {s}\nChoose a model (page {d}/{d}).",
+        .{ current_model, provider, clamped_page, total_pages },
+    );
+    defer allocator.free(visible);
+
+    return try interaction_choices.renderAssistantChoices(allocator, visible, options[0..option_count]);
+}
+
+fn renderInteractiveProviderMenu(self: anytype, page_number: usize) !?[]u8 {
+    const context_channel = if (@hasField(@TypeOf(self.*), "conversation_context"))
+        if (self.conversation_context) |ctx| ctx.channel else null
+    else
+        null;
+    if (interactiveModelMenuChannel(if (@hasField(@TypeOf(self.*), "memory_session_id")) self.memory_session_id else null, context_channel) == null) {
+        return null;
+    }
+    if (!@hasField(@TypeOf(self.*), "default_provider")) return null;
+    if (!@hasField(@TypeOf(self.*), "model_name")) return null;
+
+    const providers_list = try collectInteractiveProviderNames(self, self.allocator);
+    defer freeOwnedStringSlice(self.allocator, providers_list);
+
+    if (providers_list.len == 1) {
+        return renderInteractiveModelMenu(self, providers_list[0], page_number);
+    }
+
+    return renderInteractiveProviderMenuFromProviders(
+        self.allocator,
+        self.default_provider,
+        self.model_name,
+        page_number,
+        providers_list,
+    );
+}
+
+fn renderInteractiveModelMenu(self: anytype, provider_name: []const u8, page_number: usize) !?[]u8 {
+    const context_channel = if (@hasField(@TypeOf(self.*), "conversation_context"))
+        if (self.conversation_context) |ctx| ctx.channel else null
+    else
+        null;
+    if (interactiveModelMenuChannel(if (@hasField(@TypeOf(self.*), "memory_session_id")) self.memory_session_id else null, context_channel) == null) {
+        return null;
+    }
+    if (!@hasField(@TypeOf(self.*), "default_provider")) return null;
+    if (!@hasField(@TypeOf(self.*), "model_name")) return null;
+
+    var cfg_opt: ?config_module.Config = if (builtin.is_test) null else config_module.Config.load(self.allocator) catch null;
+    defer if (cfg_opt) |*cfg| cfg.deinit();
+
+    const api_key = if (cfg_opt) |*cfg| cfg.getProviderKey(provider_name) else null;
+    const models = onboard.fetchModels(self.allocator, provider_name, api_key) catch return null;
+    defer freeOwnedStringSlice(self.allocator, models);
+
+    return renderInteractiveModelMenuFromModels(
+        self.allocator,
+        provider_name,
+        self.model_name,
+        page_number,
+        models,
+    );
+}
+
+test "interactiveModelMenuChannel enables supported interactive channels" {
+    try std.testing.expectEqualStrings("telegram", interactiveModelMenuChannel("telegram:chat-1", null).?);
+    try std.testing.expectEqualStrings("telegram", interactiveModelMenuChannel("telegram:main:chat-1", null).?);
+    try std.testing.expectEqualStrings("discord", interactiveModelMenuChannel("discord:dm-1", null).?);
+    try std.testing.expectEqualStrings("slack", interactiveModelMenuChannel("slack:main:C123", null).?);
+    try std.testing.expectEqualStrings("lark", interactiveModelMenuChannel("lark:main:oc_123", null).?);
+    try std.testing.expectEqualStrings("telegram", interactiveModelMenuChannel("agent:main:telegram:group:42", null).?);
+    try std.testing.expectEqualStrings("discord", interactiveModelMenuChannel("agent:main:discord:direct:42", null).?);
+    try std.testing.expectEqualStrings("telegram", interactiveModelMenuChannel("agent:tg-ops:main", "telegram").?);
+    try std.testing.expectEqualStrings("discord", interactiveModelMenuChannel("agent:discord-ops:main", "discord").?);
+    try std.testing.expectEqualStrings("slack", interactiveModelMenuChannel("agent:slack-ops:main", "slack").?);
+    try std.testing.expectEqualStrings("lark", interactiveModelMenuChannel("agent:lark-ops:main", "lark").?);
+    try std.testing.expect(interactiveModelMenuChannel("cli", null) == null);
+    try std.testing.expect(interactiveModelMenuChannel(null, null) == null);
+}
+
+test "renderInteractiveModelMenuFromModels builds first page with next button" {
+    const allocator = std.testing.allocator;
+    const models = [_][]const u8{
+        "alpha",
+        "beta",
+        "gamma",
+        "theta",
+        "zeta",
+        "eta",
+        "iota",
+        "kappa",
+        "lambda",
+        "mu",
+        "nu",
+    };
+
+    const rendered = (try renderInteractiveModelMenuFromModels(allocator, "anthropic", "beta", 1, &models)).?;
+    defer allocator.free(rendered);
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, interaction_choices.START_TAG) != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "page 1/2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"label\":\"* beta\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"submit_text\":\"/model provider anthropic page 2\"") != null);
+}
+
+test "renderInteractiveModelMenuFromModels builds later page with prev button" {
+    const allocator = std.testing.allocator;
+    const models = [_][]const u8{
+        "alpha",
+        "beta",
+        "gamma",
+        "theta",
+        "zeta",
+        "eta",
+        "iota",
+        "kappa",
+        "lambda",
+        "mu",
+        "nu",
+    };
+
+    const rendered = (try renderInteractiveModelMenuFromModels(allocator, "anthropic", "nu", 2, &models)).?;
+    defer allocator.free(rendered);
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "page 2/2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"submit_text\":\"/model provider anthropic page 1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"submit_text\":\"/model nu\"") != null);
+}
+
+test "renderInteractiveProviderMenuFromProviders builds provider page with next button" {
+    const allocator = std.testing.allocator;
+    const providers_list = [_][]const u8{
+        "anthropic", "openai",   "openrouter", "moonshot-intl", "groq",
+        "mistral",   "deepseek", "vertex",     "gemini",        "ollama",
+        "qwen",
+    };
+
+    const rendered = (try renderInteractiveProviderMenuFromProviders(allocator, "openrouter", "claude-sonnet-4-6", 1, &providers_list)).?;
+    defer allocator.free(rendered);
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Choose a provider (page 1/2)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"label\":\"* openrouter\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"submit_text\":\"/model provider anthropic\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\"submit_text\":\"/model page 2\"") != null);
+}
 fn isInternalMemoryEntryKeyOrContent(key: []const u8, content: []const u8) bool {
     return memory_mod.isInternalMemoryEntryKeyOrContent(key, content);
 }
@@ -390,9 +746,9 @@ fn primaryModelProviderObjectJson(
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
 
-    var model_obj = std.json.ObjectMap.init(arena.allocator());
-    try model_obj.put("provider", .{ .string = provider });
-    try model_obj.put("primary", .{ .string = model });
+    var model_obj: std.json.ObjectMap = .empty;
+    try model_obj.put(arena.allocator(), "provider", .{ .string = provider });
+    try model_obj.put(arena.allocator(), "primary", .{ .string = model });
     return try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = model_obj }, .{});
 }
 
@@ -1965,7 +2321,8 @@ fn resetRuntimeCommandState(self: anytype) void {
 fn formatStatus(self: anytype) ![]const u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(self.allocator);
-    const w = out.writer(self.allocator);
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+    const w = &out_writer.writer;
 
     const show_emojis = if (@hasField(@TypeOf(self.*), "status_show_emojis")) self.status_show_emojis else true;
     const title_prefix = if (show_emojis) "🌊 " else "";
@@ -2043,6 +2400,7 @@ fn formatStatus(self: anytype) ![]const u8 {
             );
         }
     }
+    out = out_writer.toArrayList();
     return try out.toOwnedSlice(self.allocator);
 }
 
@@ -2087,7 +2445,8 @@ fn handleExecCommand(self: anytype, arg: []const u8) ![]const u8 {
     if (arg.len == 0 or std.ascii.eqlIgnoreCase(arg, "status")) {
         var out: std.ArrayListUnmanaged(u8) = .empty;
         errdefer out.deinit(self.allocator);
-        const w = out.writer(self.allocator);
+        var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+        const w = &out_writer.writer;
         try w.print(
             "Exec: host={s} security={s} ask={s}",
             .{ self.exec_host.toSlice(), self.exec_security.toSlice(), self.exec_ask.toSlice() },
@@ -2095,6 +2454,7 @@ fn handleExecCommand(self: anytype, arg: []const u8) ![]const u8 {
         if (self.exec_node_id) |id| {
             try w.print(" node={s}", .{id});
         }
+        out = out_writer.toArrayList();
         return try out.toOwnedSlice(self.allocator);
     }
 
@@ -2125,7 +2485,8 @@ fn handleExecCommand(self: anytype, arg: []const u8) ![]const u8 {
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(self.allocator);
-    const w = out.writer(self.allocator);
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+    const w = &out_writer.writer;
     try w.print(
         "Exec set: host={s} security={s} ask={s}",
         .{ self.exec_host.toSlice(), self.exec_security.toSlice(), self.exec_ask.toSlice() },
@@ -2133,6 +2494,7 @@ fn handleExecCommand(self: anytype, arg: []const u8) ![]const u8 {
     if (self.exec_node_id) |id| {
         try w.print(" node={s}", .{id});
     }
+    out = out_writer.toArrayList();
     return try out.toOwnedSlice(self.allocator);
 }
 
@@ -2305,11 +2667,13 @@ fn handleAllowlistCommand(self: anytype, arg: []const u8) ![]const u8 {
     if (self.policy) |pol| {
         var out: std.ArrayListUnmanaged(u8) = .empty;
         errdefer out.deinit(self.allocator);
-        const w = out.writer(self.allocator);
+        var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+        const w = &out_writer.writer;
         try w.writeAll("Allowlisted commands:\n");
         for (pol.allowed_commands) |cmd| {
             try w.print("  - {s}\n", .{cmd});
         }
+        out = out_writer.toArrayList();
         return try out.toOwnedSlice(self.allocator);
     }
     return try self.allocator.dupe(u8, "No runtime allowlist policy attached.");
@@ -2355,17 +2719,17 @@ fn handleContextCommand(self: anytype, arg: []const u8) ![]const u8 {
 fn handleExportSessionCommand(self: anytype, arg: []const u8) ![]const u8 {
     const raw_path = firstToken(arg);
     const path = if (raw_path.len == 0)
-        try std.fmt.allocPrint(self.allocator, "{s}/session-{d}.md", .{ self.workspace_dir, std.time.timestamp() })
-    else if (std.fs.path.isAbsolute(raw_path))
+        try std.fmt.allocPrint(self.allocator, "{s}/session-{d}.md", .{ self.workspace_dir, std_compat.time.timestamp() })
+    else if (std_compat.fs.path.isAbsolute(raw_path))
         try self.allocator.dupe(u8, raw_path)
     else
         try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.workspace_dir, raw_path });
     defer self.allocator.free(path);
 
-    const file = if (std.fs.path.isAbsolute(path))
-        try std.fs.createFileAbsolute(path, .{ .truncate = true, .read = false })
+    const file = if (std_compat.fs.path.isAbsolute(path))
+        try std_compat.fs.createFileAbsolute(path, .{ .truncate = true, .read = false })
     else
-        try std.fs.cwd().createFile(path, .{ .truncate = true, .read = false });
+        try std_compat.fs.cwd().createFile(path, .{ .truncate = true, .read = false });
     defer file.close();
     var out_buf: [4096]u8 = undefined;
     var bw = file.writer(&out_buf);
@@ -2537,8 +2901,8 @@ fn runShellCommand(self: anytype, command: []const u8, skip_approval_gate: bool)
     defer arena_impl.deinit();
     const arena = arena_impl.allocator();
 
-    var args = std.json.ObjectMap.init(arena);
-    try args.put("command", .{ .string = command });
+    var args: std.json.ObjectMap = .empty;
+    try args.put(arena, "command", .{ .string = command });
 
     const result = shell_tool.execute(arena, args) catch |err| {
         return try std.fmt.allocPrint(self.allocator, "Bash failed: {s}", .{@errorName(err)});
@@ -2638,7 +3002,8 @@ fn formatSubagentList(self: anytype, include_details: bool) ![]const u8 {
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(self.allocator);
-    const w = out.writer(self.allocator);
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+    const w = &out_writer.writer;
 
     manager.mutex.lock();
     defer manager.mutex.unlock();
@@ -2669,10 +3034,12 @@ fn formatSubagentList(self: anytype, include_details: bool) ![]const u8 {
 
     if (visible_count == 0) {
         try w.writeAll("No subagents tracked in this session.");
+        out = out_writer.toArrayList();
         return try out.toOwnedSlice(self.allocator);
     }
 
     try w.print("Totals: running={d}, completed={d}, failed={d}", .{ running, completed, failed });
+    out = out_writer.toArrayList();
     return try out.toOwnedSlice(self.allocator);
 }
 
@@ -2922,7 +3289,8 @@ fn handleTellCommand(self: anytype, arg: []const u8) ![]const u8 {
 fn handlePollCommand(self: anytype) ![]const u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(self.allocator);
-    const w = out.writer(self.allocator);
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+    const w = &out_writer.writer;
 
     var wrote_any = false;
     if (self.pending_exec_command) |cmd| {
@@ -2961,6 +3329,7 @@ fn handlePollCommand(self: anytype) ![]const u8 {
     if (!wrote_any) {
         return try self.allocator.dupe(u8, "No pending approvals or background tasks.");
     }
+    out = out_writer.toArrayList();
     return try out.toOwnedSlice(self.allocator);
 }
 
@@ -3180,8 +3549,8 @@ fn loadHotReloadConfig(backing_allocator: std.mem.Allocator) !config_module.Conf
     const allocator = arena_ptr.allocator();
 
     const config_path = try config_mutator.defaultConfigPath(allocator);
-    const config_dir = std.fs.path.dirname(config_path) orelse return error.InvalidPath;
-    const default_workspace_dir = try std.fs.path.join(allocator, &.{ config_dir, "workspace" });
+    const config_dir = std_compat.fs.path.dirname(config_path) orelse return error.InvalidPath;
+    const default_workspace_dir = try config_paths.defaultWorkspaceDirFromConfigDir(allocator, config_dir);
 
     var cfg = config_module.Config{
         .workspace_dir = default_workspace_dir,
@@ -3190,7 +3559,7 @@ fn loadHotReloadConfig(backing_allocator: std.mem.Allocator) !config_module.Conf
         .arena = arena_ptr,
     };
 
-    if (std.fs.openFileAbsolute(config_path, .{})) |file| {
+    if (std_compat.fs.openFileAbsolute(config_path, .{})) |file| {
         defer file.close();
         const content = try file.readToEndAlloc(allocator, 1024 * 64);
         try cfg.parseJson(content);
@@ -3204,10 +3573,10 @@ fn loadHotReloadConfig(backing_allocator: std.mem.Allocator) !config_module.Conf
     }
 
     if (cfg.channels.nostr) |ns| {
-        ns.config_dir = std.fs.path.dirname(config_path) orelse ".";
+        ns.config_dir = std_compat.fs.path.dirname(config_path) orelse ".";
     }
     {
-        const dir = std.fs.path.dirname(config_path) orelse ".";
+        const dir = std_compat.fs.path.dirname(config_path) orelse ".";
         const teams_mut = @constCast(cfg.channels.teams);
         for (teams_mut) |*tc| {
             tc.config_dir = dir;
@@ -3229,9 +3598,9 @@ fn hotReloadValueJson(
         if (config_module.shouldSerializeDefaultModelProviderField(cfg.default_provider)) {
             var arena = std.heap.ArenaAllocator.init(allocator);
             defer arena.deinit();
-            var model_obj = std.json.ObjectMap.init(arena.allocator());
-            try model_obj.put("provider", .{ .string = cfg.default_provider });
-            try model_obj.put("primary", .{ .string = model });
+            var model_obj: std.json.ObjectMap = .empty;
+            try model_obj.put(arena.allocator(), "provider", .{ .string = cfg.default_provider });
+            try model_obj.put(arena.allocator(), "primary", .{ .string = model });
             return try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = model_obj }, .{});
         }
 
@@ -3636,7 +4005,8 @@ fn handleSkillCommand(self: anytype, arg: []const u8) ![]const u8 {
         }
         var out: std.ArrayListUnmanaged(u8) = .empty;
         errdefer out.deinit(self.allocator);
-        const w = out.writer(self.allocator);
+        var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+        const w = &out_writer.writer;
         try w.writeAll("Available skills:\n");
         for (skills) |skill| {
             try w.print("  - {s}", .{skill.name});
@@ -3644,6 +4014,7 @@ fn handleSkillCommand(self: anytype, arg: []const u8) ![]const u8 {
             if (!skill.available) try w.print(" (unavailable: {s})", .{skill.missing_deps});
             try w.writeAll("\n");
         }
+        out = out_writer.toArrayList();
         return try out.toOwnedSlice(self.allocator);
     }
 
@@ -3723,11 +4094,17 @@ pub fn composeFinalReply(
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(self.allocator);
-    const w = out.writer(self.allocator);
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+    const w = &out_writer.writer;
 
     if (show_reasoning) {
         try w.writeAll("Reasoning:\n");
-        try w.writeAll(reasoning_content.?);
+        var lines = std.mem.splitScalar(u8, reasoning_content.?, '\n');
+        while (lines.next()) |line| {
+            try w.writeAll("> ");
+            try w.writeAll(line);
+            try w.writeAll("\n");
+        }
         try w.writeAll("\n\n");
     }
     try w.writeAll(base_text);
@@ -3745,6 +4122,7 @@ pub fn composeFinalReply(
         ),
     }
 
+    out = out_writer.toArrayList();
     return try out.toOwnedSlice(self.allocator);
 }
 
@@ -3789,10 +4167,43 @@ pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
         .status => return try formatStatus(self),
         .whoami => return try formatWhoAmI(self),
         .model => {
+            const first = firstToken(cmd.arg);
+            if (std.ascii.eqlIgnoreCase(first, "page")) {
+                const page_raw = std.mem.trim(u8, splitFirstToken(cmd.arg).tail, " \t");
+                const page_number = parsePositiveUsize(page_raw) orelse 1;
+                if (try renderInteractiveProviderMenu(self, page_number)) |menu| {
+                    return menu;
+                }
+                return try self.formatModelStatus();
+            }
+            if (std.ascii.eqlIgnoreCase(first, "provider")) {
+                const provider_tail = splitFirstToken(cmd.arg).tail;
+                const provider_name = firstToken(provider_tail);
+                if (provider_name.len == 0) {
+                    if (try renderInteractiveProviderMenu(self, 1)) |menu| {
+                        return menu;
+                    }
+                    return try self.formatModelStatus();
+                }
+
+                const remainder = splitFirstToken(provider_tail).tail;
+                const page_number = if (std.ascii.eqlIgnoreCase(firstToken(remainder), "page"))
+                    parsePositiveUsize(std.mem.trim(u8, splitFirstToken(remainder).tail, " \t")) orelse 1
+                else
+                    1;
+
+                if (try renderInteractiveModelMenu(self, provider_name, page_number)) |menu| {
+                    return menu;
+                }
+                return try std.fmt.allocPrint(self.allocator, "No models available for provider: {s}", .{provider_name});
+            }
             if (cmd.arg.len == 0 or
                 std.ascii.eqlIgnoreCase(cmd.arg, "list") or
                 std.ascii.eqlIgnoreCase(cmd.arg, "status"))
             {
+                if (try renderInteractiveProviderMenu(self, 1)) |menu| {
+                    return menu;
+                }
                 return try self.formatModelStatus();
             }
             if (std.ascii.eqlIgnoreCase(cmd.arg, "auto")) {
@@ -3818,6 +4229,9 @@ pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
                     "Automatic model routing enabled. Reverted to the configured default model: {s}",
                     .{self.model_name},
                 );
+            }
+            if (splitPrimaryModelRefForSelf(self, cmd.arg)) |parsed| {
+                try setDefaultProvider(self, parsed.provider);
             }
             try setModelName(self, cmd.arg);
             if (@hasField(@TypeOf(self.*), "model_pinned_by_user")) {
@@ -3919,7 +4333,8 @@ fn handleMemoryCommand(self: anytype, arg: []const u8) ![]const u8 {
         const report = mem_rt.diagnose();
         var out: std.ArrayListUnmanaged(u8) = .empty;
         errdefer out.deinit(self.allocator);
-        const w = out.writer(self.allocator);
+        var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+        const w = &out_writer.writer;
         try w.print("Memory resolved config:\n", .{});
         try w.print("  backend: {s}\n", .{r.primary_backend});
         try w.print("  retrieval: {s}\n", .{r.retrieval_mode});
@@ -3940,6 +4355,7 @@ fn handleMemoryCommand(self: anytype, arg: []const u8) ![]const u8 {
         } else {
             try w.print("  outbox_pending: n/a\n", .{});
         }
+        out = out_writer.toArrayList();
         return try out.toOwnedSlice(self.allocator);
     }
 
@@ -4006,7 +4422,8 @@ fn handleMemoryCommand(self: anytype, arg: []const u8) ![]const u8 {
 
         var out: std.ArrayListUnmanaged(u8) = .empty;
         errdefer out.deinit(self.allocator);
-        const w = out.writer(self.allocator);
+        var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+        const w = &out_writer.writer;
         try w.print("Search results: {d}\n", .{results.len});
         for (results, 0..) |c, idx| {
             try w.print("  {d}. {s} [{s}] score={d:.4}", .{ idx + 1, c.key, c.category.toString(), c.final_score });
@@ -4016,10 +4433,10 @@ fn handleMemoryCommand(self: anytype, arg: []const u8) ![]const u8 {
                 try w.print(" vector_score=n/a", .{});
             }
             try w.print(" source={s}\n", .{c.source});
-            const preview_len = @min(@as(usize, 140), c.snippet.len);
-            const preview = c.snippet[0..preview_len];
-            try w.print("     {s}{s}\n", .{ preview, if (c.snippet.len > preview_len) "..." else "" });
+            const preview = util.previewUtf8(c.snippet, 140);
+            try w.print("     {s}{s}\n", .{ preview.slice, if (preview.truncated) "..." else "" });
         }
+        out = out_writer.toArrayList();
         return try out.toOwnedSlice(self.allocator);
     }
 
@@ -4064,18 +4481,19 @@ fn handleMemoryCommand(self: anytype, arg: []const u8) ![]const u8 {
         const shown = @min(limit, filtered_total);
         var out: std.ArrayListUnmanaged(u8) = .empty;
         errdefer out.deinit(self.allocator);
-        const w = out.writer(self.allocator);
+        var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+        const w = &out_writer.writer;
         try w.print("Memory entries: showing {d}/{d}\n", .{ shown, filtered_total });
         var written: usize = 0;
         for (entries) |e| {
             if (!include_internal and isInternalMemoryEntryKeyOrContent(e.key, e.content)) continue;
             if (written >= shown) break;
-            const preview_len = @min(@as(usize, 120), e.content.len);
-            const preview = e.content[0..preview_len];
+            const preview = util.previewUtf8(e.content, 120);
             try w.print("  {d}. {s} [{s}] {s}\n", .{ written + 1, e.key, e.category.toString(), e.timestamp });
-            try w.print("     {s}{s}\n", .{ preview, if (e.content.len > preview_len) "..." else "" });
+            try w.print("     {s}{s}\n", .{ preview.slice, if (preview.truncated) "..." else "" });
             written += 1;
         }
+        out = out_writer.toArrayList();
         return try out.toOwnedSlice(self.allocator);
     }
 

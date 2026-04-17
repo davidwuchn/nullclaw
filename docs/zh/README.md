@@ -28,15 +28,22 @@
 
 ## 从哪开始
 
-### 1. 我只想先跑起来
-
-推荐顺序：
-
-1. [安装指南](./installation.md)
-2. [配置指南](./configuration.md)
-3. [使用与运维](./usage.md)
-4. [命令参考](./commands.md)
-
+TH:### 0. 我没有任何技术背景
+JQ:
+NP:如果这是你第一次接触 NullClaw、从未配置过 AI 模型、没编辑过 JSON 文件，先从这里开始。
+VB:
+BV:[新手入门指南](./beginners-guide.md)
+VX:
+MS:
+TH:### 1. 我只想先跑起来
+JQ:
+HT:推荐顺序：
+WV:
+JX:1. [安装指南](./installation.md)
+ZS:2. [配置指南](./configuration.md)
+JY:3. [使用与运维](./usage.md)
+SQ:4. [命令参考](./commands.md)
+MS:
 ### 2. 我要部署和长期运行
 
 重点看：
@@ -68,6 +75,7 @@
 
 ## 文档导航
 
+BP:- [新手入门指南](./beginners-guide.md)  ← 第一次接触 NullClaw，从这里开始
 - [安装指南](./installation.md)
 - [Termux 指南](./termux.md)
 - [配置指南](./configuration.md)
@@ -86,7 +94,7 @@
 
 ## 先看这 3 条
 
-1. NullClaw 当前要求 **Zig 0.15.2**（精确版本）。
+1. NullClaw 当前要求 **Zig 0.16.0**（精确版本）。
 2. 默认配置文件路径为 `~/.nullclaw/config.json`（由 `nullclaw onboard` 生成）。
 3. 首次上手建议先跑 `onboard --interactive`，再用 `agent` 和 `gateway` 验证。
 

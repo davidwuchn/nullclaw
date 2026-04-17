@@ -1,4 +1,5 @@
 const std = @import("std");
+const std_compat = @import("compat");
 const agent_routing = @import("agent_routing.zig");
 const config_paths = @import("config_paths.zig");
 const fs_compat = @import("fs_compat.zig");
@@ -179,6 +180,13 @@ fn namedAgentUsesReservedRootId(agent_name: []const u8) bool {
     return std.mem.eql(u8, agent_routing.normalizeId(&agent_buf, agent_name), "main");
 }
 
+fn isKnownProviderName(providers: []const ProviderEntry, name: []const u8) bool {
+    for (providers) |p| {
+        if (provider_names.providerNamesMatch(p.name, name)) return true;
+    }
+    return false;
+}
+
 // ── Top-level Config ────────────────────────────────────────────
 
 pub const Config = struct {
@@ -285,7 +293,7 @@ pub const Config = struct {
     }
 
     fn backfillExternalChannelStateDirs(self: *Config) !void {
-        const config_dir = std.fs.path.dirname(self.config_path) orelse ".";
+        const config_dir = std_compat.fs.path.dirname(self.config_path) orelse ".";
         const external_mut = @constCast(self.channels.external);
         for (external_mut) |*external_cfg| {
             const runtime_segment = try sanitizeStatePathSegment(self.allocator, external_cfg.runtime_name);
@@ -293,7 +301,7 @@ pub const Config = struct {
             const account_segment = try sanitizeStatePathSegment(self.allocator, external_cfg.account_id);
             defer self.allocator.free(account_segment);
 
-            external_cfg.state_dir = try std.fs.path.join(self.allocator, &.{
+            external_cfg.state_dir = try std_compat.fs.path.join(self.allocator, &.{
                 config_dir,
                 "state",
                 "external",
@@ -305,11 +313,11 @@ pub const Config = struct {
 
     pub fn backfillRuntimeDerivedFields(self: *Config) !void {
         if (self.channels.nostr) |ns| {
-            ns.config_dir = std.fs.path.dirname(self.config_path) orelse ".";
+            ns.config_dir = std_compat.fs.path.dirname(self.config_path) orelse ".";
         }
 
         {
-            const dir = std.fs.path.dirname(self.config_path) orelse ".";
+            const dir = std_compat.fs.path.dirname(self.config_path) orelse ".";
             const teams_mut = @constCast(self.channels.teams);
             for (teams_mut) |*tc| {
                 tc.config_dir = dir;
@@ -334,6 +342,15 @@ pub const Config = struct {
             if (provider_names.providerNamesMatch(e.name, name)) return e.native_tools;
         }
         return true;
+    }
+
+    /// Look up extra body parameters for a provider.
+    /// Returns null if provider is not in the list or has no extra params.
+    pub fn getProviderExtraBodyParams(self: *const Config, name: []const u8) ?[]const u8 {
+        for (self.providers) |e| {
+            if (provider_names.providerNamesMatch(e.name, name)) return e.extra_body_params;
+        }
+        return null;
     }
 
     fn isReservedRuntimeChannelName(runtime_name: []const u8) bool {
@@ -425,7 +442,7 @@ pub const Config = struct {
             else => return err,
         };
         const config_path = try config_paths.pathFromConfigDir(allocator, config_dir, "config.json");
-        const default_workspace_dir = try std.fs.path.join(allocator, &.{ config_dir, "workspace" });
+        const default_workspace_dir = try config_paths.defaultWorkspaceDirFromConfigDir(allocator, config_dir);
 
         var cfg = Config{
             .workspace_dir = default_workspace_dir, // temporarily set to default
@@ -435,7 +452,7 @@ pub const Config = struct {
         };
 
         // Try to read existing config file
-        if (std.fs.openFileAbsolute(config_path, .{})) |file| {
+        if (std_compat.fs.openFileAbsolute(config_path, .{})) |file| {
             defer file.close();
             const content = try file.readToEndAlloc(allocator, 1024 * 64);
             cfg.parseJson(content) catch |err| switch (err) {
@@ -496,7 +513,7 @@ pub const Config = struct {
     }
 
     fn secretStore(self: *const Config) secrets.SecretStore {
-        const config_dir = std.fs.path.dirname(self.config_path) orelse ".";
+        const config_dir = std_compat.fs.path.dirname(self.config_path) orelse ".";
         return secrets.SecretStore.init(config_dir, self.secrets.encrypt);
     }
 
@@ -554,6 +571,42 @@ pub const Config = struct {
         try writeIndentedMultilineJson(w, pretty, continuation_indent);
     }
 
+    /// Convenience: write `<indent>"<key>": <pretty-value><trailing>` in one call.
+    fn writePrettyField(allocator: std.mem.Allocator, w: *std.Io.Writer, indent: []const u8, key: []const u8, value: anytype, trailing: []const u8) !void {
+        try w.writeAll(indent);
+        try w.print("\"{s}\": ", .{key});
+        try writePrettyJsonInline(allocator, w, value, indent);
+        try w.writeAll(trailing);
+    }
+
+    fn writePrettyStringMap(w: *std.Io.Writer, base_indent: []const u8, entries: anytype) !void {
+        try w.writeAll("{");
+        if (entries.len == 0) {
+            try w.writeAll("}");
+            return;
+        }
+
+        try w.writeAll("\n");
+        for (entries, 0..) |entry, i| {
+            if (i > 0) try w.writeAll(",\n");
+            try w.writeAll(base_indent);
+            try w.writeAll("  ");
+            try writeJsonStr(w, entry.key);
+            try w.writeAll(": ");
+            try writeJsonStr(w, entry.value);
+        }
+        try w.writeAll("\n");
+        try w.writeAll(base_indent);
+        try w.writeAll("}");
+    }
+
+    fn writePrettyStringMapField(w: *std.Io.Writer, indent: []const u8, key: []const u8, entries: anytype, trailing: []const u8) !void {
+        try w.writeAll(indent);
+        try w.print("\"{s}\": ", .{key});
+        try writePrettyStringMap(w, indent, entries);
+        try w.writeAll(trailing);
+    }
+
     fn writeChannelAccounts(allocator: std.mem.Allocator, w: *std.Io.Writer, channel_name: []const u8, accounts: anytype) !void {
         try w.print("    \"{s}\": {{\n      \"accounts\": {{", .{channel_name});
         for (accounts, 0..) |account, i| {
@@ -573,44 +626,38 @@ pub const Config = struct {
     }
 
     fn writeExternalTransport(self: *const Config, w: *std.Io.Writer, transport: ExternalChannelConfig.TransportConfig) !void {
-        _ = self;
-        try w.print("{{\"command\": {f}", .{std.json.fmt(transport.command, .{})});
-
+        try w.writeAll("{\n");
+        try writePrettyField(self.allocator, w, "            ", "command", transport.command, "");
         if (transport.args.len > 0) {
-            try w.print(", \"args\": {f}", .{std.json.fmt(transport.args, .{})});
+            try w.writeAll(",\n");
+            try writePrettyField(self.allocator, w, "            ", "args", transport.args, "");
         }
         if (transport.env.len > 0) {
-            try w.print(", \"env\": {{", .{});
-            for (transport.env, 0..) |entry, index| {
-                if (index > 0) try w.print(", ", .{});
-                try w.print("{f}: {f}", .{
-                    std.json.fmt(entry.key, .{}),
-                    std.json.fmt(entry.value, .{}),
-                });
-            }
-            try w.print("}}", .{});
+            try w.writeAll(",\n");
+            try writePrettyStringMapField(w, "            ", "env", transport.env, "");
         }
         if (transport.timeout_ms != 10_000) {
-            try w.print(", \"timeout_ms\": {d}", .{transport.timeout_ms});
+            try w.writeAll(",\n");
+            try writePrettyField(self.allocator, w, "            ", "timeout_ms", transport.timeout_ms, "");
         }
-        try w.print("}}", .{});
+        try w.writeAll("\n          }");
     }
 
     fn writeExternalChannelAccount(self: *const Config, w: *std.Io.Writer, account: ExternalChannelConfig) !void {
-        try w.print("{{\"runtime_name\": {f}, \"transport\": ", .{
-            std.json.fmt(account.runtime_name, .{}),
-        });
+        try w.writeAll("{\n");
+        try writePrettyField(self.allocator, w, "          ", "runtime_name", account.runtime_name, ",\n");
+        try w.writeAll("          \"transport\": ");
         try self.writeExternalTransport(w, account.transport);
-
-        try w.print(", \"config\": ", .{});
+        try w.writeAll(",\n");
+        try w.writeAll("          \"config\": ");
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, account.plugin_config_json, .{}) catch {
-            try w.print("{f}", .{std.json.fmt(account.plugin_config_json, .{})});
-            try w.print("}}", .{});
+            try writePrettyJsonInline(self.allocator, w, account.plugin_config_json, "          ");
+            try w.writeAll("\n        }");
             return;
         };
         defer parsed.deinit();
-        try writePrettyJsonInline(self.allocator, w, parsed.value, "");
-        try w.print("}}", .{});
+        try writePrettyJsonInline(self.allocator, w, parsed.value, "          ");
+        try w.writeAll("\n        }");
     }
 
     fn writeExternalChannelAccounts(self: *const Config, w: *std.Io.Writer, accounts: []const ExternalChannelConfig) !void {
@@ -754,14 +801,9 @@ pub const Config = struct {
         try writeStringArray(w, encrypted_api_keys);
         try w.print(",\n", .{});
 
-        try w.print("    \"model_fallbacks\": [", .{});
-        for (self.reliability.model_fallbacks, 0..) |entry, i| {
-            if (i > 0) try w.print(", ", .{});
-            try w.print("{{\"model\": \"{s}\", \"fallbacks\": ", .{entry.model});
-            try writeStringArray(w, entry.fallbacks);
-            try w.print("}}", .{});
-        }
-        try w.print("]\n", .{});
+        try w.print("    \"model_fallbacks\": ", .{});
+        try writePrettyJsonInline(self.allocator, w, self.reliability.model_fallbacks, "    ");
+        try w.print("\n", .{});
         try w.print("  }},\n", .{});
     }
 
@@ -772,56 +814,69 @@ pub const Config = struct {
 
             var wrote_field = false;
             if (!std.mem.eql(u8, server.transport, McpServerConfig.DEFAULT_TRANSPORT)) {
-                try w.print("\"transport\": {f}", .{std.json.fmt(server.transport, .{})});
+                try w.writeAll("\n");
+                try writePrettyField(self.allocator, w, "      ", "transport", server.transport, "");
                 wrote_field = true;
             }
             if (server.command.len > 0) {
-                if (wrote_field) try w.print(", ", .{});
-                try w.print("\"command\": {f}", .{std.json.fmt(server.command, .{})});
+                if (wrote_field) {
+                    try w.writeAll(",\n");
+                } else {
+                    try w.writeAll("\n");
+                }
+                try writePrettyField(self.allocator, w, "      ", "command", server.command, "");
                 wrote_field = true;
             }
             if (server.url) |url| {
-                if (wrote_field) try w.print(", ", .{});
-                try w.print("\"url\": {f}", .{std.json.fmt(url, .{})});
+                if (wrote_field) {
+                    try w.writeAll(",\n");
+                } else {
+                    try w.writeAll("\n");
+                }
+                try writePrettyField(self.allocator, w, "      ", "url", url, "");
                 wrote_field = true;
             }
             if (server.timeout_ms != 10_000) {
-                if (wrote_field) try w.print(", ", .{});
-                try w.print("\"timeout_ms\": {d}", .{server.timeout_ms});
+                if (wrote_field) {
+                    try w.writeAll(",\n");
+                } else {
+                    try w.writeAll("\n");
+                }
+                try writePrettyField(self.allocator, w, "      ", "timeout_ms", server.timeout_ms, "");
                 wrote_field = true;
             }
             if (server.args.len > 0) {
-                if (wrote_field) try w.print(", ", .{});
-                try w.print("\"args\": {f}", .{std.json.fmt(server.args, .{})});
+                if (wrote_field) {
+                    try w.writeAll(",\n");
+                } else {
+                    try w.writeAll("\n");
+                }
+                try writePrettyField(self.allocator, w, "      ", "args", server.args, "");
                 wrote_field = true;
             }
             if (server.env.len > 0) {
-                if (wrote_field) try w.print(", ", .{});
-                try w.print("\"env\": {{", .{});
-                for (server.env, 0..) |entry, env_i| {
-                    if (env_i > 0) try w.print(", ", .{});
-                    try w.print("{f}: {f}", .{
-                        std.json.fmt(entry.key, .{}),
-                        std.json.fmt(entry.value, .{}),
-                    });
+                if (wrote_field) {
+                    try w.writeAll(",\n");
+                } else {
+                    try w.writeAll("\n");
                 }
-                try w.print("}}", .{});
+                try writePrettyStringMapField(w, "      ", "env", server.env, "");
                 wrote_field = true;
             }
             if (server.headers.len > 0) {
-                if (wrote_field) try w.print(", ", .{});
-                try w.print("\"headers\": {{", .{});
-                for (server.headers, 0..) |entry, hdr_i| {
-                    if (hdr_i > 0) try w.print(", ", .{});
-                    try w.print("{f}: {f}", .{
-                        std.json.fmt(entry.key, .{}),
-                        std.json.fmt(entry.value, .{}),
-                    });
+                if (wrote_field) {
+                    try w.writeAll(",\n");
+                } else {
+                    try w.writeAll("\n");
                 }
-                try w.print("}}", .{});
+                try writePrettyStringMapField(w, "      ", "headers", server.headers, "");
                 wrote_field = true;
             }
-            try w.print("}}", .{});
+            if (wrote_field) {
+                try w.writeAll("\n    }");
+            } else {
+                try w.writeAll("}");
+            }
             if (i + 1 < self.mcp_servers.len) try w.print(",", .{});
             try w.print("\n", .{});
         }
@@ -831,17 +886,17 @@ pub const Config = struct {
     /// Apply NULLCLAW_* environment variable overrides.
     pub fn applyEnvOverrides(self: *Config) void {
         // Provider
-        if (std.process.getEnvVarOwned(self.allocator, "NULLCLAW_PROVIDER")) |prov| {
+        if (std_compat.process.getEnvVarOwned(self.allocator, "NULLCLAW_PROVIDER")) |prov| {
             self.default_provider = prov;
         } else |_| {}
 
         // Model
-        if (std.process.getEnvVarOwned(self.allocator, "NULLCLAW_MODEL")) |model| {
+        if (std_compat.process.getEnvVarOwned(self.allocator, "NULLCLAW_MODEL")) |model| {
             self.default_model = model;
         } else |_| {}
 
         // Temperature
-        if (std.process.getEnvVarOwned(self.allocator, "NULLCLAW_TEMPERATURE")) |temp_str| {
+        if (std_compat.process.getEnvVarOwned(self.allocator, "NULLCLAW_TEMPERATURE")) |temp_str| {
             defer self.allocator.free(temp_str);
             if (std.fmt.parseFloat(f64, temp_str)) |temp| {
                 if (temp >= 0.0 and temp <= 2.0) {
@@ -851,7 +906,7 @@ pub const Config = struct {
         } else |_| {}
 
         // Gateway port
-        if (std.process.getEnvVarOwned(self.allocator, "NULLCLAW_GATEWAY_PORT")) |port_str| {
+        if (std_compat.process.getEnvVarOwned(self.allocator, "NULLCLAW_GATEWAY_PORT")) |port_str| {
             defer self.allocator.free(port_str);
             if (std.fmt.parseInt(u16, port_str, 10)) |port| {
                 self.gateway.port = port;
@@ -859,17 +914,17 @@ pub const Config = struct {
         } else |_| {}
 
         // Gateway host
-        if (std.process.getEnvVarOwned(self.allocator, "NULLCLAW_GATEWAY_HOST")) |host| {
+        if (std_compat.process.getEnvVarOwned(self.allocator, "NULLCLAW_GATEWAY_HOST")) |host| {
             self.gateway.host = host;
         } else |_| {}
 
         // Workspace
-        if (std.process.getEnvVarOwned(self.allocator, "NULLCLAW_WORKSPACE")) |ws| {
+        if (std_compat.process.getEnvVarOwned(self.allocator, "NULLCLAW_WORKSPACE")) |ws| {
             self.workspace_dir = ws;
         } else |_| {}
 
         // Allow public bind
-        if (std.process.getEnvVarOwned(self.allocator, "NULLCLAW_ALLOW_PUBLIC_BIND")) |val| {
+        if (std_compat.process.getEnvVarOwned(self.allocator, "NULLCLAW_ALLOW_PUBLIC_BIND")) |val| {
             defer self.allocator.free(val);
             self.gateway.allow_public_bind = std.mem.eql(u8, val, "1") or std.mem.eql(u8, val, "true");
         } else |_| {}
@@ -877,16 +932,16 @@ pub const Config = struct {
 
     /// Save config as JSON to the config_path.
     pub fn save(self: *const Config) !void {
-        const dir = std.fs.path.dirname(self.config_path) orelse return error.InvalidConfigPath;
+        const dir = std_compat.fs.path.dirname(self.config_path) orelse return error.InvalidConfigPath;
         const store = self.secretStore();
 
         // Ensure parent directory exists
-        std.fs.makeDirAbsolute(dir) catch |err| switch (err) {
+        std_compat.fs.makeDirAbsolute(dir) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
         };
 
-        const file = try std.fs.createFileAbsolute(self.config_path, .{});
+        const file = try std_compat.fs.createFileAbsolute(self.config_path, .{});
         defer file.close();
 
         var buf: [8192]u8 = undefined;
@@ -966,6 +1021,19 @@ pub const Config = struct {
                         has_field = true;
                     }
                 }
+                if (comptime @hasField(ProviderEntry, "extra_body_params")) {
+                    if (entry.extra_body_params) |extra_body_params| {
+                        if (has_field) try w.print(", ", .{});
+                        try w.print("\"extra_body_params\": ", .{});
+                        if (std.json.parseFromSlice(std.json.Value, self.allocator, extra_body_params, .{})) |parsed_extra| {
+                            defer parsed_extra.deinit();
+                            try writePrettyJsonInline(self.allocator, w, parsed_extra.value, "");
+                        } else |_| {
+                            try writePrettyJsonInline(self.allocator, w, extra_body_params, "");
+                        }
+                        has_field = true;
+                    }
+                }
                 try w.print("}}", .{});
                 if (i + 1 < self.providers.len) try w.print(",", .{});
                 try w.print("\n", .{});
@@ -999,13 +1067,25 @@ pub const Config = struct {
                     if (route.api_key) |value| self.allocator.free(value);
                 }
             }
-            try w.print("  \"model_routes\": {f},\n", .{std.json.fmt(serialized_routes, .{})});
+            try writePrettyField(self.allocator, w, "  ", "model_routes", serialized_routes, ",\n");
         }
 
         // agents.defaults (model + heartbeat) + agents.list
         {
             const has_model = self.default_model != null;
-            const has_heartbeat = self.heartbeat.enabled or self.heartbeat.interval_minutes != 30;
+            const has_heartbeat = self.heartbeat.enabled or
+                self.heartbeat.interval_minutes != 30 or
+                self.heartbeat.prompt != null or
+                self.heartbeat.model != null or
+                self.heartbeat.timeout_secs != 120 or
+                self.heartbeat.delivery_mode != null or
+                self.heartbeat.delivery_channel != null or
+                self.heartbeat.delivery_to != null or
+                self.heartbeat.delivery_account_id != null or
+                self.heartbeat.delivery_peer_kind != null or
+                self.heartbeat.delivery_peer_id != null or
+                self.heartbeat.delivery_thread_id != null or
+                !self.heartbeat.delivery_best_effort;
             const has_agents = self.agents.len > 0;
             if (has_model or has_heartbeat or has_agents) {
                 try w.print("  \"agents\": {{\n", .{});
@@ -1043,6 +1123,48 @@ pub const Config = struct {
                     if (!self.heartbeat.enabled) {
                         try w.print(", \"enabled\": false", .{});
                     }
+                    if (self.heartbeat.prompt) |prompt| {
+                        try w.print(", \"prompt\": ", .{});
+                        try writeJsonStr(w, prompt);
+                    }
+                    if (self.heartbeat.model) |model| {
+                        try w.print(", \"model\": ", .{});
+                        try writeJsonStr(w, model);
+                    }
+                    if (self.heartbeat.timeout_secs != 120) {
+                        try w.print(", \"timeout_secs\": {d}", .{self.heartbeat.timeout_secs});
+                    }
+                    if (self.heartbeat.delivery_mode) |delivery_mode| {
+                        try w.print(", \"delivery_mode\": ", .{});
+                        try writeJsonStr(w, delivery_mode);
+                    }
+                    if (self.heartbeat.delivery_channel) |delivery_channel| {
+                        try w.print(", \"delivery_channel\": ", .{});
+                        try writeJsonStr(w, delivery_channel);
+                    }
+                    if (self.heartbeat.delivery_to) |delivery_to| {
+                        try w.print(", \"delivery_to\": ", .{});
+                        try writeJsonStr(w, delivery_to);
+                    }
+                    if (self.heartbeat.delivery_account_id) |delivery_account_id| {
+                        try w.print(", \"delivery_account_id\": ", .{});
+                        try writeJsonStr(w, delivery_account_id);
+                    }
+                    if (self.heartbeat.delivery_peer_kind) |delivery_peer_kind| {
+                        try w.print(", \"delivery_peer_kind\": ", .{});
+                        try writeJsonStr(w, delivery_peer_kind);
+                    }
+                    if (self.heartbeat.delivery_peer_id) |delivery_peer_id| {
+                        try w.print(", \"delivery_peer_id\": ", .{});
+                        try writeJsonStr(w, delivery_peer_id);
+                    }
+                    if (self.heartbeat.delivery_thread_id) |delivery_thread_id| {
+                        try w.print(", \"delivery_thread_id\": ", .{});
+                        try writeJsonStr(w, delivery_thread_id);
+                    }
+                    if (!self.heartbeat.delivery_best_effort) {
+                        try w.print(", \"delivery_best_effort\": false", .{});
+                    }
                     try w.print("}}\n", .{});
                 }
                 if (has_model or has_heartbeat) {
@@ -1079,7 +1201,7 @@ pub const Config = struct {
                     if (wrote_agent_field) {
                         try w.print(",\n", .{});
                     }
-                    try w.print("    \"list\": {f}\n", .{std.json.fmt(serialized_agents, .{})});
+                    try writePrettyField(self.allocator, w, "    ", "list", serialized_agents, "\n");
                 } else {
                     try w.print("\n", .{});
                 }
@@ -1088,7 +1210,7 @@ pub const Config = struct {
         }
 
         if (self.agent_bindings.len > 0) {
-            try w.print("  \"bindings\": {f},\n", .{std.json.fmt(self.agent_bindings, .{})});
+            try writePrettyField(self.allocator, w, "  ", "bindings", self.agent_bindings, ",\n");
         }
         if (self.mcp_servers.len > 0) {
             try self.writeMcpServersSection(w);
@@ -1135,8 +1257,8 @@ pub const Config = struct {
         }
         try w.print("\n  }},\n", .{});
 
-        try w.print("  \"autonomy\": {f},\n", .{std.json.fmt(self.autonomy, .{})});
-        try w.print("  \"runtime\": {f},\n", .{std.json.fmt(.{
+        try writePrettyField(self.allocator, w, "  ", "autonomy", self.autonomy, ",\n");
+        try writePrettyField(self.allocator, w, "  ", "runtime", .{
             .kind = self.runtime.kind,
             .docker = .{
                 .image = self.runtime.docker.image,
@@ -1145,13 +1267,13 @@ pub const Config = struct {
                 .read_only_rootfs = self.runtime.docker.read_only_rootfs,
                 .mount_workspace = self.runtime.docker.mount_workspace,
             },
-        }, .{})});
+        }, ",\n");
 
         // Reliability
         try self.writeReliabilitySection(w, &store);
-        try w.print("  \"scheduler\": {f},\n", .{std.json.fmt(self.scheduler, .{})});
-        try w.print("  \"messages\": {f},\n", .{std.json.fmt(self.messages, .{})});
-        try w.print("  \"agent\": {f},\n", .{std.json.fmt(.{
+        try writePrettyField(self.allocator, w, "  ", "scheduler", self.scheduler, ",\n");
+        try writePrettyField(self.allocator, w, "  ", "messages", self.messages, ",\n");
+        try writePrettyField(self.allocator, w, "  ", "agent", .{
             .compact_context = self.agent.compact_context,
             .max_tool_iterations = self.agent.max_tool_iterations,
             .max_history_messages = self.agent.max_history_messages,
@@ -1166,7 +1288,7 @@ pub const Config = struct {
             .timezone = self.agent.timezone,
             .vision_disabled_models = self.agent.vision_disabled_models,
             .auto_disable_vision_on_error = self.agent.auto_disable_vision_on_error,
-        }, .{})});
+        }, ",\n");
 
         // Channels
         try self.writeChannelsSection(w);
@@ -1184,10 +1306,10 @@ pub const Config = struct {
         defer if (serialized_memory.api.api_key.ptr != self.memory.api.api_key.ptr) {
             self.allocator.free(serialized_memory.api.api_key);
         };
-        try w.print("  \"memory\": {f},\n", .{std.json.fmt(serialized_memory, .{})});
-        try w.print("  \"gateway\": {f},\n", .{std.json.fmt(self.gateway, .{})});
-        try w.print("  \"a2a\": {f},\n", .{std.json.fmt(self.a2a, .{})});
-        try w.print("  \"tunnel\": {f},\n", .{std.json.fmt(self.tunnel, .{})});
+        try writePrettyField(self.allocator, w, "  ", "memory", serialized_memory, ",\n");
+        try writePrettyField(self.allocator, w, "  ", "gateway", self.gateway, ",\n");
+        try writePrettyField(self.allocator, w, "  ", "a2a", self.a2a, ",\n");
+        try writePrettyField(self.allocator, w, "  ", "tunnel", self.tunnel, ",\n");
         var serialized_composio = self.composio;
         if (serialized_composio.api_key) |api_key| {
             serialized_composio.api_key = try store.encryptSecret(self.allocator, api_key);
@@ -1197,9 +1319,9 @@ pub const Config = struct {
                 self.allocator.free(api_key);
             }
         };
-        try w.print("  \"composio\": {f},\n", .{std.json.fmt(serialized_composio, .{})});
-        try w.print("  \"secrets\": {f},\n", .{std.json.fmt(self.secrets, .{})});
-        try w.print("  \"browser\": {f},\n", .{std.json.fmt(.{
+        try writePrettyField(self.allocator, w, "  ", "composio", serialized_composio, ",\n");
+        try writePrettyField(self.allocator, w, "  ", "secrets", self.secrets, ",\n");
+        try writePrettyField(self.allocator, w, "  ", "browser", .{
             .enabled = self.browser.enabled,
             .session_name = self.browser.session_name,
             .backend = self.browser.backend,
@@ -1207,8 +1329,8 @@ pub const Config = struct {
             .native_webdriver_url = self.browser.native_webdriver_url,
             .native_chrome_path = self.browser.native_chrome_path,
             .allowed_domains = self.browser.allowed_domains,
-        }, .{})});
-        try w.print("  \"http_request\": {f},\n", .{std.json.fmt(.{
+        }, ",\n");
+        try writePrettyField(self.allocator, w, "  ", "http_request", .{
             .enabled = self.http_request.enabled,
             .max_response_size = self.http_request.max_response_size,
             .timeout_secs = self.http_request.timeout_secs,
@@ -1217,10 +1339,10 @@ pub const Config = struct {
             .search_base_url = self.http_request.search_base_url,
             .search_provider = self.http_request.search_provider,
             .search_fallback_providers = self.http_request.search_fallback_providers,
-        }, .{})});
-        try w.print("  \"identity\": {f},\n", .{std.json.fmt(self.identity, .{})});
-        try w.print("  \"cost\": {f},\n", .{std.json.fmt(self.cost, .{})});
-        try w.print("  \"security\": {f},\n", .{std.json.fmt(.{
+        }, ",\n");
+        try writePrettyField(self.allocator, w, "  ", "identity", self.identity, ",\n");
+        try writePrettyField(self.allocator, w, "  ", "cost", self.cost, ",\n");
+        try writePrettyField(self.allocator, w, "  ", "security", .{
             .sandbox = .{
                 .enabled = self.security.sandbox.enabled,
                 .backend = self.security.sandbox.backend,
@@ -1237,11 +1359,11 @@ pub const Config = struct {
                 .max_size_mb = self.security.audit.max_size_mb,
                 .sign_events = self.security.audit.sign_events,
             },
-        }, .{})});
-        try w.print("  \"peripherals\": {f},\n", .{std.json.fmt(.{
+        }, ",\n");
+        try writePrettyField(self.allocator, w, "  ", "peripherals", .{
             .enabled = self.peripherals.enabled,
             .datasheet_dir = self.peripherals.datasheet_dir,
-        }, .{})});
+        }, ",\n");
 
         // Tools (with media.audio)
         try w.print("  \"tools\": {{\n", .{});
@@ -1249,7 +1371,8 @@ pub const Config = struct {
         try w.print("    \"shell_max_output_bytes\": {d},\n", .{self.tools.shell_max_output_bytes});
         try w.print("    \"max_file_size_bytes\": {d},\n", .{self.tools.max_file_size_bytes});
         try w.print("    \"web_fetch_max_chars\": {d},\n", .{self.tools.web_fetch_max_chars});
-        try w.print("    \"path_env_vars\": {f}", .{std.json.fmt(self.tools.path_env_vars, .{})});
+        try w.print("    \"path_env_vars\": ", .{});
+        try writePrettyJsonInline(self.allocator, w, self.tools.path_env_vars, "    ");
         // tools.media.audio
         {
             const am = self.audio_media;
@@ -1272,8 +1395,8 @@ pub const Config = struct {
         }
         try w.print("\n  }},\n", .{});
 
-        try w.print("  \"hardware\": {f},\n", .{std.json.fmt(self.hardware, .{})});
-        try w.print("  \"session\": {f}\n", .{std.json.fmt(self.session, .{})});
+        try writePrettyField(self.allocator, w, "  ", "hardware", self.hardware, ",\n");
+        try writePrettyField(self.allocator, w, "  ", "session", self.session, "\n");
 
         try w.print("}}\n", .{});
         try w.flush();
@@ -1293,10 +1416,12 @@ pub const Config = struct {
         InvalidBackoffMs,
         InvalidHttpProxyUrl,
         InvalidApiErrorMaxChars,
+        InvalidOtelEndpoint,
         InvalidHttpSearchBaseUrl,
         InvalidHttpSearchProvider,
         InvalidHttpSearchFallbackProvider,
         InvalidProviderApiMode,
+        InvalidProviderBaseUrl,
         InvalidMcpTransport,
         MissingMcpCommand,
         MissingMcpHttpUrl,
@@ -1321,6 +1446,7 @@ pub const Config = struct {
         InvalidWebRelayUiTokenTtl,
         InvalidWebRelayTokenTtl,
         ReservedMainAgentName,
+        UnknownAgentProvider,
         InsecurePlaintextSecrets,
     };
 
@@ -1334,6 +1460,17 @@ pub const Config = struct {
         if (self.default_provider.len == 0) {
             return ValidationError.InvalidDefaultModelPrimary;
         }
+        if (std.mem.startsWith(u8, self.default_provider, "custom:")) {
+            const custom_target = self.default_provider["custom:".len..];
+            if (!config_types.ProviderEntry.isValidBaseUrl(custom_target)) {
+                return ValidationError.InvalidProviderBaseUrl;
+            }
+        } else if (std.mem.startsWith(u8, self.default_provider, "anthropic-custom:")) {
+            const custom_target = self.default_provider["anthropic-custom:".len..];
+            if (!config_types.ProviderEntry.isValidBaseUrl(custom_target)) {
+                return ValidationError.InvalidProviderBaseUrl;
+            }
+        }
         if (self.default_model == null) {
             return ValidationError.NoDefaultModel;
         }
@@ -1346,6 +1483,9 @@ pub const Config = struct {
         for (self.agents) |agent_cfg| {
             if (namedAgentUsesReservedRootId(agent_cfg.name)) {
                 return ValidationError.ReservedMainAgentName;
+            }
+            if (self.providers.len > 0 and !isKnownProviderName(self.providers, agent_cfg.provider)) {
+                return ValidationError.UnknownAgentProvider;
             }
         }
         if (self.gateway.port == 0) {
@@ -1370,6 +1510,11 @@ pub const Config = struct {
                 return ValidationError.InvalidApiErrorMaxChars;
             }
         }
+        if (self.diagnostics.otel_endpoint) |otel_endpoint| {
+            if (!config_types.DiagnosticsConfig.isValidOtelEndpoint(otel_endpoint)) {
+                return ValidationError.InvalidOtelEndpoint;
+            }
+        }
         if (self.http_request.search_base_url) |search_base_url| {
             if (!config_types.HttpRequestConfig.isValidSearchBaseUrl(search_base_url)) {
                 return ValidationError.InvalidHttpSearchBaseUrl;
@@ -1381,6 +1526,22 @@ pub const Config = struct {
         for (self.providers) |provider| {
             if (provider.api_mode == .invalid) {
                 return ValidationError.InvalidProviderApiMode;
+            }
+            if (provider.base_url) |base_url| {
+                if (!config_types.ProviderEntry.isValidBaseUrl(base_url)) {
+                    return ValidationError.InvalidProviderBaseUrl;
+                }
+            }
+            if (std.mem.startsWith(u8, provider.name, "custom:")) {
+                const custom_target = provider.name["custom:".len..];
+                if (!config_types.ProviderEntry.isValidBaseUrl(custom_target)) {
+                    return ValidationError.InvalidProviderBaseUrl;
+                }
+            } else if (std.mem.startsWith(u8, provider.name, "anthropic-custom:")) {
+                const custom_target = provider.name["anthropic-custom:".len..];
+                if (!config_types.ProviderEntry.isValidBaseUrl(custom_target)) {
+                    return ValidationError.InvalidProviderBaseUrl;
+                }
             }
         }
         for (self.http_request.search_fallback_providers) |provider| {
@@ -1508,10 +1669,12 @@ pub const Config = struct {
             ValidationError.InvalidBackoffMs => std.debug.print("Config error: provider_backoff_ms must be <= 600000.\n", .{}),
             ValidationError.InvalidHttpProxyUrl => std.debug.print("Config error: http_request.proxy must be a non-empty http://, https://, or socks5:// URL.\n", .{}),
             ValidationError.InvalidApiErrorMaxChars => std.debug.print("Config error: diagnostics.api_error_max_chars must be in [200, 10000].\n", .{}),
+            ValidationError.InvalidOtelEndpoint => std.debug.print("Config error: diagnostics.otel.endpoint/otel_endpoint must be an absolute https:// URL (or http:// for localhost/private or container-local collector hosts).\n", .{}),
             ValidationError.InvalidHttpSearchBaseUrl => std.debug.print("Config error: http_request.search_base_url must be https://host[/search] or local http://host[:port][/search] (no query/fragment).\n", .{}),
             ValidationError.InvalidHttpSearchProvider => std.debug.print("Config error: http_request.search_provider must be one of: auto, searxng, duckduckgo(ddg), brave, firecrawl, tavily, perplexity, exa, jina.\n", .{}),
             ValidationError.InvalidHttpSearchFallbackProvider => std.debug.print("Config error: http_request.search_fallback_providers entries must be valid providers and cannot be 'auto'.\n", .{}),
             ValidationError.InvalidProviderApiMode => std.debug.print("Config error: models.providers.<name>.api_mode must be 'chat_completions' or 'responses'.\n", .{}),
+            ValidationError.InvalidProviderBaseUrl => std.debug.print("Config error: models.providers.<name>.base_url and custom: provider URLs must be absolute http(s) URLs with no query/fragment; plain HTTP is allowed only for localhost/private hosts.\n", .{}),
             ValidationError.InvalidMcpTransport => std.debug.print("Config error: mcp_servers.<name>.transport must be 'stdio' or 'http'.\n", .{}),
             ValidationError.MissingMcpCommand => std.debug.print("Config error: mcp_servers.<name>.command is required when transport='stdio'.\n", .{}),
             ValidationError.MissingMcpHttpUrl => std.debug.print("Config error: mcp_servers.<name>.url is required when transport='http'.\n", .{}),
@@ -1536,6 +1699,7 @@ pub const Config = struct {
             ValidationError.InvalidWebRelayUiTokenTtl => std.debug.print("Config error: channels.web.accounts.<id>.relay_ui_token_ttl_secs must be in [300, 2592000].\n", .{}),
             ValidationError.InvalidWebRelayTokenTtl => std.debug.print("Config error: channels.web.accounts.<id>.relay_token_ttl_secs must be in [3600, 31536000].\n", .{}),
             ValidationError.ReservedMainAgentName => std.debug.print("Config error: agents.list names must not normalize to 'main' because that id is reserved for the root agent.\n", .{}),
+            ValidationError.UnknownAgentProvider => std.debug.print("Config error: agents.list[].provider must match a known provider name.\n", .{}),
         }
     }
 
@@ -1561,13 +1725,13 @@ pub const Config = struct {
     }
 
     pub fn resolveAgentWorkspacePath(self: *const Config, allocator: std.mem.Allocator, workspace_path: []const u8) ![]const u8 {
-        if (std.fs.path.isAbsolute(workspace_path)) {
+        if (std_compat.fs.path.isAbsolute(workspace_path)) {
             return try allocator.dupe(u8, workspace_path);
         }
         const normalized_workspace_path = try normalizeHostPathSeparators(allocator, workspace_path);
         defer allocator.free(normalized_workspace_path);
-        const home_dir = std.fs.path.dirname(self.config_path) orelse self.workspace_dir;
-        return try std.fs.path.join(allocator, &.{ home_dir, normalized_workspace_path });
+        const home_dir = std_compat.fs.path.dirname(self.config_path) orelse self.workspace_dir;
+        return try std_compat.fs.path.join(allocator, &.{ home_dir, normalized_workspace_path });
     }
 
     pub fn resolveAgentWorkspace(self: *const Config, allocator: std.mem.Allocator, agent_name: []const u8) ![]const u8 {
@@ -1610,10 +1774,10 @@ pub const Config = struct {
         };
 
         for (files) |file_spec| {
-            const path = try std.fs.path.join(allocator, &.{ workspace_path, file_spec.name });
+            const path = try std_compat.fs.path.join(allocator, &.{ workspace_path, file_spec.name });
             defer allocator.free(path);
 
-            const file = std.fs.createFileAbsolute(path, .{ .exclusive = true }) catch |err| switch (err) {
+            const file = std_compat.fs.createFileAbsolute(path, .{ .exclusive = true }) catch |err| switch (err) {
                 error.PathAlreadyExists => continue,
                 else => return err,
             };
@@ -1638,7 +1802,7 @@ fn normalizePathSeparators(allocator: std.mem.Allocator, path: []const u8) ![]co
 pub fn normalizeHostPathSeparators(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     const dup = try allocator.dupe(u8, path);
     for (dup) |*c| {
-        if (c.* == '/' or c.* == '\\') c.* = std.fs.path.sep;
+        if (c.* == '/' or c.* == '\\') c.* = std_compat.fs.path.sep;
     }
     return dup;
 }
@@ -1880,7 +2044,7 @@ test "save includes channels section by default" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
     const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
     defer allocator.free(config_path);
@@ -1892,7 +2056,7 @@ test "save includes channels section by default" {
     };
     try cfg.save();
 
-    const file = try std.fs.openFileAbsolute(config_path, .{});
+    const file = try std_compat.fs.openFileAbsolute(config_path, .{});
     defer file.close();
     const content = try file.readToEndAlloc(allocator, 128 * 1024);
     defer allocator.free(content);
@@ -1905,7 +2069,7 @@ test "save writes configured telegram channel account" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
     const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
     defer allocator.free(config_path);
@@ -1930,7 +2094,7 @@ test "save writes configured telegram channel account" {
     };
     try cfg.save();
 
-    const file = try std.fs.openFileAbsolute(config_path, .{});
+    const file = try std_compat.fs.openFileAbsolute(config_path, .{});
     defer file.close();
     const content = try file.readToEndAlloc(allocator, 128 * 1024);
     defer allocator.free(content);
@@ -1951,7 +2115,7 @@ test "save roundtrip preserves telegram interactive settings" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
     const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
     defer allocator.free(config_path);
@@ -1975,7 +2139,7 @@ test "save roundtrip preserves telegram interactive settings" {
     };
     try cfg.save();
 
-    const file = try std.fs.openFileAbsolute(config_path, .{});
+    const file = try std_compat.fs.openFileAbsolute(config_path, .{});
     defer file.close();
     const content = try file.readToEndAlloc(allocator, 128 * 1024);
     defer allocator.free(content);
@@ -2000,7 +2164,7 @@ test "save roundtrip preserves external channel config" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
     const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
     defer allocator.free(config_path);
@@ -2030,16 +2194,19 @@ test "save roundtrip preserves external channel config" {
     cfg.channels.external = &external_accounts;
     try cfg.save();
 
-    const file = try std.fs.openFileAbsolute(config_path, .{});
+    const file = try std_compat.fs.openFileAbsolute(config_path, .{});
     defer file.close();
     const content = try file.readToEndAlloc(allocator, 128 * 1024);
     defer allocator.free(content);
 
     try std.testing.expect(std.mem.indexOf(u8, content, "\"external\": {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, content, "\"runtime_name\": \"whatsapp_web\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, content, "\"transport\": {") != null);
-    try std.testing.expect(std.mem.indexOf(u8, content, "\"command\": \"nullclaw-plugin-whatsapp-web\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, content, "\"config\": {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "        \"main\": {\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "          \"runtime_name\": \"whatsapp_web\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "          \"transport\": {\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "            \"command\": \"nullclaw-plugin-whatsapp-web\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "            \"env\": {\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "              \"TOKEN\": \"secret\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "          \"config\": {\n") != null);
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -2066,7 +2233,7 @@ test "save roundtrip preserves diagnostics logging flags" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
     const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
     defer allocator.free(config_path);
@@ -2086,7 +2253,7 @@ test "save roundtrip preserves diagnostics logging flags" {
     cfg.diagnostics.token_usage_ledger_max_lines = 2048;
     try cfg.save();
 
-    const file = try std.fs.openFileAbsolute(config_path, .{});
+    const file = try std_compat.fs.openFileAbsolute(config_path, .{});
     defer file.close();
     const content = try file.readToEndAlloc(allocator, 128 * 1024);
     defer allocator.free(content);
@@ -2115,7 +2282,7 @@ test "save roundtrip preserves diagnostics otel headers" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
     const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
     defer allocator.free(config_path);
@@ -2131,12 +2298,12 @@ test "save roundtrip preserves diagnostics otel headers" {
         .allocator = allocator,
     };
     cfg.diagnostics.backend = "otel";
-    cfg.diagnostics.otel_endpoint = "http://127.0.0.1:7710";
+    cfg.diagnostics.otel_endpoint = "https://127.0.0.1:7710";
     cfg.diagnostics.otel_service_name = "nullclaw";
     cfg.diagnostics.otel_headers = &headers;
     try cfg.save();
 
-    const file = try std.fs.openFileAbsolute(config_path, .{});
+    const file = try std_compat.fs.openFileAbsolute(config_path, .{});
     defer file.close();
     const content = try file.readToEndAlloc(allocator, 64 * 1024);
     defer allocator.free(content);
@@ -2150,7 +2317,7 @@ test "save roundtrip preserves diagnostics otel headers" {
     };
     try loaded.parseJson(content);
     try std.testing.expectEqualStrings("otel", loaded.diagnostics.backend);
-    try std.testing.expectEqualStrings("http://127.0.0.1:7710", loaded.diagnostics.otel_endpoint.?);
+    try std.testing.expectEqualStrings("https://127.0.0.1:7710", loaded.diagnostics.otel_endpoint.?);
     try std.testing.expectEqualStrings("nullclaw", loaded.diagnostics.otel_service_name.?);
     try std.testing.expectEqual(@as(usize, 2), loaded.diagnostics.otel_headers.len);
     try std.testing.expectEqualStrings("Authorization", loaded.diagnostics.otel_headers[0].key);
@@ -2164,7 +2331,7 @@ test "save roundtrip preserves reliability settings" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
     const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
     defer allocator.free(config_path);
@@ -2196,10 +2363,14 @@ test "save roundtrip preserves reliability settings" {
     cfg.reliability.model_fallbacks = &model_fallbacks;
     try cfg.save();
 
-    const file = try std.fs.openFileAbsolute(config_path, .{});
+    const file = try std_compat.fs.openFileAbsolute(config_path, .{});
     defer file.close();
     const content = try file.readToEndAlloc(allocator, 128 * 1024);
     defer allocator.free(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, "    \"model_fallbacks\": [\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "        \"model\": \"gpt-5.3-codex\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "        \"fallbacks\": [\n") != null);
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -2285,7 +2456,7 @@ test "save roundtrip preserves extended config sections" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
     const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
     defer allocator.free(config_path);
@@ -2458,7 +2629,7 @@ test "save roundtrip preserves extended config sections" {
 
     try cfg.save();
 
-    const file = try std.fs.openFileAbsolute(config_path, .{});
+    const file = try std_compat.fs.openFileAbsolute(config_path, .{});
     defer file.close();
     const content = try file.readToEndAlloc(allocator, 256 * 1024);
     defer allocator.free(content);
@@ -2531,7 +2702,7 @@ test "save escapes mcp_servers strings safely" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
     const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
     defer allocator.free(config_path);
@@ -2561,10 +2732,17 @@ test "save escapes mcp_servers strings safely" {
 
     try cfg.save();
 
-    const file = try std.fs.openFileAbsolute(config_path, .{});
+    const file = try std_compat.fs.openFileAbsolute(config_path, .{});
     defer file.close();
     const content = try file.readToEndAlloc(allocator, 128 * 1024);
     defer allocator.free(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, "  \"mcp_servers\": {\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "    \"ctx\\\"7\": {\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "      \"command\": \"npx \\\"@scope/pkg\\\"\\nrun\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "      \"args\": [\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "      \"env\": {\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "        \"OPEN\\\"KEY\": \"ab\\\\cd\\\"ef\\nz\"") != null);
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -2585,6 +2763,62 @@ test "save escapes mcp_servers strings safely" {
     try std.testing.expectEqual(@as(usize, 1), loaded.mcp_servers[0].env.len);
     try std.testing.expectEqualStrings("OPEN\"KEY", loaded.mcp_servers[0].env[0].key);
     try std.testing.expectEqualStrings("ab\\cd\"ef\nz", loaded.mcp_servers[0].env[0].value);
+}
+
+test "save outputs pretty-printed nested sections" {
+    // Regression: issue #765 — onboard --interactive generated minified config.json
+    // because nested sections used compact std.json.fmt. Verify indentation is present.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+    defer allocator.free(config_path);
+
+    var cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    cfg.security.sandbox.enabled = true;
+    cfg.security.audit.enabled = true;
+    cfg.agent.compact_context = true;
+    cfg.agent.max_tool_iterations = 42;
+    try cfg.save();
+
+    const file = try std_compat.fs.openFileAbsolute(config_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 256 * 1024);
+    defer allocator.free(content);
+
+    // Top-level keys must be indented at 2 spaces
+    try std.testing.expect(std.mem.indexOf(u8, content, "  \"security\": {\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "  \"agent\": {\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "  \"autonomy\": {\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "  \"gateway\": {\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "  \"memory\": {\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "  \"session\": {\n") != null);
+
+    // Nested keys must be indented at 4 spaces (inside top-level objects)
+    try std.testing.expect(std.mem.indexOf(u8, content, "    \"sandbox\": {\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "      \"enabled\": true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "    \"max_tool_iterations\": 42") != null);
+
+    // Roundtrip: values must survive parse
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var loaded = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = arena.allocator(),
+    };
+    try loaded.parseJson(content);
+    try std.testing.expect(loaded.security.sandbox.enabled orelse false);
+    try std.testing.expect(loaded.security.audit.enabled);
+    try std.testing.expect(loaded.agent.compact_context);
+    try std.testing.expectEqual(@as(u32, 42), loaded.agent.max_tool_iterations);
 }
 
 test "syncFlatFields propagates nested values" {
@@ -2766,6 +3000,51 @@ test "validation rejects remote http_request search base URL over plain http" {
     };
     cfg.http_request.search_base_url = "http://searx.example.com/search";
     try std.testing.expectError(Config.ValidationError.InvalidHttpSearchBaseUrl, cfg.validate());
+}
+
+test "validation accepts local diagnostics otel endpoint over plain http" {
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+    };
+    cfg.diagnostics.otel_endpoint = "http://localhost:4318";
+    try cfg.validate();
+}
+
+test "validation accepts container-local diagnostics otel endpoint over plain http" {
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+    };
+    cfg.diagnostics.otel_endpoint = "http://otel:4318";
+    try cfg.validate();
+
+    cfg.diagnostics.otel_endpoint = "http://host.docker.internal:4318";
+    try cfg.validate();
+
+    cfg.diagnostics.otel_endpoint = "http://host.containers.internal:4318";
+    try cfg.validate();
+}
+
+test "validation rejects remote diagnostics otel endpoint over plain http" {
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+    };
+    // Regression: OTEL config must not silently allow remote plaintext exporters.
+    cfg.diagnostics.otel_endpoint = "http://otel.example.com:4318";
+    try std.testing.expectError(Config.ValidationError.InvalidOtelEndpoint, cfg.validate());
+
+    // Regression: keep the container-runtime exception narrow; dotted internal
+    // domains are not necessarily local collectors.
+    cfg.diagnostics.otel_endpoint = "http://otel.example.internal:4318";
+    try std.testing.expectError(Config.ValidationError.InvalidOtelEndpoint, cfg.validate());
 }
 
 test "validation rejects invalid http_request search provider" {
@@ -3331,7 +3610,7 @@ test "validation rejects relay ttl values outside supported ranges" {
 test "json parse diagnostics section" {
     const allocator = std.testing.allocator;
     const json =
-        \\{"diagnostics": {"backend": "otel", "log_tool_calls": true, "log_message_receipts": true, "log_message_payloads": true, "log_llm_io": true, "token_usage_ledger_enabled": false, "token_usage_ledger_window_hours": 12, "token_usage_ledger_max_bytes": 262144, "token_usage_ledger_max_lines": 4096, "otel": {"endpoint": "http://localhost:4318", "service_name": "yc", "headers": {"Authorization": "Bearer test", "x-nullwatch-source": "nullclaw"}}}}
+        \\{"diagnostics": {"backend": "otel", "log_tool_calls": true, "log_message_receipts": true, "log_message_payloads": true, "log_llm_io": true, "token_usage_ledger_enabled": false, "token_usage_ledger_window_hours": 12, "token_usage_ledger_max_bytes": 262144, "token_usage_ledger_max_lines": 4096, "otel": {"endpoint": "https://localhost:4318", "service_name": "yc", "headers": {"Authorization": "Bearer test", "x-nullwatch-source": "nullclaw"}}}}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
@@ -3344,7 +3623,7 @@ test "json parse diagnostics section" {
     try std.testing.expectEqual(@as(u32, 12), cfg.diagnostics.token_usage_ledger_window_hours);
     try std.testing.expectEqual(@as(u64, 262144), cfg.diagnostics.token_usage_ledger_max_bytes);
     try std.testing.expectEqual(@as(u64, 4096), cfg.diagnostics.token_usage_ledger_max_lines);
-    try std.testing.expectEqualStrings("http://localhost:4318", cfg.diagnostics.otel_endpoint.?);
+    try std.testing.expectEqualStrings("https://localhost:4318", cfg.diagnostics.otel_endpoint.?);
     try std.testing.expectEqualStrings("yc", cfg.diagnostics.otel_service_name.?);
     try std.testing.expectEqual(@as(usize, 2), cfg.diagnostics.otel_headers.len);
     try std.testing.expectEqualStrings("Authorization", cfg.diagnostics.otel_headers[0].key);
@@ -3364,12 +3643,12 @@ test "json parse diagnostics section" {
 test "json parse diagnostics section accepts flat otel fields for compatibility" {
     const allocator = std.testing.allocator;
     const json =
-        \\{"diagnostics": {"backend": "otel", "otel_endpoint": "http://otel:4318", "otel_service_name": "nullclaw", "otel_headers": {"Authorization": "Bearer test"}}}
+        \\{"diagnostics": {"backend": "otel", "otel_endpoint": "https://otel:4318", "otel_service_name": "nullclaw", "otel_headers": {"Authorization": "Bearer test"}}}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
     try std.testing.expectEqualStrings("otel", cfg.diagnostics.backend);
-    try std.testing.expectEqualStrings("http://otel:4318", cfg.diagnostics.otel_endpoint.?);
+    try std.testing.expectEqualStrings("https://otel:4318", cfg.diagnostics.otel_endpoint.?);
     try std.testing.expectEqualStrings("nullclaw", cfg.diagnostics.otel_service_name.?);
     try std.testing.expectEqual(@as(usize, 1), cfg.diagnostics.otel_headers.len);
     try std.testing.expectEqualStrings("Authorization", cfg.diagnostics.otel_headers[0].key);
@@ -3387,12 +3666,12 @@ test "json parse diagnostics section accepts flat otel fields for compatibility"
 test "json parse diagnostics section prefers nested otel fields over flat compatibility aliases" {
     const allocator = std.testing.allocator;
     const json =
-        \\{"diagnostics": {"backend": "otel", "otel_endpoint": "http://flat:4318", "otel_service_name": "flat-service", "otel_headers": {"Authorization": "Bearer flat"}, "otel": {"endpoint": "http://nested:4318", "service_name": "nested-service", "headers": {"Authorization": "Bearer nested"}}}}
+        \\{"diagnostics": {"backend": "otel", "otel_endpoint": "https://flat:4318", "otel_service_name": "flat-service", "otel_headers": {"Authorization": "Bearer flat"}, "otel": {"endpoint": "https://nested:4318", "service_name": "nested-service", "headers": {"Authorization": "Bearer nested"}}}}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
     try std.testing.expectEqualStrings("otel", cfg.diagnostics.backend);
-    try std.testing.expectEqualStrings("http://nested:4318", cfg.diagnostics.otel_endpoint.?);
+    try std.testing.expectEqualStrings("https://nested:4318", cfg.diagnostics.otel_endpoint.?);
     try std.testing.expectEqualStrings("nested-service", cfg.diagnostics.otel_service_name.?);
     try std.testing.expectEqual(@as(usize, 1), cfg.diagnostics.otel_headers.len);
     try std.testing.expectEqualStrings("Authorization", cfg.diagnostics.otel_headers[0].key);
@@ -3533,6 +3812,29 @@ test "json parse security section" {
     allocator.free(cfg.security.audit.log_path);
 }
 
+test "json parse security sandbox backend values" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct {
+        name: []const u8,
+        backend: SandboxBackend,
+    }{
+        .{ .name = "auto", .backend = .auto },
+        .{ .name = "landlock", .backend = .landlock },
+        .{ .name = "firejail", .backend = .firejail },
+        .{ .name = "bubblewrap", .backend = .bubblewrap },
+        .{ .name = "docker", .backend = .docker },
+        .{ .name = "none", .backend = .none },
+    };
+
+    inline for (cases) |case| {
+        var json_buf: [96]u8 = undefined;
+        const json = try std.fmt.bufPrint(&json_buf, "{{\"security\": {{\"sandbox\": {{\"backend\": \"{s}\"}}}}}}", .{case.name});
+        var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+        try cfg.parseJson(json);
+        try std.testing.expectEqual(case.backend, cfg.security.sandbox.backend);
+    }
+}
+
 test "json parse browser section" {
     const allocator = std.testing.allocator;
     const json =
@@ -3614,7 +3916,7 @@ test "save roundtrip preserves tools.path_env_vars" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
     const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
     defer allocator.free(config_path);
@@ -3627,7 +3929,7 @@ test "save roundtrip preserves tools.path_env_vars" {
     cfg.tools.path_env_vars = &.{ "LD_LIBRARY_PATH", "PYTHONHOME" };
     try cfg.save();
 
-    const file = try std.fs.openFileAbsolute(config_path, .{});
+    const file = try std_compat.fs.openFileAbsolute(config_path, .{});
     defer file.close();
     const content = try file.readToEndAlloc(allocator, 64 * 1024);
     defer allocator.free(content);
@@ -3880,11 +4182,11 @@ test "system_prompt absolute file path loads file content" {
     defer tmp.cleanup();
 
     const prompt_content = "You are a helpful coding assistant from file.";
-    try tmp.dir.writeFile(.{ .sub_path = "prompt.md", .data = prompt_content });
+    try @import("compat").fs.Dir.wrap(tmp.dir).writeFile(.{ .sub_path = "prompt.md", .data = prompt_content });
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
-    const prompt_path = try std.fmt.allocPrint(allocator, "{s}{c}prompt.md", .{ base, std.fs.path.sep });
+    const prompt_path = try std.fmt.allocPrint(allocator, "{s}{c}prompt.md", .{ base, std_compat.fs.path.sep });
     defer allocator.free(prompt_path);
     const prompt_path_json = try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .string = prompt_path }, .{});
     defer allocator.free(prompt_path_json);
@@ -3910,9 +4212,9 @@ test "system_prompt missing file falls back to raw string and keeps remaining fi
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
-    const missing_path = try std.fmt.allocPrint(allocator, "{s}{c}missing-prompt.md", .{ base, std.fs.path.sep });
+    const missing_path = try std.fmt.allocPrint(allocator, "{s}{c}missing-prompt.md", .{ base, std_compat.fs.path.sep });
     defer allocator.free(missing_path);
     const missing_path_json = try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .string = missing_path }, .{});
     defer allocator.free(missing_path_json);
@@ -4013,6 +4315,35 @@ test "parse agents.defaults.model.primary custom provider supports versioned pat
     try std.testing.expectEqualStrings("minimaxai/minimax-m2.1", cfg.default_model.?);
 }
 
+test "parse agents.defaults.model.primary matches configured cloudflare custom provider key" {
+    // Regression: issue #721 Cloudflare AI refs append "@cf/..." after a configured custom provider URL.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const json =
+        \\{
+        \\  "models": {
+        \\    "providers": {
+        \\      "custom:https://api.cloudflare.com/client/v4/accounts/xxx/ai/v1": {
+        \\        "base_url": "https://api.cloudflare.com/client/v4/accounts/xxx/ai/v1"
+        \\      }
+        \\    }
+        \\  },
+        \\  "agents": {
+        \\    "defaults": {
+        \\      "model": {
+        \\        "primary": "custom:https://api.cloudflare.com/client/v4/accounts/xxx/ai/v1/@cf/google/gemma-3-12b-it"
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqualStrings("custom:https://api.cloudflare.com/client/v4/accounts/xxx/ai/v1", cfg.default_provider);
+    try std.testing.expectEqualStrings("@cf/google/gemma-3-12b-it", cfg.default_model.?);
+}
+
 test "parse agents.defaults.model supports explicit provider field" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -4071,7 +4402,7 @@ test "save and load roundtrip" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
 
     var cfg = Config{
@@ -4089,7 +4420,7 @@ test "save and load roundtrip" {
     try cfg.save();
 
     // load back by reading and parsing the saved file
-    const file = try std.fs.openFileAbsolute(config_path, .{});
+    const file = try std_compat.fs.openFileAbsolute(config_path, .{});
     defer file.close();
     const content = try file.readToEndAlloc(allocator, 1024 * 64);
 
@@ -4116,7 +4447,7 @@ test "save and load roundtrip preserves non-versioned custom default provider" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
 
     var cfg = Config{
@@ -4129,7 +4460,7 @@ test "save and load roundtrip preserves non-versioned custom default provider" {
 
     try cfg.save();
 
-    const file = try std.fs.openFileAbsolute(config_path, .{});
+    const file = try std_compat.fs.openFileAbsolute(config_path, .{});
     defer file.close();
     const content = try file.readToEndAlloc(allocator, 1024 * 64);
 
@@ -4154,15 +4485,15 @@ test "save preserves file-backed system_prompt path" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
-    const config_path = try std.fmt.allocPrint(allocator, "{s}{c}config.json", .{ base, std.fs.path.sep });
+    const config_path = try std.fmt.allocPrint(allocator, "{s}{c}config.json", .{ base, std_compat.fs.path.sep });
     defer allocator.free(config_path);
-    const prompt_path = try std.fmt.allocPrint(allocator, "{s}{c}prompt.md", .{ base, std.fs.path.sep });
+    const prompt_path = try std.fmt.allocPrint(allocator, "{s}{c}prompt.md", .{ base, std_compat.fs.path.sep });
     defer allocator.free(prompt_path);
     const prompt_content = "Prompt content that must stay in the file.";
 
-    try tmp.dir.writeFile(.{ .sub_path = "prompt.md", .data = prompt_content });
+    try @import("compat").fs.Dir.wrap(tmp.dir).writeFile(.{ .sub_path = "prompt.md", .data = prompt_content });
 
     const prompt_path_json = try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .string = prompt_path }, .{});
     defer allocator.free(prompt_path_json);
@@ -4182,7 +4513,7 @@ test "save preserves file-backed system_prompt path" {
     defer freeNamedAgentSlice(allocator, cfg.agents);
     try cfg.save();
 
-    const file = try std.fs.openFileAbsolute(config_path, .{});
+    const file = try std_compat.fs.openFileAbsolute(config_path, .{});
     defer file.close();
     const raw = try file.readToEndAlloc(allocator, 64 * 1024);
     defer allocator.free(raw);
@@ -4240,6 +4571,41 @@ test "parse agents.list primary model ref without provider field" {
     try std.testing.expectEqualStrings("qwen3.5:cloud", cfg.agents[0].model);
 }
 
+test "parse agents.list primary model ref matches configured cloudflare custom provider key" {
+    // Regression: issue #721 must also preserve Cloudflare-style refs for named agents.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const json =
+        \\{
+        \\  "models": {
+        \\    "providers": {
+        \\      "custom:https://api.cloudflare.com/client/v4/accounts/xxx/ai/v1": {
+        \\        "base_url": "https://api.cloudflare.com/client/v4/accounts/xxx/ai/v1"
+        \\      }
+        \\    }
+        \\  },
+        \\  "agents": {
+        \\    "list": [
+        \\      {
+        \\        "id": "coder",
+        \\        "model": {
+        \\          "primary": "custom:https://api.cloudflare.com/client/v4/accounts/xxx/ai/v1/@cf/google/gemma-3-12b-it"
+        \\        }
+        \\      }
+        \\    ]
+        \\  }
+        \\}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    defer freeNamedAgentSlice(allocator, cfg.agents);
+    try std.testing.expectEqual(@as(usize, 1), cfg.agents.len);
+    try std.testing.expectEqualStrings("coder", cfg.agents[0].name);
+    try std.testing.expectEqualStrings("custom:https://api.cloudflare.com/client/v4/accounts/xxx/ai/v1", cfg.agents[0].provider);
+    try std.testing.expectEqualStrings("@cf/google/gemma-3-12b-it", cfg.agents[0].model);
+}
+
 test "parse agents.list with workspace_path" {
     const allocator = std.testing.allocator;
     const json =
@@ -4258,11 +4624,11 @@ test "resolveAgentWorkspace resolves relative path against config directory" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
-    const config_path = try std.fs.path.join(allocator, &.{ base, "config.json" });
+    const config_path = try std_compat.fs.path.join(allocator, &.{ base, "config.json" });
     defer allocator.free(config_path);
-    const expected_workspace = try std.fs.path.join(allocator, &.{ base, "agents", "coder" });
+    const expected_workspace = try std_compat.fs.path.join(allocator, &.{ base, "agents", "coder" });
     defer allocator.free(expected_workspace);
 
     const agents = [_]NamedAgentConfig{.{
@@ -4290,9 +4656,9 @@ test "scaffoldAgentWorkspace leaves markdown memory empty" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
-    const workspace = try std.fs.path.join(allocator, &.{ base, "agents", "writer" });
+    const workspace = try std_compat.fs.path.join(allocator, &.{ base, "agents", "writer" });
     defer allocator.free(workspace);
 
     try Config.scaffoldAgentWorkspace(allocator, workspace);
@@ -4700,7 +5066,7 @@ test "save writes provider native_tools when false" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
     const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
     defer allocator.free(config_path);
@@ -4721,7 +5087,7 @@ test "save writes provider native_tools when false" {
 
     try cfg.save();
 
-    const file = try std.fs.openFileAbsolute(config_path, .{});
+    const file = try std_compat.fs.openFileAbsolute(config_path, .{});
     defer file.close();
     const content = try file.readToEndAlloc(allocator, 64 * 1024);
     defer allocator.free(content);
@@ -4735,7 +5101,7 @@ test "save escapes provider string fields" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
     const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
     defer allocator.free(config_path);
@@ -4757,7 +5123,7 @@ test "save escapes provider string fields" {
 
     try cfg.save();
 
-    const file = try std.fs.openFileAbsolute(config_path, .{});
+    const file = try std_compat.fs.openFileAbsolute(config_path, .{});
     defer file.close();
     const content = try file.readToEndAlloc(allocator, 64 * 1024);
     defer allocator.free(content);
@@ -4855,7 +5221,7 @@ test "save writes max_streaming_prompt_bytes when set" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
     const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
     defer allocator.free(config_path);
@@ -4870,7 +5236,7 @@ test "save writes max_streaming_prompt_bytes when set" {
     };
     try cfg.save();
 
-    const file = try std.fs.openFileAbsolute(config_path, .{});
+    const file = try std_compat.fs.openFileAbsolute(config_path, .{});
     defer file.close();
     const content = try file.readToEndAlloc(allocator, 64 * 1024);
     defer allocator.free(content);
@@ -4884,7 +5250,7 @@ test "save omits max_streaming_prompt_bytes when null" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
     const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
     defer allocator.free(config_path);
@@ -4899,7 +5265,7 @@ test "save omits max_streaming_prompt_bytes when null" {
     };
     try cfg.save();
 
-    const file = try std.fs.openFileAbsolute(config_path, .{});
+    const file = try std_compat.fs.openFileAbsolute(config_path, .{});
     defer file.close();
     const content = try file.readToEndAlloc(allocator, 64 * 1024);
     defer allocator.free(content);
@@ -4908,12 +5274,55 @@ test "save omits max_streaming_prompt_bytes when null" {
     try std.testing.expect(std.mem.indexOf(u8, content, "max_streaming_prompt_bytes") == null);
 }
 
+test "save writes provider extra_body_params when set" {
+    // Regression: save() previously dropped extra_body_params entirely, so a
+    // config rewrite lost provider-specific request body overrides.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+    defer allocator.free(config_path);
+
+    var cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    cfg.providers = &.{
+        .{
+            .name = "groq",
+            .api_key = "gsk_test",
+            .extra_body_params = "{\"seed\":123,\"metadata\":{\"tier\":\"pro\"}}",
+        },
+    };
+    try cfg.save();
+
+    const file = try std_compat.fs.openFileAbsolute(config_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(content);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
+    defer parsed.deinit();
+
+    const models = parsed.value.object.get("models").?.object;
+    const providers = models.get("providers").?.object;
+    const groq = providers.get("groq").?.object;
+    const extra = groq.get("extra_body_params").?.object;
+
+    try std.testing.expectEqual(@as(i64, 123), extra.get("seed").?.integer);
+    try std.testing.expectEqualStrings("pro", extra.get("metadata").?.object.get("tier").?.string);
+}
+
 test "save writes provider api_mode when responses" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
     const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
     defer allocator.free(config_path);
@@ -4928,7 +5337,7 @@ test "save writes provider api_mode when responses" {
     };
     try cfg.save();
 
-    const file = try std.fs.openFileAbsolute(config_path, .{});
+    const file = try std_compat.fs.openFileAbsolute(config_path, .{});
     defer file.close();
     const content = try file.readToEndAlloc(allocator, 64 * 1024);
     defer allocator.free(content);
@@ -4941,7 +5350,7 @@ test "save writes chat_template_enable_thinking_param when true" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
     const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
     defer allocator.free(config_path);
@@ -4956,7 +5365,7 @@ test "save writes chat_template_enable_thinking_param when true" {
     };
     try cfg.save();
 
-    const file = try std.fs.openFileAbsolute(config_path, .{});
+    const file = try std_compat.fs.openFileAbsolute(config_path, .{});
     defer file.close();
     const content = try file.readToEndAlloc(allocator, 64 * 1024);
     defer allocator.free(content);
@@ -4970,7 +5379,7 @@ test "save and parseJson round-trip max_streaming_prompt_bytes" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
     const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
     defer allocator.free(config_path);
@@ -4986,7 +5395,7 @@ test "save and parseJson round-trip max_streaming_prompt_bytes" {
     };
     try cfg.save();
 
-    const file = try std.fs.openFileAbsolute(config_path, .{});
+    const file = try std_compat.fs.openFileAbsolute(config_path, .{});
     defer file.close();
     const content = try file.readToEndAlloc(allocator, 64 * 1024);
     defer allocator.free(content);
@@ -5006,12 +5415,58 @@ test "save and parseJson round-trip max_streaming_prompt_bytes" {
     try std.testing.expectEqual(@as(?usize, null), loaded.getProviderMaxStreamingPromptBytes("openai"));
 }
 
+test "save and parseJson round-trip extra_body_params" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+    defer allocator.free(config_path);
+
+    var cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    cfg.providers = &.{
+        .{
+            .name = "groq",
+            .api_key = "gsk_test",
+            .extra_body_params = "{\"seed\":321,\"metadata\":{\"tier\":\"team\"}}",
+        },
+    };
+    try cfg.save();
+
+    const file = try std_compat.fs.openFileAbsolute(config_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(content);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var loaded = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = arena.allocator(),
+    };
+    try loaded.parseJson(content);
+
+    const extra_body_params = loaded.getProviderExtraBodyParams("groq") orelse return error.TestExpectedEqual;
+    const parsed_extra = try std.json.parseFromSlice(std.json.Value, allocator, extra_body_params, .{});
+    defer parsed_extra.deinit();
+
+    try std.testing.expectEqual(@as(i64, 321), parsed_extra.value.object.get("seed").?.integer);
+    try std.testing.expectEqualStrings("team", parsed_extra.value.object.get("metadata").?.object.get("tier").?.string);
+}
+
 test "save encrypts persisted api keys and parse decrypts them" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(base);
     const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
     defer allocator.free(config_path);
@@ -5050,7 +5505,7 @@ test "save encrypts persisted api keys and parse decrypts them" {
 
     try cfg.save();
 
-    const file = try std.fs.openFileAbsolute(config_path, .{});
+    const file = try std_compat.fs.openFileAbsolute(config_path, .{});
     defer file.close();
     const content = try file.readToEndAlloc(allocator, 128 * 1024);
     defer allocator.free(content);
@@ -5178,6 +5633,60 @@ test "validate rejects invalid provider api_mode" {
     };
 
     try std.testing.expectError(Config.ValidationError.InvalidProviderApiMode, cfg.validate());
+}
+
+test "validate rejects insecure provider base_url and custom urls" {
+    const allocator = std.testing.allocator;
+
+    const remote_cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+        .default_provider = "groq",
+        .default_model = "gpt-4o",
+        .providers = &.{.{
+            .name = "groq",
+            .api_key = "gsk_test",
+            .base_url = "http://api.example.com/v1",
+        }},
+    };
+    try std.testing.expectError(Config.ValidationError.InvalidProviderBaseUrl, remote_cfg.validate());
+
+    const custom_cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+        .default_provider = "custom:http://api.example.com/v1",
+        .default_model = "gpt-4o",
+    };
+    try std.testing.expectError(Config.ValidationError.InvalidProviderBaseUrl, custom_cfg.validate());
+
+    const https_cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+        .default_provider = "custom:https://api.example.com/v1",
+        .default_model = "gpt-4o",
+    };
+    try https_cfg.validate();
+}
+
+test "validate accepts intentional local provider base_url" {
+    const allocator = std.testing.allocator;
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+        .default_provider = "my-local-llm",
+        .default_model = "gpt-4o",
+        .providers = &.{.{
+            .name = "my-local-llm",
+            .api_key = "key",
+            .base_url = "http://localhost:9999/v1",
+        }},
+    };
+
+    try cfg.validate();
 }
 
 test "providers defaults to empty" {
@@ -5358,6 +5867,104 @@ test "parse agents.defaults.heartbeat disabled" {
     try cfg.parseJson(json);
     try std.testing.expect(!cfg.heartbeat.enabled);
     try std.testing.expectEqual(@as(u32, 30), cfg.heartbeat.interval_minutes);
+}
+
+test "parse agents.defaults.heartbeat dispatch settings" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const json =
+        \\{"agents":{"defaults":{"heartbeat":{"every":"1m","prompt":"Review tasks","model":"openai/gpt-5.4","timeout_secs":45,"delivery_mode":"on_error","delivery_channel":"telegram","delivery_account_id":"backup","delivery_to":"-100123:thread:77","delivery_peer_kind":"group","delivery_peer_id":"-100123","delivery_thread_id":"77","delivery_best_effort":false}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expect(cfg.heartbeat.enabled);
+    try std.testing.expectEqual(@as(u32, 1), cfg.heartbeat.interval_minutes);
+    try std.testing.expectEqualStrings("Review tasks", cfg.heartbeat.prompt.?);
+    try std.testing.expectEqualStrings("openai/gpt-5.4", cfg.heartbeat.model.?);
+    try std.testing.expectEqual(@as(u32, 45), cfg.heartbeat.timeout_secs);
+    try std.testing.expectEqualStrings("on_error", cfg.heartbeat.delivery_mode.?);
+    try std.testing.expectEqualStrings("telegram", cfg.heartbeat.delivery_channel.?);
+    try std.testing.expectEqualStrings("backup", cfg.heartbeat.delivery_account_id.?);
+    try std.testing.expectEqualStrings("-100123:thread:77", cfg.heartbeat.delivery_to.?);
+    try std.testing.expectEqualStrings("group", cfg.heartbeat.delivery_peer_kind.?);
+    try std.testing.expectEqualStrings("-100123", cfg.heartbeat.delivery_peer_id.?);
+    try std.testing.expectEqualStrings("77", cfg.heartbeat.delivery_thread_id.?);
+    try std.testing.expect(!cfg.heartbeat.delivery_best_effort);
+}
+
+test "save roundtrip preserves heartbeat dispatch settings" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+    defer allocator.free(config_path);
+
+    var cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    cfg.heartbeat = .{
+        .enabled = true,
+        .interval_minutes = 1,
+        .prompt = "Review tasks",
+        .model = "openai/gpt-5.4",
+        .timeout_secs = 45,
+        .delivery_mode = "on_error",
+        .delivery_channel = "telegram",
+        .delivery_account_id = "backup",
+        .delivery_to = "-100123:thread:77",
+        .delivery_peer_kind = "group",
+        .delivery_peer_id = "-100123",
+        .delivery_thread_id = "77",
+        .delivery_best_effort = false,
+    };
+    try cfg.save();
+
+    const file = try std_compat.fs.openFileAbsolute(config_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 128 * 1024);
+    defer allocator.free(content);
+
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"heartbeat\": {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"every\": \"1m\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"prompt\": \"Review tasks\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"model\": \"openai/gpt-5.4\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"timeout_secs\": 45") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"delivery_mode\": \"on_error\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"delivery_channel\": \"telegram\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"delivery_account_id\": \"backup\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"delivery_to\": \"-100123:thread:77\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"delivery_peer_kind\": \"group\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"delivery_peer_id\": \"-100123\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"delivery_thread_id\": \"77\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"delivery_best_effort\": false") != null);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var loaded = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = arena.allocator(),
+    };
+    try loaded.parseJson(content);
+    try std.testing.expect(loaded.heartbeat.enabled);
+    try std.testing.expectEqual(@as(u32, 1), loaded.heartbeat.interval_minutes);
+    try std.testing.expectEqualStrings("Review tasks", loaded.heartbeat.prompt.?);
+    try std.testing.expectEqualStrings("openai/gpt-5.4", loaded.heartbeat.model.?);
+    try std.testing.expectEqual(@as(u32, 45), loaded.heartbeat.timeout_secs);
+    try std.testing.expectEqualStrings("on_error", loaded.heartbeat.delivery_mode.?);
+    try std.testing.expectEqualStrings("telegram", loaded.heartbeat.delivery_channel.?);
+    try std.testing.expectEqualStrings("backup", loaded.heartbeat.delivery_account_id.?);
+    try std.testing.expectEqualStrings("-100123:thread:77", loaded.heartbeat.delivery_to.?);
+    try std.testing.expectEqualStrings("group", loaded.heartbeat.delivery_peer_kind.?);
+    try std.testing.expectEqualStrings("-100123", loaded.heartbeat.delivery_peer_id.?);
+    try std.testing.expectEqualStrings("77", loaded.heartbeat.delivery_thread_id.?);
+    try std.testing.expect(!loaded.heartbeat.delivery_best_effort);
 }
 
 test "tools.media.audio disabled" {
@@ -6392,9 +6999,9 @@ test "save includes nostr channel when configured" {
     cfg.channels.nostr = &ns_cfg;
 
     try cfg.save();
-    defer std.fs.deleteFileAbsolute(tmp_path) catch {};
+    defer std_compat.fs.deleteFileAbsolute(tmp_path) catch {};
 
-    const file = try std.fs.openFileAbsolute(tmp_path, .{});
+    const file = try std_compat.fs.openFileAbsolute(tmp_path, .{});
     defer file.close();
     const content = try file.readToEndAlloc(allocator, 64 * 1024);
     defer allocator.free(content);
@@ -6435,9 +7042,9 @@ test "save includes dm_relays in nostr section" {
     cfg.channels.nostr = &ns_cfg;
 
     try cfg.save();
-    defer std.fs.deleteFileAbsolute(tmp_path) catch {};
+    defer std_compat.fs.deleteFileAbsolute(tmp_path) catch {};
 
-    const file = try std.fs.openFileAbsolute(tmp_path, .{});
+    const file = try std_compat.fs.openFileAbsolute(tmp_path, .{});
     defer file.close();
     const content = try file.readToEndAlloc(allocator, 64 * 1024);
     defer allocator.free(content);
@@ -6464,9 +7071,9 @@ test "dm_relays round-trips through save and load" {
     cfg.channels.nostr = &ns_cfg;
 
     try cfg.save();
-    defer std.fs.deleteFileAbsolute(tmp_path) catch {};
+    defer std_compat.fs.deleteFileAbsolute(tmp_path) catch {};
 
-    const file = try std.fs.openFileAbsolute(tmp_path, .{});
+    const file = try std_compat.fs.openFileAbsolute(tmp_path, .{});
     defer file.close();
     const content = try file.readToEndAlloc(allocator, 64 * 1024);
     defer allocator.free(content);
@@ -6505,9 +7112,9 @@ test "nostr display_name with special chars round-trips correctly" {
     cfg.channels.nostr = &ns_cfg;
 
     try cfg.save();
-    defer std.fs.deleteFileAbsolute(tmp_path) catch {};
+    defer std_compat.fs.deleteFileAbsolute(tmp_path) catch {};
 
-    const file_content = try std.fs.openFileAbsolute(tmp_path, .{});
+    const file_content = try std_compat.fs.openFileAbsolute(tmp_path, .{});
     defer file_content.close();
     const raw = try file_content.readToEndAlloc(allocator, 64 * 1024);
     defer allocator.free(raw);
@@ -6619,4 +7226,40 @@ test "NostrConfig dm_relays default is auth.nostr1.com" {
     };
     try std.testing.expectEqual(@as(usize, 1), cfg.dm_relays.len);
     try std.testing.expectEqualStrings("wss://auth.nostr1.com", cfg.dm_relays[0]);
+}
+
+// Regression: named agent provider names must resolve through the same alias-aware
+// provider matching used by config lookups.
+test "validation rejects unknown named agent provider when providers are configured" {
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .providers = &.{.{ .name = "openai" }},
+        .default_model = "gpt-5.4",
+        .agents = &.{.{
+            .name = "worker",
+            .provider = "nonexistent-provider",
+            .model = "gpt-5.4",
+        }},
+        .allocator = std.testing.allocator,
+    };
+
+    try std.testing.expectError(Config.ValidationError.UnknownAgentProvider, cfg.validate());
+}
+
+test "validation accepts named agent provider aliases from configured providers" {
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .providers = &.{.{ .name = "azure" }},
+        .default_model = "gpt-5.4",
+        .agents = &.{.{
+            .name = "worker",
+            .provider = "azure-openai",
+            .model = "gpt-5.4",
+        }},
+        .allocator = std.testing.allocator,
+    };
+
+    try cfg.validate();
 }
