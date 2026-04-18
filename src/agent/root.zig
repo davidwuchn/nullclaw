@@ -326,6 +326,9 @@ pub const Agent = struct {
     /// Empty = no filtering; all tool specs are sent as-is.
     tool_filter_groups: []const config_types.ToolFilterGroup = &.{},
 
+    /// Tool customization config (system_prompt overrides, triggers, enabled flags).
+    tools_config: config_types.ToolsConfig = .{},
+
     /// Optional security policy for autonomy checks and rate limiting.
     policy: ?*const SecurityPolicy = null,
 
@@ -9850,6 +9853,4 @@ test "globMatch handles prefix wildcard" {
     try std.testing.expect(Agent.globMatch("*", "anything"));
     try std.testing.expect(Agent.globMatch("shell", "shell"));
     try std.testing.expect(!Agent.globMatch("shell", "shell_extra"));
-}
-extra"));
 }
