@@ -73,7 +73,13 @@ pub const Stream = struct {
 
     pub fn read(self: Stream, buffer: []u8) ReadError!usize {
         var stream_reader = self.toInner().reader(shared.io(), &[_]u8{});
-        return stream_reader.interface.readSliceShort(buffer) catch |err| switch (err) {
+        var vec = [_][]u8{buffer};
+        // Socket reads must be short reads. `readSliceShort` tries to fill the
+        // whole buffer, which deadlocks HTTP-style request/response flows when
+        // the peer sends a short request and keeps the connection open for the
+        // response.
+        return stream_reader.interface.readVec(&vec) catch |err| switch (err) {
+            error.EndOfStream => 0,
             error.ReadFailed => return stream_reader.err orelse error.Unexpected,
         };
     }
@@ -259,6 +265,10 @@ pub const Server = struct {
     pub const AcceptError = IoNet.Server.AcceptError;
 
     pub fn accept(self: *Server) AcceptError!Connection {
+        if (builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+            return self.acceptPosix();
+        }
+
         const accept_options: IoNet.Server.AcceptOptions = if (comptime IoNet.Server.AcceptOptions == void) {} else .{ .mode = .stream, .protocol = .tcp };
         var server: IoNet.Server = .{
             .socket = .{
@@ -273,6 +283,45 @@ pub const Server = struct {
         return .{
             .stream = .{ .handle = stream.socket.handle },
             .address = Address.fromCurrent(stream.socket.address),
+        };
+    }
+
+    fn acceptPosix(self: *Server) AcceptError!Connection {
+        var storage: posix.sockaddr.storage = undefined;
+        var addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
+        const flags = if (builtin.os.tag == .linux)
+            posix.SOCK.CLOEXEC
+        else
+            0;
+
+        const fd = while (true) {
+            const rc = if (builtin.os.tag == .linux)
+                posix.system.accept4(self.stream.handle, @ptrCast(&storage), &addr_len, flags)
+            else
+                posix.system.accept(self.stream.handle, @ptrCast(&storage), &addr_len);
+            switch (posix.errno(rc)) {
+                .SUCCESS => {
+                    const accepted_fd: posix.fd_t = @intCast(rc);
+                    errdefer posix.close(accepted_fd);
+                    if (builtin.os.tag != .linux) try setCloseOnExec(accepted_fd);
+                    break accepted_fd;
+                },
+                .INTR => continue,
+                .AGAIN => return error.WouldBlock,
+                .CONNABORTED => return error.ConnectionAborted,
+                .INVAL => return error.SocketNotListening,
+                .MFILE => return error.ProcessFdQuotaExceeded,
+                .NFILE => return error.SystemFdQuotaExceeded,
+                .NOBUFS, .NOMEM => return error.SystemResources,
+                .PERM => return error.BlockedByFirewall,
+                else => |err| return posix.unexpectedErrno(err),
+            }
+        };
+
+        try setSocketNonblocking(fd, false);
+        return .{
+            .stream = .{ .handle = fd },
+            .address = addressFromSockaddrStorage(storage),
         };
     }
 };
@@ -434,7 +483,7 @@ test "compat net normalizes listener and stream blocking mode" {
 
     var conn = server.accept() catch |err| switch (err) {
         error.WouldBlock => blk: {
-            std.time.sleep(10 * std.time.ns_per_ms);
+            std.Thread.sleep(10 * std.time.ns_per_ms);
             break :blk try server.accept();
         },
         else => return err,
@@ -444,6 +493,46 @@ test "compat net normalizes listener and stream blocking mode" {
     try std.testing.expect(!socketIsNonblocking(conn.stream.handle));
 }
 
+test "compat net stream read returns short payload without waiting for buffer fill" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const addr = try Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{ .force_nonblocking = true });
+    defer server.deinit();
+
+    const client = try tcpConnectToAddress(server.listen_address);
+    defer client.close();
+
+    var conn = server.accept() catch |err| switch (err) {
+        error.WouldBlock => blk: {
+            std.Thread.sleep(10 * std.time.ns_per_ms);
+            break :blk try server.accept();
+        },
+        else => return err,
+    };
+    defer conn.stream.close();
+
+    try setSocketReceiveTimeoutMillis(conn.stream.handle, 100);
+
+    const request = "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    try client.writeAll(request);
+
+    var buf: [2048]u8 = undefined;
+    const n = try conn.stream.read(&buf);
+    try std.testing.expectEqual(request.len, n);
+    try std.testing.expectEqualStrings(request, buf[0..n]);
+}
+
+test "compat net nonblocking accept returns would block instead of panicking" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const addr = try Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{ .force_nonblocking = true });
+    defer server.deinit();
+
+    try std.testing.expectError(error.WouldBlock, server.accept());
+}
+
 fn socketIsNonblocking(handle: IoNet.Socket.Handle) bool {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return false;
     const rc = posix.system.fcntl(handle, posix.F.GETFL, @as(usize, 0));
@@ -451,4 +540,46 @@ fn socketIsNonblocking(handle: IoNet.Socket.Handle) bool {
     const flags: usize = @intCast(rc);
     const nonblocking_flag = @as(usize, 1) << @bitOffsetOf(posix.O, "NONBLOCK");
     return (flags & nonblocking_flag) != 0;
+}
+
+fn setCloseOnExec(handle: IoNet.Socket.Handle) !void {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const rc = posix.system.fcntl(handle, posix.F.GETFD, @as(usize, 0));
+    const current_flags = switch (posix.errno(rc)) {
+        .SUCCESS => @as(usize, @intCast(rc)),
+        else => |err| return posix.unexpectedErrno(err),
+    };
+    const next_flags = current_flags | posix.FD_CLOEXEC;
+    if (next_flags == current_flags) return;
+
+    switch (posix.errno(posix.system.fcntl(handle, posix.F.SETFD, next_flags))) {
+        .SUCCESS => {},
+        else => |err| return posix.unexpectedErrno(err),
+    }
+}
+
+fn addressFromSockaddrStorage(storage: posix.sockaddr.storage) Address {
+    return switch (storage.family) {
+        posix.AF.INET => .{ .in = .{ .sa = @as(*const posix.sockaddr.in, @ptrCast(&storage)).* } },
+        posix.AF.INET6 => .{ .in6 = .{ .sa = @as(*const posix.sockaddr.in6, @ptrCast(&storage)).* } },
+        else => unreachable,
+    };
+}
+
+fn setSocketReceiveTimeoutMillis(handle: IoNet.Socket.Handle, timeout_ms: u64) !void {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const zero_timeout = posix.timeval{ .sec = 0, .usec = 0 };
+    const TimevalSecs = @TypeOf(zero_timeout.sec);
+    const timeout = posix.timeval{
+        .sec = @intCast(@min(timeout_ms / std.time.ms_per_s, @as(u64, std.math.maxInt(TimevalSecs)))),
+        .usec = @intCast((timeout_ms % std.time.ms_per_s) * std.time.us_per_ms),
+    };
+    try posix.setsockopt(
+        handle,
+        posix.SOL.SOCKET,
+        posix.SO.RCVTIMEO,
+        &std.mem.toBytes(timeout),
+    );
 }
