@@ -1,6 +1,7 @@
 const std = @import("std");
 const std_compat = @import("compat");
 const builtin = @import("builtin");
+const platform = @import("platform.zig");
 
 // Tunnel -- ngrok/cloudflare/tailscale/custom tunnel management.
 //
@@ -45,6 +46,7 @@ pub const CloudflareTunnelConfig = struct {
 pub const TailscaleTunnelConfig = struct {
     funnel: bool = false,
     hostname: ?[]const u8 = null,
+    auth_key: ?[]const u8 = null,
 };
 
 pub const NgrokTunnelConfig = struct {
@@ -93,6 +95,7 @@ pub const TunnelAdapter = struct {
     pub const TunnelError = error{
         StartFailed,
         ProcessSpawnFailed,
+        AuthenticationFailed,
         UrlNotFound,
         Timeout,
         InvalidCommand,
@@ -234,6 +237,69 @@ fn cleanupFailedStart(child: *?std_compat.process.Child, state: *TunnelState) vo
     }
     child.* = null;
     state.* = .error_state;
+}
+
+const tailscale_inherit_env_vars = [_][]const u8{
+    "PATH",              "HOME",        "TERM",    "LANG",         "LC_ALL",
+    "LC_CTYPE",          "USER",        "SHELL",   "TMPDIR",       "NODE_PATH",
+    "NPM_CONFIG_PREFIX",
+    // Windows-specific
+    "USERPROFILE", "APPDATA", "LOCALAPPDATA", "TEMP",
+    "TMP",               "SYSTEMROOT",  "COMSPEC", "PROGRAMFILES", "WINDIR",
+};
+
+const TailscaleAuthError = error{
+    InvalidAuthKey,
+    AuthenticationFailed,
+    ProcessSpawnFailed,
+} || std.mem.Allocator.Error;
+
+fn buildTailscaleAuthEnvMap(
+    allocator: std.mem.Allocator,
+    auth_key: []const u8,
+) TailscaleAuthError!std_compat.process.EnvMap {
+    var env = std_compat.process.EnvMap.init(allocator);
+    errdefer env.deinit();
+
+    for (&tailscale_inherit_env_vars) |key| {
+        if (platform.getEnvOrNull(allocator, key)) |value| {
+            defer allocator.free(value);
+            try env.put(key, value);
+        }
+    }
+    try env.put("TS_AUTH_KEY", auth_key);
+    return env;
+}
+
+fn tailscaleAuthCommand() []const u8 {
+    return if (comptime builtin.os.tag == .windows)
+        "tailscale up --auth-key=%TS_AUTH_KEY%"
+    else
+        "exec tailscale up --auth-key=\"$TS_AUTH_KEY\"";
+}
+
+fn runTailscaleAuth(allocator: std.mem.Allocator, auth_key: []const u8) TailscaleAuthError!void {
+    if (std.mem.trim(u8, auth_key, " \t\r\n").len == 0) return error.InvalidAuthKey;
+
+    var env = try buildTailscaleAuthEnvMap(allocator, auth_key);
+    defer env.deinit();
+
+    var child = std_compat.process.Child.init(
+        &.{ platform.getShell(), platform.getShellFlag(), tailscaleAuthCommand() },
+        allocator,
+    );
+    child.env_map = &env;
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+
+    const term = child.spawnAndWait() catch return error.ProcessSpawnFailed;
+    switch (term) {
+        .exited => |code| {
+            if (code != 0) return error.AuthenticationFailed;
+        },
+        else => return error.AuthenticationFailed,
+    }
 }
 
 // ── CloudflareTunnel ────────────────────────────────────────────
@@ -453,6 +519,7 @@ pub const NgrokTunnel = struct {
 pub const TailscaleTunnel = struct {
     funnel: bool,
     hostname: ?[]const u8 = null,
+    auth_key: ?[]const u8 = null,
     allocator: std.mem.Allocator,
     state: TunnelState = .stopped,
     url: ?[]const u8 = null,
@@ -467,7 +534,21 @@ pub const TailscaleTunnel = struct {
     };
 
     pub fn create(allocator: std.mem.Allocator, funnel: bool, hostname: ?[]const u8) TailscaleTunnel {
-        return .{ .allocator = allocator, .funnel = funnel, .hostname = hostname };
+        return createWithAuth(allocator, funnel, hostname, null);
+    }
+
+    pub fn createWithAuth(
+        allocator: std.mem.Allocator,
+        funnel: bool,
+        hostname: ?[]const u8,
+        auth_key: ?[]const u8,
+    ) TailscaleTunnel {
+        return .{
+            .allocator = allocator,
+            .funnel = funnel,
+            .hostname = hostname,
+            .auth_key = auth_key,
+        };
     }
 
     pub fn adapter(self: *TailscaleTunnel) TunnelAdapter {
@@ -485,6 +566,17 @@ pub const TailscaleTunnel = struct {
         var port_buf: [8]u8 = undefined;
         const port_str = std.fmt.bufPrint(&port_buf, "{d}", .{local_port}) catch
             return TunnelAdapter.TunnelError.StartFailed;
+
+        if (self.auth_key) |auth_key| {
+            runTailscaleAuth(self.allocator, auth_key) catch |err| {
+                self.state = .error_state;
+                return switch (err) {
+                    error.InvalidAuthKey, error.AuthenticationFailed => TunnelAdapter.TunnelError.AuthenticationFailed,
+                    error.ProcessSpawnFailed => TunnelAdapter.TunnelError.ProcessSpawnFailed,
+                    else => TunnelAdapter.TunnelError.StartFailed,
+                };
+            };
+        }
 
         const subcmd: []const u8 = if (self.funnel) "funnel" else "serve";
 
@@ -688,6 +780,7 @@ pub const Tunnel = struct {
     cloudflare_token: ?[]const u8 = null,
     tailscale_funnel: bool = false,
     tailscale_hostname: ?[]const u8 = null,
+    tailscale_auth_key: ?[]const u8 = null,
     ngrok_auth_token: ?[]const u8 = null,
     ngrok_domain: ?[]const u8 = null,
     custom_start_command: ?[]const u8 = null,
@@ -806,6 +899,16 @@ pub const Tunnel = struct {
             },
             .tailscale => {
                 self.state = .starting;
+                if (self.tailscale_auth_key) |auth_key| {
+                    runTailscaleAuth(alloc, auth_key) catch |err| {
+                        self.state = .error_state;
+                        return switch (err) {
+                            error.InvalidAuthKey, error.AuthenticationFailed => error.AuthenticationFailed,
+                            error.ProcessSpawnFailed => error.NotImplemented,
+                            else => error.NotImplemented,
+                        };
+                    };
+                }
                 const subcmd: []const u8 = if (self.tailscale_funnel) "funnel" else "serve";
 
                 var child = std_compat.process.Child.init(
@@ -917,6 +1020,7 @@ pub fn createTunnel(cfg: TunnelFullConfig) CreateTunnelError!?Tunnel {
                 .provider = .tailscale,
                 .tailscale_funnel = ts.funnel,
                 .tailscale_hostname = ts.hostname,
+                .tailscale_auth_key = ts.auth_key,
             };
         },
         .ngrok => blk: {
@@ -952,7 +1056,16 @@ pub fn cloudflareTunnel(token: []const u8) Tunnel {
 }
 
 pub fn tailscaleTunnel(funnel: bool, hostname: ?[]const u8) Tunnel {
-    return .{ .provider = .tailscale, .tailscale_funnel = funnel, .tailscale_hostname = hostname };
+    return tailscaleTunnelWithAuth(funnel, hostname, null);
+}
+
+pub fn tailscaleTunnelWithAuth(funnel: bool, hostname: ?[]const u8, auth_key: ?[]const u8) Tunnel {
+    return .{
+        .provider = .tailscale,
+        .tailscale_funnel = funnel,
+        .tailscale_hostname = hostname,
+        .tailscale_auth_key = auth_key,
+    };
 }
 
 pub fn ngrokTunnel(auth_token: []const u8, domain: ?[]const u8) Tunnel {
@@ -1012,6 +1125,21 @@ test "factory tailscale defaults ok" {
     try std.testing.expectEqualStrings("tailscale", t.?.providerName());
 }
 
+test "factory tailscale auth key wiring" {
+    const t = try createTunnel(.{
+        .provider = "tailscale",
+        .tailscale = .{
+            .funnel = true,
+            .hostname = "nullclaw.ts.net",
+            .auth_key = "tskey-auth-k123",
+        },
+    });
+    try std.testing.expect(t != null);
+    try std.testing.expect(t.?.tailscale_funnel);
+    try std.testing.expectEqualStrings("nullclaw.ts.net", t.?.tailscale_hostname.?);
+    try std.testing.expectEqualStrings("tskey-auth-k123", t.?.tailscale_auth_key.?);
+}
+
 test "factory ngrok missing config errors" {
     const result = createTunnel(.{ .provider = "ngrok" });
     try std.testing.expectError(CreateTunnelError.MissingNgrokConfig, result);
@@ -1045,6 +1173,13 @@ test "tailscaleTunnel funnel mode" {
     try std.testing.expectEqualStrings("tailscale", t.providerName());
     try std.testing.expect(t.tailscale_funnel);
     try std.testing.expectEqualStrings("myhost", t.tailscale_hostname.?);
+}
+
+test "tailscaleTunnelWithAuth stores auth key" {
+    const t = tailscaleTunnelWithAuth(false, "nullclaw.ts.net", "tskey-auth-k123");
+    try std.testing.expectEqualStrings("tailscale", t.providerName());
+    try std.testing.expectEqualStrings("nullclaw.ts.net", t.tailscale_hostname.?);
+    try std.testing.expectEqualStrings("tskey-auth-k123", t.tailscale_auth_key.?);
 }
 
 test "ngrokTunnel with domain" {
@@ -1187,6 +1322,14 @@ test "TailscaleTunnel adapter funnel mode" {
     var t = TailscaleTunnel.create(std.testing.allocator, true, "myhost.ts.net");
     try std.testing.expect(t.funnel);
     try std.testing.expectEqualStrings("myhost.ts.net", t.hostname.?);
+    const a = t.adapter();
+    try std.testing.expect(!a.isRunning());
+}
+
+test "TailscaleTunnel adapter createWithAuth stores auth key" {
+    var t = TailscaleTunnel.createWithAuth(std.testing.allocator, false, "nullclaw.ts.net", "tskey-auth-k123");
+    try std.testing.expectEqualStrings("nullclaw.ts.net", t.hostname.?);
+    try std.testing.expectEqualStrings("tskey-auth-k123", t.auth_key.?);
     const a = t.adapter();
     try std.testing.expect(!a.isRunning());
 }
