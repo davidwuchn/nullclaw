@@ -39,6 +39,21 @@ fn setSocketNonblocking(handle: IoNet.Socket.Handle, nonblocking: bool) !void {
     }
 }
 
+fn setSocketCloseOnExec(handle: IoNet.Socket.Handle) !void {
+    switch (builtin.os.tag) {
+        .windows, .wasi => return,
+        else => {},
+    }
+
+    while (true) {
+        switch (posix.errno(posix.system.fcntl(handle, posix.F.SETFD, @as(usize, posix.FD_CLOEXEC)))) {
+            .SUCCESS => return,
+            .INTR => continue,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    }
+}
+
 pub const has_unix_sockets = false;
 
 pub const Stream = struct {
@@ -258,7 +273,43 @@ pub const Server = struct {
 
     pub const AcceptError = IoNet.Server.AcceptError;
 
+    fn acceptPosixNonblocking(self: *Server) AcceptError!Connection {
+        var address: Address = undefined;
+        var address_len: posix.socklen_t = @sizeOf(Address);
+
+        while (true) {
+            const rc = posix.system.accept(self.stream.handle, &address.any, &address_len);
+            switch (posix.errno(rc)) {
+                .SUCCESS => {
+                    var stream: Stream = .{ .handle = @intCast(rc) };
+                    errdefer stream.close();
+                    try setSocketCloseOnExec(stream.handle);
+                    try setSocketNonblocking(stream.handle, false);
+                    return .{
+                        .stream = stream,
+                        .address = address,
+                    };
+                },
+                .INTR => continue,
+                .AGAIN => return error.WouldBlock,
+                .CONNABORTED => return error.ConnectionAborted,
+                .INVAL => return error.SocketNotListening,
+                .MFILE => return error.ProcessFdQuotaExceeded,
+                .NFILE => return error.SystemFdQuotaExceeded,
+                .NETDOWN => return error.NetworkDown,
+                .NOBUFS, .NOMEM => return error.SystemResources,
+                .PERM => return error.BlockedByFirewall,
+                .PROTO => return error.ProtocolFailure,
+                else => |err| return posix.unexpectedErrno(err),
+            }
+        }
+    }
+
     pub fn accept(self: *Server) AcceptError!Connection {
+        if (socketIsNonblocking(self.stream.handle)) {
+            return self.acceptPosixNonblocking();
+        }
+
         const accept_options: IoNet.Server.AcceptOptions = if (comptime IoNet.Server.AcceptOptions == void) {} else .{ .mode = .stream, .protocol = .tcp };
         var server: IoNet.Server = .{
             .socket = .{
@@ -442,6 +493,18 @@ test "compat net normalizes listener and stream blocking mode" {
     defer conn.stream.close();
 
     try std.testing.expect(!socketIsNonblocking(conn.stream.handle));
+}
+
+test "compat net nonblocking listener accept reports WouldBlock when idle" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const addr = try Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{ .force_nonblocking = true });
+    defer server.deinit();
+
+    // Regression for #851: Zig 0.16 Threaded accept maps EAGAIN on externally
+    // non-blocking listeners to Unexpected instead of WouldBlock.
+    try std.testing.expectError(error.WouldBlock, server.accept());
 }
 
 fn socketIsNonblocking(handle: IoNet.Socket.Handle) bool {
