@@ -1392,6 +1392,14 @@ pub const Config = struct {
         try w.print("    \"web_fetch_max_chars\": {d},\n", .{self.tools.web_fetch_max_chars});
         try w.print("    \"path_env_vars\": ", .{});
         try writePrettyJsonInline(self.allocator, w, self.tools.path_env_vars, "    ");
+        if (self.tools.tool_customizations.len > 0) {
+            try w.print(",\n    \"tool_customizations\": ", .{});
+            try writePrettyJsonInline(self.allocator, w, self.tools.tool_customizations, "    ");
+        }
+        if (self.tools.tool_customizations_file) |path| {
+            try w.print(",\n    \"tool_customizations_file\": ", .{});
+            try writePrettyJsonInline(self.allocator, w, path, "    ");
+        }
         // tools.media.audio
         {
             const am = self.audio_media;
@@ -3964,6 +3972,56 @@ test "save roundtrip preserves tools.path_env_vars" {
     try std.testing.expectEqual(@as(usize, 2), loaded.tools.path_env_vars.len);
     try std.testing.expectEqualStrings("LD_LIBRARY_PATH", loaded.tools.path_env_vars[0]);
     try std.testing.expectEqualStrings("PYTHONHOME", loaded.tools.path_env_vars[1]);
+}
+
+test "save roundtrip preserves tools tool_customizations" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+    defer allocator.free(config_path);
+
+    var cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    cfg.tools.tool_customizations = &.{
+        .{
+            .name = "shell",
+            .system_prompt = "Prefer shell for deterministic local checks.",
+            .triggers = &.{ "run", "execute" },
+            .priority = 8,
+            .enabled = false,
+        },
+    };
+    cfg.tools.tool_customizations_file = "tools.external.json";
+    try cfg.save();
+
+    const file = try std_compat.fs.openFileAbsolute(config_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(content);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var loaded = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = arena.allocator(),
+    };
+    try loaded.parseJson(content);
+    try std.testing.expectEqual(@as(usize, 1), loaded.tools.tool_customizations.len);
+    try std.testing.expectEqualStrings("shell", loaded.tools.tool_customizations[0].name);
+    try std.testing.expectEqualStrings("Prefer shell for deterministic local checks.", loaded.tools.tool_customizations[0].system_prompt.?);
+    try std.testing.expectEqualStrings("run", loaded.tools.tool_customizations[0].triggers[0]);
+    try std.testing.expectEqual(@as(u8, 8), loaded.tools.tool_customizations[0].priority);
+    try std.testing.expect(!loaded.tools.tool_customizations[0].enabled);
+    try std.testing.expect(loaded.tools.tool_customizations_file != null);
+    try std.testing.expectEqualStrings("tools.external.json", loaded.tools.tool_customizations_file.?);
 }
 
 test "json parse autonomy allow_raw_url_chars" {

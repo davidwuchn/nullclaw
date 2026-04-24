@@ -13,6 +13,7 @@ const mcp_mod = @import("../mcp.zig");
 const SandboxBackend = @import("../security/sandbox.zig").SandboxBackend;
 const createSandbox = @import("../security/sandbox.zig").createSandbox;
 const ConfigSandboxBackend = @import("../config.zig").SandboxBackend;
+const config_types = @import("../config_types.zig");
 
 fn mapConfigSandboxBackend(backend: ConfigSandboxBackend) SandboxBackend {
     return switch (backend) {
@@ -306,6 +307,37 @@ pub fn defaultToolsWithPaths(
     return list.toOwnedSlice(allocator);
 }
 
+fn applyToolCustomizations(
+    allocator: std.mem.Allocator,
+    list: *std.ArrayList(Tool),
+    customizations: []const config_types.ToolCustomization,
+) void {
+    if (customizations.len == 0) return;
+
+    var write_idx: usize = 0;
+    for (list.items) |*t| {
+        var keep = true;
+        for (customizations) |cust| {
+            if (std.mem.eql(u8, t.name(), cust.name)) {
+                if (!cust.enabled) {
+                    keep = false;
+                    t.deinit(allocator);
+                    break;
+                }
+                if (cust.system_prompt) |prompt| {
+                    t.custom_description = prompt;
+                }
+                break;
+            }
+        }
+        if (keep) {
+            list.items[write_idx] = t.*;
+            write_idx += 1;
+        }
+    }
+    list.shrinkRetainingCapacity(write_idx);
+}
+
 /// Create all tools including optional ones.
 pub fn allTools(
     allocator: std.mem.Allocator,
@@ -566,28 +598,7 @@ pub fn allTools(
         }
     }
 
-    var write_idx: usize = 0;
-    for (list.items) |*t| {
-        var keep = true;
-        for (opts.tools_config.tool_customizations) |cust| {
-            if (std.mem.eql(u8, t.name(), cust.name)) {
-                if (!cust.enabled) {
-                    keep = false;
-                    t.deinit(allocator);
-                    break;
-                }
-                if (cust.system_prompt) |prompt| {
-                    t.custom_description = prompt;
-                }
-                break;
-            }
-        }
-        if (keep) {
-            list.items[write_idx] = t.*;
-            write_idx += 1;
-        }
-    }
-    list.shrinkRetainingCapacity(write_idx);
+    applyToolCustomizations(allocator, &list, opts.tools_config.tool_customizations);
 
     return list.toOwnedSlice(allocator);
 }
@@ -755,6 +766,8 @@ pub fn subagentTools(
         };
         try list.append(allocator, ht.tool());
     }
+
+    applyToolCustomizations(allocator, &list, opts.tools_config.tool_customizations);
 
     return list.toOwnedSlice(allocator);
 }
@@ -928,6 +941,37 @@ test "all tools excludes extras when disabled" {
     //        memory_store, memory_recall, memory_list, memory_forget,
     //        delegate, schedule, spawn = 18
     try std.testing.expectEqual(@as(usize, 18), tools.len);
+}
+
+test "all tools applies configured tool customizations" {
+    const customizations: []const config_types.ToolCustomization = &.{
+        .{
+            .name = "shell",
+            .system_prompt = "Custom shell description",
+        },
+        .{
+            .name = "calculator",
+            .enabled = false,
+        },
+    };
+    const tools = try allTools(std.testing.allocator, "/tmp/yc_test", .{
+        .tools_config = .{ .tool_customizations = customizations },
+    });
+    defer deinitTools(std.testing.allocator, tools);
+
+    var saw_shell = false;
+    var saw_calculator = false;
+    for (tools) |t| {
+        if (std.mem.eql(u8, t.name(), "shell")) {
+            try std.testing.expectEqualStrings("Custom shell description", t.description());
+            saw_shell = true;
+        }
+        if (std.mem.eql(u8, t.name(), "calculator")) {
+            saw_calculator = true;
+        }
+    }
+    try std.testing.expect(saw_shell);
+    try std.testing.expect(!saw_calculator);
 }
 
 test "all tools wires shell sandbox by default" {
@@ -1163,6 +1207,37 @@ test "subagent tools use configured shell and file limits" {
     try std.testing.expect(saw_file_edit);
     try std.testing.expect(saw_file_read_hashed);
     try std.testing.expect(saw_file_edit_hashed);
+}
+
+test "subagent tools applies configured tool customizations" {
+    const customizations: []const config_types.ToolCustomization = &.{
+        .{
+            .name = "shell",
+            .system_prompt = "Subagent shell description",
+        },
+        .{
+            .name = "file_write",
+            .enabled = false,
+        },
+    };
+    const tools = try subagentTools(std.testing.allocator, "/tmp/yc_test", .{
+        .tools_config = .{ .tool_customizations = customizations },
+    });
+    defer deinitTools(std.testing.allocator, tools);
+
+    var saw_shell = false;
+    var saw_file_write = false;
+    for (tools) |t| {
+        if (std.mem.eql(u8, t.name(), "shell")) {
+            try std.testing.expectEqualStrings("Subagent shell description", t.description());
+            saw_shell = true;
+        }
+        if (std.mem.eql(u8, t.name(), "file_write")) {
+            saw_file_write = true;
+        }
+    }
+    try std.testing.expect(saw_shell);
+    try std.testing.expect(!saw_file_write);
 }
 
 test "subagent tools wire bootstrap provider into bootstrap-aware file tools for sqlite backends" {

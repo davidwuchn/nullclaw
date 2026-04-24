@@ -1622,6 +1622,26 @@ pub const Agent = struct {
         return result.toOwnedSlice(arena);
     }
 
+    fn priorityToolNameForMessage(
+        tools_config: config_types.ToolsConfig,
+        user_message: []const u8,
+    ) ?[]const u8 {
+        var highest_priority: u8 = 0;
+        var priority_tool: ?[]const u8 = null;
+        for (tools_config.tool_customizations) |custom| {
+            if (!custom.enabled or custom.triggers.len == 0) continue;
+            for (custom.triggers) |kw| {
+                if (containsAsciiIgnoreCase(user_message, kw)) {
+                    if (priority_tool == null or custom.priority >= highest_priority) {
+                        highest_priority = custom.priority;
+                        priority_tool = custom.name;
+                    }
+                }
+            }
+        }
+        return priority_tool;
+    }
+
     /// Execute a single conversation turn: send messages to LLM, parse tool calls,
     /// execute tools, and loop until a final text response is produced.
     pub fn turn(self: *Agent, user_message: []const u8) ![]const u8 {
@@ -1644,25 +1664,10 @@ pub const Agent = struct {
         var effective_user_message_owned = false;
         defer if (effective_user_message_owned) self.allocator.free(effective_user_message);
 
-        // Process tool triggers to inject PRIORITY hints natively into the LLM context
-        if (self.tools_config.tool_customizations.len > 0) {
-            var highest_priority: u8 = 0;
-            var priority_tool: ?[]const u8 = null;
-            for (self.tools_config.tool_customizations) |custom| {
-                if (!custom.enabled or custom.triggers.len == 0) continue;
-                for (custom.triggers) |kw| {
-                    if (containsAsciiIgnoreCase(effective_user_message, kw)) {
-                        if (custom.priority >= highest_priority) {
-                            highest_priority = custom.priority;
-                            priority_tool = custom.name;
-                        }
-                    }
-                }
-            }
-            if (priority_tool) |pn| {
-                effective_user_message = try std.fmt.allocPrint(self.allocator, "[PRIORITY: Please call the {s} tool immediately] {s}", .{ pn, effective_user_message });
-                effective_user_message_owned = true;
-            }
+        // Tool triggers bias the LLM toward a matching configured tool without changing tool availability.
+        if (priorityToolNameForMessage(self.tools_config, effective_user_message)) |tool_name| {
+            effective_user_message = try std.fmt.allocPrint(self.allocator, "[PRIORITY: Please call the {s} tool immediately] {s}", .{ tool_name, effective_user_message });
+            effective_user_message_owned = true;
         }
 
         const turn_route_selection = self.routeSelectionForTurn(effective_user_message);
@@ -9853,4 +9858,31 @@ test "globMatch handles prefix wildcard" {
     try std.testing.expect(Agent.globMatch("*", "anything"));
     try std.testing.expect(Agent.globMatch("shell", "shell"));
     try std.testing.expect(!Agent.globMatch("shell", "shell_extra"));
+}
+
+test "priorityToolNameForMessage selects highest enabled trigger match" {
+    const customizations: []const config_types.ToolCustomization = &.{
+        .{
+            .name = "shell",
+            .triggers = &.{"run"},
+            .priority = 2,
+        },
+        .{
+            .name = "file_read",
+            .triggers = &.{"inspect"},
+            .priority = 9,
+        },
+        .{
+            .name = "git",
+            .triggers = &.{"status"},
+            .priority = 255,
+            .enabled = false,
+        },
+    };
+    const tools_config = config_types.ToolsConfig{ .tool_customizations = customizations };
+
+    // Regression: disabled matches must not override enabled trigger hints.
+    const selected = Agent.priorityToolNameForMessage(tools_config, "please RUN and inspect the workspace status") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("file_read", selected);
+    try std.testing.expect(Agent.priorityToolNameForMessage(tools_config, "plain chat") == null);
 }
