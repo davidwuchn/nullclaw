@@ -55,6 +55,26 @@ pub fn estimate_text_tokens(text: []const u8) u32 {
     return @intCast((text.len + 3) / 4);
 }
 
+// ─── Progress hints ──────────────────────────────────────────────────────────
+
+/// Progress hint emitted during a turn. For tool-call starts, text is the tool name.
+pub const ProgressHint = struct {
+    text: []const u8,
+};
+
+/// Callback invoked for each progress hint. Same lifetime rules as StreamCallback.
+pub const ProgressCallback = *const fn (ctx: *anyopaque, hint: ProgressHint) void;
+
+/// Sink wrapping a ProgressCallback + context pointer.
+pub const ProgressSink = struct {
+    callback: ProgressCallback,
+    ctx: *anyopaque,
+
+    pub fn emit(self: ProgressSink, hint: ProgressHint) void {
+        self.callback(self.ctx, hint);
+    }
+};
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Agent
 // ═══════════════════════════════════════════════════════════════════════════
@@ -336,6 +356,10 @@ pub const Agent = struct {
     stream_callback: ?providers.StreamCallback = null,
     /// Context pointer passed to stream_callback.
     stream_ctx: ?*anyopaque = null,
+    /// Optional progress hint callback. When set, called on tool_call_start events.
+    progress_callback: ?ProgressCallback = null,
+    /// Context pointer passed to progress_callback.
+    progress_ctx: ?*anyopaque = null,
     /// Optional callback invoked for each LLM response usage record.
     usage_record_callback: ?UsageRecordCallback = null,
     /// Context pointer passed to usage_record_callback.
@@ -2463,6 +2487,9 @@ pub const Agent = struct {
 
                 const tool_start_event = ObserverEvent{ .tool_call_start = .{ .tool = call.name } };
                 self.observer.recordEvent(&tool_start_event);
+                if (self.progress_callback) |cb| {
+                    if (self.progress_ctx) |pctx| cb(pctx, .{ .text = call.name });
+                }
 
                 const tool_timer = std_compat.time.milliTimestamp();
                 const result = blk: {
@@ -7584,6 +7611,8 @@ test "Agent streaming fields default to null" {
 
     try std.testing.expect(agent.stream_callback == null);
     try std.testing.expect(agent.stream_ctx == null);
+    try std.testing.expect(agent.progress_callback == null);
+    try std.testing.expect(agent.progress_ctx == null);
 }
 
 // ── Bug regression tests ─────────────────────────────────────────
