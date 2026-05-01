@@ -44,6 +44,7 @@ This page groups the NullClaw CLI by task so you can find the right command quic
 | `nullclaw onboard --channels-only` | Reconfigure channels and allowlists only |
 | `nullclaw agent -m "..."` | Run a single prompt |
 | `nullclaw agent --workspace /path/to/workspace -m "..."` | Run the agent against a specific workspace for this process |
+| `nullclaw agent --skill news-digest -m "..."` | Run a single prompt with a named skill active |
 | `nullclaw agent` | Start interactive chat mode |
 
 ### Interactive model routing
@@ -57,6 +58,7 @@ This page groups the NullClaw CLI by task so you can find the right command quic
 - `/model auto` clears the user pin, restores the configured default model, and re-enables `model_routes` for later turns in the same session.
 - If no `model_routes` are configured, `/model auto` still clears the pin and returns the session to the configured default model.
 - Starting `nullclaw agent` with `--model` or `--provider` also pins the run and bypasses `model_routes`.
+- Starting `nullclaw agent` with `--skill <name>` activates that skill before the first message or REPL turn.
 
 ## Runtime and operations
 
@@ -122,7 +124,7 @@ Notes:
 | Command | Purpose |
 |---|---|
 | `nullclaw skills list` | List installed skills |
-| `nullclaw skills install <source>` | Install from a GitHub URL or local path |
+| `nullclaw skills install <source>` | Install from a Git URL, local path, or HTTPS well-known skill endpoint |
 | `nullclaw skills install --name <query>` | Search the skill registry and install the best matching skill |
 | `nullclaw skills remove <name>` | Remove a skill |
 | `nullclaw skills info <name>` | Show skill metadata |
