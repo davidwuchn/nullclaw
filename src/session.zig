@@ -201,7 +201,19 @@ pub const Session = struct {
         self.injection_pending = duped;
     }
 
-    /// Returns true if there is a pending injection (lock-free snapshot).
+    /// Drain the pending injection into target_allocator.
+    /// On allocation failure, keeps the pending injection available for a later drain.
+    pub fn drainInjection(self: *Session, source_allocator: Allocator, target_allocator: Allocator) !?[]u8 {
+        self.injection_mu.lock();
+        defer self.injection_mu.unlock();
+        const pending = self.injection_pending orelse return null;
+        const owned = try target_allocator.dupe(u8, pending);
+        source_allocator.free(pending);
+        self.injection_pending = null;
+        return owned;
+    }
+
+    /// Returns true if there is a pending injection.
     pub fn hasInjection(self: *Session) bool {
         self.injection_mu.lock();
         defer self.injection_mu.unlock();
@@ -1763,14 +1775,7 @@ pub const SessionManager = struct {
 
             fn callback(ctx: *anyopaque, agent_alloc: std.mem.Allocator) ?[]u8 {
                 const dc: *@This() = @ptrCast(@alignCast(ctx));
-                dc.session.injection_mu.lock();
-                defer dc.session.injection_mu.unlock();
-                const pending = dc.session.injection_pending orelse return null;
-                defer {
-                    dc.sm_allocator.free(pending);
-                    dc.session.injection_pending = null;
-                }
-                return agent_alloc.dupe(u8, pending) catch null;
+                return dc.session.drainInjection(dc.sm_allocator, agent_alloc) catch null;
             }
         };
         var drain_ctx = DrainCtx{ .session = session, .sm_allocator = self.allocator };
@@ -1863,6 +1868,17 @@ pub const SessionManager = struct {
             break :blk self.sessions.get(session_key) orelse return;
         };
         try session.injectMidTurn(self.allocator, text);
+    }
+
+    /// Route one inbound message and apply the non-blocking injection side effect.
+    /// Callers should still handle .process/.queue by invoking processMessage*.
+    pub fn routeInbound(self: *SessionManager, session_key: []const u8, text: []const u8) !inbound_router.RoutingDecision {
+        const decision = inbound_router.route(self.routeInput(session_key));
+        switch (decision) {
+            .inject, .replace_injection => try self.injectMidTurn(session_key, text),
+            .process, .queue, .drop => {},
+        }
+        return decision;
     }
 
     pub const SessionSnapshot = struct {
@@ -3764,6 +3780,70 @@ test "processMessageStreaming forwards tool progress hints" {
     // Regression: A2A streaming depends on this sink to observe tool-call starts.
     try testing.expectEqual(@as(usize, 1), collector.count);
     try testing.expectEqualStrings("probe", collector.lastText());
+}
+
+test "routeInbound injects and replaces mid-turn messages" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session_key = "route:inject";
+    const session = try sm.getOrCreate(session_key);
+    session.agent.queue_mode = .latest;
+    session.turn_running.store(true, .release);
+
+    // Regression: channel and gateway shells use routeInbound to avoid duplicating
+    // route()+inject side effects at each inbound call site.
+    try testing.expectEqual(inbound_router.RoutingDecision.inject, try sm.routeInbound(session_key, "first"));
+    try testing.expect(session.hasInjection());
+    try testing.expectEqual(inbound_router.RoutingDecision.replace_injection, try sm.routeInbound(session_key, "second"));
+
+    const drained = (try session.drainInjection(testing.allocator, testing.allocator)).?;
+    defer testing.allocator.free(drained);
+    try testing.expectEqualStrings("second", drained);
+    try testing.expect(!session.hasInjection());
+}
+
+test "routeInbound drops queue off while turn is running" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session_key = "route:drop";
+    const session = try sm.getOrCreate(session_key);
+    session.agent.queue_mode = .off;
+    session.turn_running.store(true, .release);
+
+    try testing.expectEqual(inbound_router.RoutingDecision.drop, try sm.routeInbound(session_key, "ignored"));
+    try testing.expect(!session.hasInjection());
+}
+
+test "drainInjection keeps pending message on allocation failure" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("route:oom");
+    try session.injectMidTurn(testing.allocator, "keep");
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    failing.fail_index = failing.alloc_index;
+
+    // Regression: a transient allocation failure while draining must not discard
+    // the user's pending mid-turn injection.
+    try testing.expectError(
+        error.OutOfMemory,
+        session.drainInjection(testing.allocator, failing.allocator()),
+    );
+    try testing.expect(session.hasInjection());
+
+    const drained = (try session.drainInjection(testing.allocator, testing.allocator)).?;
+    defer testing.allocator.free(drained);
+    try testing.expectEqualStrings("keep", drained);
+    try testing.expect(!session.hasInjection());
 }
 
 test "processMessage refreshes system prompt when conversation context is cleared" {

@@ -4,12 +4,11 @@
 //! the effectful shell should take.  No I/O, no allocations — fully unit-testable.
 //!
 //! Usage:
-//!   const input = session_mgr.routeInput(session_key);
-//!   switch (inbound_router.route(input)) {
+//!   switch (session_mgr.routeInbound(session_key, text)) {
 //!       .process          => session_mgr.processMessageStreaming(...),
-//!       .inject           => session_mgr.injectMidTurn(session_key, text),
-//!       .replace_injection => session_mgr.injectMidTurn(session_key, text),  // same effect
-//!       .queue            => session_mgr.enqueuePostTurn(session_key, text),
+//!       .inject           => {},
+//!       .replace_injection => {},
+//!       .queue            => session_mgr.processMessageStreaming(...),
 //!       .drop             => {},
 //!   }
 

@@ -29,7 +29,6 @@ const thread_stacks = @import("thread_stacks.zig");
 const control_plane = @import("control_plane.zig");
 const agent_bindings_config = @import("agent_bindings_config.zig");
 const fs_compat = @import("fs_compat.zig");
-const inbound_router = @import("inbound_router.zig");
 const provider_probe = @import("provider_probe.zig");
 
 const signal = @import("channels/signal.zig");
@@ -188,6 +187,25 @@ fn compactAgentErrorMessage(err: anyerror) []const u8 {
         error.NoResponseContent => "Model returned an empty response. Please try again.",
         error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError, error.AllProvidersFailed, error.OutOfMemory => defaultAgentErrorMessage(err),
         else => "An error occurred. Try again.",
+    };
+}
+
+fn handleChannelInboundRoute(
+    session_mgr: *session_mod.SessionManager,
+    session_key: []const u8,
+    content: []const u8,
+) bool {
+    const decision = session_mgr.routeInbound(session_key, content) catch |err| {
+        log.warn("inbound route failed session={s} err={}", .{ session_key, err });
+        return false;
+    };
+    return switch (decision) {
+        .inject, .replace_injection => true,
+        .drop => blk: {
+            log.info("dropping message: session busy queue_mode=off session={s}", .{session_key});
+            break :blk true;
+        },
+        .process, .queue => false,
     };
 }
 
@@ -774,6 +792,8 @@ fn handleTelegramInteractiveCallback(
             return false;
         }
 
+        if (handleChannelInboundRoute(&runtime.session_mgr, session_key, content)) return true;
+
         const model_reply = runtime.session_mgr.processMessage(session_key, content, conversation_context) catch |err| {
             log.err("failed to process telegram callback interaction: {}", .{err});
             response_owned = true;
@@ -977,18 +997,7 @@ fn processTelegramMessage(
     };
     const sink = tg_ptr.makeSink(&stream_ctx);
 
-    switch (inbound_router.route(runtime.session_mgr.routeInput(session_key))) {
-        .inject, .replace_injection => {
-            runtime.session_mgr.injectMidTurn(session_key, content) catch |err|
-                log.warn("mid-turn inject failed session={s} err={}", .{ session_key, err });
-            return;
-        },
-        .drop => {
-            log.info("dropping message: session busy queue_mode=off session={s}", .{session_key});
-            return;
-        },
-        .process, .queue => {},
-    }
+    if (handleChannelInboundRoute(&runtime.session_mgr, session_key, content)) return;
 
     tg_ptr.setTaskReaction(sender, message_id, .running);
     const reply = runtime.session_mgr.processMessageStreaming(session_key, content, conversation_context, sink, null) catch |err| {
@@ -1895,6 +1904,8 @@ pub fn runSignalLoop(
                 break :blk route.session_key;
             };
 
+            if (handleChannelInboundRoute(&runtime.session_mgr, session_key, msg.content)) continue;
+
             const typing_target = msg.reply_target;
             if (typing_target) |target| sg_ptr.startTyping(target) catch {};
             defer if (typing_target) |target| sg_ptr.stopTyping(target) catch {};
@@ -2014,6 +2025,8 @@ pub fn runWeixinLoop(
                 .peer_id = msg.sender,
                 .is_group = false,
             });
+
+            if (handleChannelInboundRoute(&runtime.session_mgr, session_key, msg.content)) continue;
 
             const reply = runtime.session_mgr.processMessage(session_key, msg.content, conversation_context) catch |err| {
                 logAgentProcessingError(allocator, "Weixin agent error", err);
@@ -2259,6 +2272,8 @@ pub fn runMatrixLoop(
                 break :blk route.session_key;
             };
 
+            if (handleChannelInboundRoute(&runtime.session_mgr, session_key, msg.content)) continue;
+
             const typing_target = msg.reply_target orelse msg.sender;
             mx_ptr.startTyping(typing_target) catch {};
             defer mx_ptr.stopTyping(typing_target) catch {};
@@ -2405,18 +2420,7 @@ pub fn runMaxLoop(
                 break :blk route.session_key;
             };
 
-            switch (inbound_router.route(runtime.session_mgr.routeInput(session_key))) {
-                .inject, .replace_injection => {
-                    runtime.session_mgr.injectMidTurn(session_key, msg.content) catch |err|
-                        log.warn("mid-turn inject failed session={s} err={}", .{ session_key, err });
-                    continue;
-                },
-                .drop => {
-                    log.info("dropping message: session busy queue_mode=off session={s}", .{session_key});
-                    continue;
-                },
-                .process, .queue => {},
-            }
+            if (handleChannelInboundRoute(&runtime.session_mgr, session_key, msg.content)) continue;
 
             mx_ptr.startTyping(reply_target) catch {};
             defer mx_ptr.stopTyping(reply_target) catch {};

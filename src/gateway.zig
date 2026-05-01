@@ -39,7 +39,6 @@ const constantTimeEq = @import("security/pairing.zig").constantTimeEq;
 const channels = @import("channels/root.zig");
 const bus_mod = @import("bus.zig");
 const a2a = @import("a2a.zig");
-const inbound_router = @import("inbound_router.zig");
 const thread_stacks = @import("thread_stacks.zig");
 const channel_adapters = @import("channel_adapters.zig");
 const cron_mod = @import("cron.zig");
@@ -2424,6 +2423,30 @@ fn setXmlResponse(ctx: *WebhookHandlerContext, body: []const u8) void {
     ctx.response_body = body;
 }
 
+fn routeWebhookInbound(
+    ctx: *WebhookHandlerContext,
+    sm: *session_mod.SessionManager,
+    session_key: []const u8,
+    content: []const u8,
+    response_status: ?[]const u8,
+    response_content_type: ?[]const u8,
+    response_body: []const u8,
+) bool {
+    const decision = sm.routeInbound(session_key, content) catch |err| {
+        std.log.scoped(.gateway).warn("inbound route failed session={s} err={}", .{ session_key, err });
+        return false;
+    };
+    switch (decision) {
+        .inject, .replace_injection => {},
+        .drop => std.log.scoped(.gateway).info("dropping inbound: session busy queue_mode=off session={s}", .{session_key}),
+        .process, .queue => return false,
+    }
+    if (response_status) |status| ctx.response_status = status;
+    if (response_content_type) |content_type| ctx.response_content_type = content_type;
+    ctx.response_body = response_body;
+    return true;
+}
+
 const WebhookHandlerFn = *const fn (ctx: *WebhookHandlerContext) void;
 
 const WebhookRouteDescriptor = struct {
@@ -3087,20 +3110,7 @@ fn handleTelegramWebhookRoute(ctx: *WebhookHandlerContext) void {
                     std.mem.eql(u8, peer_kind, "group"),
                     if (std.mem.eql(u8, peer_kind, "group")) cid_str else null,
                 );
-                switch (inbound_router.route(sm.routeInput(sk))) {
-                    .inject, .replace_injection => {
-                        sm.injectMidTurn(sk, msg_text.?) catch |err|
-                            std.log.scoped(.gateway).warn("mid-turn inject failed session={s} err={}", .{ sk, err });
-                        ctx.response_body = "{\"status\":\"received\"}";
-                        return;
-                    },
-                    .drop => {
-                        std.log.scoped(.gateway).info("dropping inbound: session busy queue_mode=off session={s}", .{sk});
-                        ctx.response_body = "{\"status\":\"received\"}";
-                        return;
-                    },
-                    .process, .queue => {},
-                }
+                if (routeWebhookInbound(ctx, sm, sk, msg_text.?, null, null, "{\"status\":\"received\"}")) return;
                 const reply: ?[]const u8 = sm.processMessage(sk, msg_text.?, conversation_context) catch |err| blk: {
                     if (tg_bot_token.len > 0) {
                         sendTelegramReply(ctx.req_allocator, tg_bot_token, chat_id.?, thread_id, userFacingAgentError(err)) catch {};
@@ -3248,20 +3258,7 @@ fn handleWhatsAppWebhookRoute(ctx: *WebhookHandlerContext) void {
                     wa_is_group,
                     wa_group_id,
                 );
-                switch (inbound_router.route(sm.routeInput(wa_session_key))) {
-                    .inject, .replace_injection => {
-                        sm.injectMidTurn(wa_session_key, mt) catch |err|
-                            std.log.scoped(.gateway).warn("mid-turn inject failed session={s} err={}", .{ wa_session_key, err });
-                        ctx.response_body = "{\"status\":\"received\"}";
-                        return;
-                    },
-                    .drop => {
-                        std.log.scoped(.gateway).info("dropping inbound: session busy queue_mode=off session={s}", .{wa_session_key});
-                        ctx.response_body = "{\"status\":\"received\"}";
-                        return;
-                    },
-                    .process, .queue => {},
-                }
+                if (routeWebhookInbound(ctx, sm, wa_session_key, mt, null, null, "{\"status\":\"received\"}")) return;
                 const reply: ?[]const u8 = sm.processMessage(wa_session_key, mt, conversation_context) catch |err| blk: {
                     ctx.response_body = userFacingAgentErrorJson(err);
                     break :blk null;
@@ -3326,20 +3323,7 @@ fn handleWhatsAppWebhookRoute(ctx: *WebhookHandlerContext) void {
                     wa_is_group,
                     wa_group_id,
                 );
-                switch (inbound_router.route(sm.routeInput(wa_session_key))) {
-                    .inject, .replace_injection => {
-                        sm.injectMidTurn(wa_session_key, mt) catch |err|
-                            std.log.scoped(.gateway).warn("mid-turn inject failed session={s} err={}", .{ wa_session_key, err });
-                        ctx.response_body = "{\"status\":\"received\"}";
-                        return;
-                    },
-                    .drop => {
-                        std.log.scoped(.gateway).info("dropping inbound: session busy queue_mode=off session={s}", .{wa_session_key});
-                        ctx.response_body = "{\"status\":\"received\"}";
-                        return;
-                    },
-                    .process, .queue => {},
-                }
+                if (routeWebhookInbound(ctx, sm, wa_session_key, mt, null, null, "{\"status\":\"received\"}")) return;
                 const reply: ?[]const u8 = sm.processMessage(wa_session_key, mt, conversation_context) catch |err| blk: {
                     ctx.response_body = userFacingAgentErrorJson(err);
                     break :blk null;
@@ -3551,20 +3535,7 @@ fn handleSlackWebhookRoute(ctx: *WebhookHandlerContext) void {
                         !interactive_target.is_dm,
                         if (!interactive_target.is_dm) interactive_target.channel_id else null,
                     );
-                    switch (inbound_router.route(sm.routeInput(session_key))) {
-                        .inject, .replace_injection => {
-                            sm.injectMidTurn(session_key, selection.submit_text) catch |err|
-                                std.log.scoped(.gateway).warn("mid-turn inject failed session={s} err={}", .{ session_key, err });
-                            ctx.response_body = "{\"status\":\"ok\"}";
-                            return;
-                        },
-                        .drop => {
-                            std.log.scoped(.gateway).info("dropping inbound: session busy queue_mode=off session={s}", .{session_key});
-                            ctx.response_body = "{\"status\":\"ok\"}";
-                            return;
-                        },
-                        .process, .queue => {},
-                    }
+                    if (routeWebhookInbound(ctx, sm, session_key, selection.submit_text, null, null, "{\"status\":\"ok\"}")) return;
                     const reply: ?[]const u8 = sm.processMessage(session_key, selection.submit_text, conversation_context) catch |err| blk: {
                         var outbound_ch = channels.slack.SlackChannel.initFromConfig(ctx.req_allocator, slack_cfg.*);
                         outbound_ch.sendMessage(selection.target, userFacingAgentError(err)) catch {};
@@ -3707,20 +3678,7 @@ fn handleSlackWebhookRoute(ctx: *WebhookHandlerContext) void {
             !is_dm,
             if (!is_dm) channel_id else null,
         );
-        switch (inbound_router.route(sm.routeInput(sk))) {
-            .inject, .replace_injection => {
-                sm.injectMidTurn(sk, text) catch |err|
-                    std.log.scoped(.gateway).warn("mid-turn inject failed session={s} err={}", .{ sk, err });
-                ctx.response_body = "{\"status\":\"ok\"}";
-                return;
-            },
-            .drop => {
-                std.log.scoped(.gateway).info("dropping inbound: session busy queue_mode=off session={s}", .{sk});
-                ctx.response_body = "{\"status\":\"ok\"}";
-                return;
-            },
-            .process, .queue => {},
-        }
+        if (routeWebhookInbound(ctx, sm, sk, text, null, null, "{\"status\":\"ok\"}")) return;
         const reply: ?[]const u8 = sm.processMessage(sk, text, conversation_context) catch |err| blk: {
             var outbound_ch = channels.slack.SlackChannel.initFromConfig(ctx.req_allocator, slack_cfg.*);
             outbound_ch.sendMessage(channel_id, userFacingAgentError(err)) catch {};
@@ -3858,20 +3816,7 @@ fn handleLineWebhookRoute(ctx: *WebhookHandlerContext) void {
                         !std.mem.eql(u8, line_peer.kind, "direct"),
                         if (!std.mem.eql(u8, line_peer.kind, "direct")) line_peer.id else null,
                     );
-                    switch (inbound_router.route(sm.routeInput(sk))) {
-                        .inject, .replace_injection => {
-                            sm.injectMidTurn(sk, text) catch |err|
-                                std.log.scoped(.gateway).warn("mid-turn inject failed session={s} err={}", .{ sk, err });
-                            ctx.response_body = "{\"status\":\"ok\"}";
-                            return;
-                        },
-                        .drop => {
-                            std.log.scoped(.gateway).info("dropping inbound: session busy queue_mode=off session={s}", .{sk});
-                            ctx.response_body = "{\"status\":\"ok\"}";
-                            return;
-                        },
-                        .process, .queue => {},
-                    }
+                    if (routeWebhookInbound(ctx, sm, sk, text, null, null, "{\"status\":\"ok\"}")) return;
                     const reply: ?[]const u8 = sm.processMessage(sk, text, conversation_context) catch |err| blk: {
                         if (evt.reply_token) |rt| {
                             var line_ch = channels.line.LineChannel.init(ctx.req_allocator, .{
@@ -4001,20 +3946,7 @@ fn handleLarkWebhookRoute(ctx: *WebhookHandlerContext) void {
                 msg.is_group,
                 if (msg.is_group) msg.sender else null,
             );
-            switch (inbound_router.route(sm.routeInput(sk))) {
-                .inject, .replace_injection => {
-                    sm.injectMidTurn(sk, msg.content) catch |err|
-                        std.log.scoped(.gateway).warn("mid-turn inject failed session={s} err={}", .{ sk, err });
-                    ctx.response_body = "{\"status\":\"ok\"}";
-                    return;
-                },
-                .drop => {
-                    std.log.scoped(.gateway).info("dropping inbound: session busy queue_mode=off session={s}", .{sk});
-                    ctx.response_body = "{\"status\":\"ok\"}";
-                    return;
-                },
-                .process, .queue => {},
-            }
+            if (routeWebhookInbound(ctx, sm, sk, msg.content, null, null, "{\"status\":\"ok\"}")) return;
             const reply: ?[]const u8 = sm.processMessage(sk, msg.content, conversation_context) catch |err| blk: {
                 lark_ch.sendMessage(msg.sender, userFacingAgentError(err)) catch {};
                 break :blk null;
@@ -4246,20 +4178,7 @@ fn handleWeChatWebhookRoute(ctx: *WebhookHandlerContext) void {
             ctx.config_opt,
             wechat_account_id,
         );
-        switch (inbound_router.route(sm.routeInput(session_key))) {
-            .inject, .replace_injection => {
-                sm.injectMidTurn(session_key, inbound.content) catch |err|
-                    std.log.scoped(.gateway).warn("mid-turn inject failed session={s} err={}", .{ session_key, err });
-                setPlainTextResponse(ctx, "success");
-                return;
-            },
-            .drop => {
-                std.log.scoped(.gateway).info("dropping inbound: session busy queue_mode=off session={s}", .{session_key});
-                setPlainTextResponse(ctx, "success");
-                return;
-            },
-            .process, .queue => {},
-        }
+        if (routeWebhookInbound(ctx, sm, session_key, inbound.content, null, CONTENT_TYPE_TEXT, "success")) return;
         const reply: ?[]const u8 = sm.processMessage(session_key, inbound.content, null) catch null;
         if (reply) |r| {
             defer ctx.root_allocator.free(r);
@@ -4446,20 +4365,7 @@ fn handleWeComWebhookRoute(ctx: *WebhookHandlerContext) void {
     }
 
     if (ctx.session_mgr_opt) |sm| {
-        switch (inbound_router.route(sm.routeInput(session_key))) {
-            .inject, .replace_injection => {
-                sm.injectMidTurn(session_key, inbound.content) catch |err|
-                    std.log.scoped(.gateway).warn("mid-turn inject failed session={s} err={}", .{ session_key, err });
-                ctx.response_body = "{\"status\":\"received\"}";
-                return;
-            },
-            .drop => {
-                std.log.scoped(.gateway).info("dropping inbound: session busy queue_mode=off session={s}", .{session_key});
-                ctx.response_body = "{\"status\":\"received\"}";
-                return;
-            },
-            .process, .queue => {},
-        }
+        if (routeWebhookInbound(ctx, sm, session_key, inbound.content, null, null, "{\"status\":\"received\"}")) return;
         const reply: ?[]const u8 = sm.processMessage(session_key, inbound.content, null) catch |err| blk: {
             if (wecom_cfg_opt) |wecom_cfg| {
                 var wecom_ch = channels.wecom.WeComChannel.initFromConfig(ctx.req_allocator, wecom_cfg.*);
@@ -4583,20 +4489,7 @@ fn handleQqWebhookRoute(ctx: *WebhookHandlerContext) void {
                 .is_group = if (peer) |resolved| resolved.kind != .direct else null,
                 .group_id = if (peer) |resolved| if (resolved.kind == .direct) null else resolved.id else null,
             });
-            switch (inbound_router.route(sm.routeInput(session_key))) {
-                .inject, .replace_injection => {
-                    sm.injectMidTurn(session_key, inbound.content) catch |err|
-                        std.log.scoped(.gateway).warn("mid-turn inject failed session={s} err={}", .{ session_key, err });
-                    ctx.response_body = "{\"status\":\"ok\"}";
-                    return;
-                },
-                .drop => {
-                    std.log.scoped(.gateway).info("dropping inbound: session busy queue_mode=off session={s}", .{session_key});
-                    ctx.response_body = "{\"status\":\"ok\"}";
-                    return;
-                },
-                .process, .queue => {},
-            }
+            if (routeWebhookInbound(ctx, sm, session_key, inbound.content, null, null, "{\"status\":\"ok\"}")) return;
             const reply: ?[]const u8 = sm.processMessage(session_key, inbound.content, conversation_context) catch |err| blk: {
                 qq_channel.sendMessage(inbound.chat_id, userFacingAgentError(err)) catch {};
                 break :blk null;
@@ -4714,20 +4607,7 @@ fn handleMaxWebhookRoute(ctx: *WebhookHandlerContext) void {
                 inbound.is_group,
                 if (inbound.is_group) reply_target else null,
             );
-            switch (inbound_router.route(sm.routeInput(sk))) {
-                .inject, .replace_injection => {
-                    sm.injectMidTurn(sk, inbound.content) catch |err|
-                        std.log.scoped(.gateway).warn("mid-turn inject failed session={s} err={}", .{ sk, err });
-                    ctx.response_body = "{\"status\":\"ok\"}";
-                    return;
-                },
-                .drop => {
-                    std.log.scoped(.gateway).info("dropping inbound: session busy queue_mode=off session={s}", .{sk});
-                    ctx.response_body = "{\"status\":\"ok\"}";
-                    return;
-                },
-                .process, .queue => {},
-            }
+            if (routeWebhookInbound(ctx, sm, sk, inbound.content, null, null, "{\"status\":\"ok\"}")) return;
             const reply: ?[]const u8 = sm.processMessage(sk, inbound.content, conversation_context) catch |err| blk: {
                 max_ch.sendMessage(reply_target, userFacingAgentError(err)) catch {};
                 break :blk null;
@@ -4918,22 +4798,7 @@ fn handleTeamsWebhookRoute(ctx: *WebhookHandlerContext) void {
     if (ctx.state.event_bus) |eb| {
         _ = publishToBus(eb, ctx.state.allocator, "teams", from_id, chat_id, text, sk, metadata);
     } else if (ctx.session_mgr_opt) |sm| {
-        switch (inbound_router.route(sm.routeInput(sk))) {
-            .inject, .replace_injection => {
-                sm.injectMidTurn(sk, text) catch |err|
-                    std.log.scoped(.gateway).warn("mid-turn inject failed session={s} err={}", .{ sk, err });
-                ctx.response_status = "202 Accepted";
-                ctx.response_body = "{\"status\":\"accepted\"}";
-                return;
-            },
-            .drop => {
-                std.log.scoped(.gateway).info("dropping inbound: session busy queue_mode=off session={s}", .{sk});
-                ctx.response_status = "202 Accepted";
-                ctx.response_body = "{\"status\":\"accepted\"}";
-                return;
-            },
-            .process, .queue => {},
-        }
+        if (routeWebhookInbound(ctx, sm, sk, text, "202 Accepted", null, "{\"status\":\"accepted\"}")) return;
         const reply: ?[]const u8 = sm.processMessage(sk, text, conversation_context) catch blk: {
             break :blk null;
         };
@@ -5651,10 +5516,12 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                                 response_body = "{\"status\":\"received\"}";
                             } else if (session_mgr_opt) |*sm| {
                                 route_blk: {
-                                    switch (inbound_router.route(sm.routeInput(routing.session_key))) {
+                                    const route_decision = sm.routeInbound(routing.session_key, msg_text) catch |err| blk: {
+                                        std.log.scoped(.gateway).warn("inbound route failed session={s} err={}", .{ routing.session_key, err });
+                                        break :blk null;
+                                    };
+                                    if (route_decision) |decision| switch (decision) {
                                         .inject, .replace_injection => {
-                                            sm.injectMidTurn(routing.session_key, msg_text) catch |err|
-                                                std.log.scoped(.gateway).warn("mid-turn inject failed session={s} err={}", .{ routing.session_key, err });
                                             response_body = "{\"status\":\"received\"}";
                                             break :route_blk;
                                         },
@@ -5664,7 +5531,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                                             break :route_blk;
                                         },
                                         .process, .queue => {},
-                                    }
+                                    };
                                     const start_seq = gateway_thread_observer.currentSeq();
                                     const reply: ?[]const u8 = sm.processMessage(routing.session_key, msg_text, routing.conversation_context) catch |err| blk: {
                                         response_body = userFacingAgentErrorJson(err);

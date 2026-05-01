@@ -20,6 +20,7 @@ const dispatch = @import("channels/dispatch.zig");
 const channel_outbox = @import("channels/outbox.zig");
 const channel_loop = @import("channel_loop.zig");
 const channel_manager = @import("channel_manager.zig");
+const session_mod = @import("session.zig");
 const agent_routing = @import("agent_routing.zig");
 const channel_catalog = @import("channel_catalog.zig");
 const channel_adapters = @import("channel_adapters.zig");
@@ -55,6 +56,25 @@ const HEARTBEAT_THREAD_STACK_SIZE: usize = thread_stacks.SESSION_TURN_STACK_SIZE
 /// Maximum number of supervised components.
 const MAX_COMPONENTS: usize = 8;
 var outbound_draft_id_counter: Atomic(u64) = Atomic(u64).init(1);
+
+fn handleDaemonInboundRoute(
+    session_mgr: *session_mod.SessionManager,
+    session_key: []const u8,
+    content: []const u8,
+) bool {
+    const decision = session_mgr.routeInbound(session_key, content) catch |err| {
+        log.warn("inbound route failed session={s} err={}", .{ session_key, err });
+        return false;
+    };
+    return switch (decision) {
+        .inject, .replace_injection => true,
+        .drop => blk: {
+            log.info("dropping inbound: session busy queue_mode=off session={s}", .{session_key});
+            break :blk true;
+        },
+        .process, .queue => false,
+    };
+}
 
 /// Component status for state file serialization.
 pub const ComponentStatus = struct {
@@ -1211,6 +1231,13 @@ fn inboundDispatcherThread(
             defer if (routed_session_key) |key| allocator.free(key);
             const session_key = routed_session_key orelse msg.session_key;
 
+            const outbound_channel = resolveOutboundChannel(registry, msg.channel, outbound_account_id);
+            if (outbound_channel) |channel| {
+                markInboundMessageRead(channel, buildInboundMessageRef(&msg, parsed_meta.fields));
+            }
+
+            if (handleDaemonInboundRoute(&runtime.session_mgr, session_key, msg.content)) continue;
+
             const typing_recipient = sendInboundProcessingIndicator(
                 allocator,
                 registry,
@@ -1227,10 +1254,6 @@ fn inboundDispatcherThread(
                 typing_recipient,
             );
 
-            const outbound_channel = resolveOutboundChannel(registry, msg.channel, outbound_account_id);
-            if (outbound_channel) |channel| {
-                markInboundMessageRead(channel, buildInboundMessageRef(&msg, parsed_meta.fields));
-            }
             const use_tracked_draft_outbound = if (outbound_channel) |channel|
                 !channel.supportsStreamingOutbound() and dispatch.supportsDraftStreaming(channel)
             else
