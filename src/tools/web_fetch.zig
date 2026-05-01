@@ -144,14 +144,18 @@ pub const WebFetchTool = struct {
 
 fn formatExtractedText(allocator: std.mem.Allocator, extracted: []const u8, max_chars: usize) ![]u8 {
     const preview = util.previewUtf8(extracted, max_chars);
-    if (!preview.truncated) {
-        return allocator.dupe(u8, extracted);
-    }
-    return std.fmt.allocPrint(
-        allocator,
-        "{s}\n\n[Content truncated at {d} chars, total {d} chars]",
-        .{ preview.slice, max_chars, extracted.len },
-    );
+    const truncated_text = if (preview.truncated)
+        try std.fmt.allocPrint(
+            allocator,
+            "{s}\n\n[Content truncated at {d} chars, total {d} chars]",
+            .{ preview.slice, max_chars, extracted.len },
+        )
+    else
+        try allocator.dupe(u8, extracted);
+    defer allocator.free(truncated_text);
+
+    const security = @import("../security/root.zig");
+    return security.wrapExternalContent(allocator, truncated_text, .web_fetch);
 }
 
 fn parseMaxChars(args: JsonObjectMap) usize {

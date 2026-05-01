@@ -115,6 +115,12 @@ pub const WebSearchTool = struct {
                     continue;
                 },
             };
+            if (result.success) {
+                const security = @import("../security/root.zig");
+                const wrapped = try security.wrapExternalContent(allocator, result.output, .web_search);
+                allocator.free(result.output);
+                return ToolResult{ .success = true, .output = wrapped };
+            }
             return result;
         }
 
