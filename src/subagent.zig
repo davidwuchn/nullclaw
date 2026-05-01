@@ -2,7 +2,7 @@
 //!
 //! Spawns subagents in separate OS threads with restricted tool sets
 //! (no message, spawn, delegate — to prevent infinite loops).
-//! Task results are routed via the event bus as system InboundMessages.
+//! Task results are routed back to the originating channel/session.
 
 const std = @import("std");
 const std_compat = @import("compat");
@@ -85,9 +85,6 @@ const ThreadContext = struct {
     task_id: u64,
     task: []const u8,
     label: []const u8,
-    origin_channel: []const u8,
-    origin_chat_id: []const u8,
-    origin_account_id: ?[]const u8 = null,
     agent_name: ?[]const u8 = null,
     trace_id: ?[32]u8 = null,
 };
@@ -251,12 +248,6 @@ pub const SubagentManager = struct {
         errdefer self.allocator.free(task_copy);
         const label_copy = try self.allocator.dupe(u8, label);
         errdefer self.allocator.free(label_copy);
-        const origin_channel_copy = try self.allocator.dupe(u8, origin_channel);
-        errdefer self.allocator.free(origin_channel_copy);
-        const origin_chat_copy = try self.allocator.dupe(u8, origin_chat_id);
-        errdefer self.allocator.free(origin_chat_copy);
-        const origin_account_copy = if (origin_account_id) |account_id| try self.allocator.dupe(u8, account_id) else null;
-        errdefer if (origin_account_copy) |account_id| self.allocator.free(account_id);
         const agent_name_copy = if (agent_name) |name| try self.allocator.dupe(u8, name) else null;
         errdefer if (agent_name_copy) |name| self.allocator.free(name);
 
@@ -270,9 +261,6 @@ pub const SubagentManager = struct {
             .task_id = task_id,
             .task = task_copy,
             .label = label_copy,
-            .origin_channel = origin_channel_copy,
-            .origin_chat_id = origin_chat_copy,
-            .origin_account_id = origin_account_copy,
             .agent_name = agent_name_copy,
             .trace_id = trace_id,
         };
@@ -451,9 +439,6 @@ fn subagentThreadFn(ctx: *ThreadContext) void {
     defer {
         ctx.manager.allocator.free(ctx.task);
         ctx.manager.allocator.free(ctx.label);
-        ctx.manager.allocator.free(ctx.origin_channel);
-        ctx.manager.allocator.free(ctx.origin_chat_id);
-        if (ctx.origin_account_id) |account_id| ctx.manager.allocator.free(account_id);
         if (ctx.agent_name) |agent_name| ctx.manager.allocator.free(agent_name);
         ctx.manager.allocator.destroy(ctx);
     }

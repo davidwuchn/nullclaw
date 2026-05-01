@@ -65,7 +65,7 @@ pub const SpawnTool = struct {
 
         const msg = std.fmt.allocPrint(
             allocator,
-            "Subagent '{s}' spawned with task_id={d}. Results will be delivered as system messages.",
+            "Subagent '{s}' spawned with task_id={d}. Results will be delivered as follow-up messages.",
             .{ label, task_id },
         ) catch return ToolResult.ok("Subagent spawned");
 
