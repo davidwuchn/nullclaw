@@ -6387,7 +6387,7 @@ test "parse irc accounts" {
 test "parse matrix accounts" {
     const allocator = std.testing.allocator;
     const json =
-        \\{"channels": {"matrix": {"accounts": {"main": {"homeserver": "https://matrix.org", "access_token": "syt_abc", "room_id": "!room:matrix.org", "user_id": "@bot:matrix.org", "group_allow_from": ["@alice:matrix.org"], "dm_policy": "open", "group_policy": "open", "require_mention": true}}}}}
+        \\{"channels": {"matrix": {"accounts": {"main": {"homeserver": "https://matrix.org", "access_token": "syt_abc", "room_id": "!room:matrix.org", "user_id": "@bot:matrix.org", "group_allow_from": ["@alice:matrix.org"], "dm_policy": "open", "group_policy": "open", "require_mention": true, "pantalaimon_proxy_url": "http://127.0.0.1:8008"}}}}}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
@@ -6403,6 +6403,9 @@ test "parse matrix accounts" {
     try std.testing.expect(mc.require_mention);
     try std.testing.expectEqual(@as(usize, 1), mc.group_allow_from.len);
     try std.testing.expectEqualStrings("@alice:matrix.org", mc.group_allow_from[0]);
+    // Regression: Pantalaimon config must survive JSON parsing before
+    // MatrixChannel can route E2EE traffic through the proxy.
+    try std.testing.expectEqualStrings("http://127.0.0.1:8008", mc.pantalaimon_proxy_url.?);
     allocator.free(mc.account_id);
     allocator.free(mc.homeserver);
     allocator.free(mc.access_token);
@@ -6410,6 +6413,7 @@ test "parse matrix accounts" {
     allocator.free(mc.user_id.?);
     allocator.free(mc.dm_policy);
     allocator.free(mc.group_policy);
+    allocator.free(mc.pantalaimon_proxy_url.?);
     for (mc.group_allow_from) |entry| allocator.free(entry);
     allocator.free(mc.group_allow_from);
     allocator.free(cfg.channels.matrix);
