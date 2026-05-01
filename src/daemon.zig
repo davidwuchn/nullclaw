@@ -1262,6 +1262,7 @@ fn processInboundMessage(
         msg.content,
         conversation_context,
         stream_sink,
+        null,
     ) catch |err| {
         log.warn("inbound dispatch process failed: {}", .{err});
 
