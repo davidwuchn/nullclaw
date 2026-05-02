@@ -143,9 +143,9 @@ pub const ShellTool = struct {
     // This is part of the vtable ownership pattern: the tool creator owns the storage.
     sandbox_storage: SandboxStorage = .{},
     pub const tool_name = "shell";
-    pub const tool_description = "Run a shell command in the workspace directory";
+    pub const tool_description = "Execute a shell command in the workspace directory";
     pub const tool_params =
-        \\{"type":"object","properties":{"command":{"type":"string","description":"The shell command to run"},"cwd":{"type":"string","description":"Working directory (absolute path within allowed paths; defaults to workspace)"}},"required":["command"]}
+        \\{"type":"object","properties":{"command":{"type":"string","description":"The shell command to execute"},"cwd":{"type":"string","description":"Working directory (absolute path within allowed paths; defaults to workspace)"}},"required":["command"]}
     ;
 
     const vtable = root.ToolVTable(@This());
@@ -695,6 +695,28 @@ test "shell ApprovalRequired propagates oom for error message allocation" {
         error.OutOfMemory,
         st.execute(failing.allocator(), parsed.value.object),
     );
+}
+
+test "shell MediumRiskBlocked error is user-facing" {
+    const policy_mod = @import("../security/policy.zig");
+    var tracker = policy_mod.RateTracker.init(std.testing.allocator, 100);
+    defer tracker.deinit();
+    const allowed = [_][]const u8{"curl"};
+    var policy = policy_mod.SecurityPolicy{
+        .autonomy = .full,
+        .workspace_dir = "/tmp",
+        .block_medium_risk_commands = true,
+        .tracker = &tracker,
+        .allowed_commands = &allowed,
+    };
+
+    var st = ShellTool{ .workspace_dir = "/tmp", .policy = &policy };
+    const parsed = try root.parseTestArgs("{\"command\": \"curl https://example.com\"}");
+    defer parsed.deinit();
+    const result = try st.execute(std.testing.allocator, parsed.value.object);
+
+    try std.testing.expect(!result.success);
+    try std.testing.expectEqualStrings("Medium-risk command blocked by security policy", result.error_msg.?);
 }
 
 test "shell wildcard policy permits command outside default allowlist" {

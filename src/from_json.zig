@@ -643,6 +643,24 @@ test "applyAutonomySelection rejects invalid value" {
     try std.testing.expectError(error.InvalidAutonomyLevel, applyAutonomySelection(&cfg, "danger-mode"));
 }
 
+test "applyAutonomySelection maps medium-risk blocking" {
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+    };
+
+    try applyAutonomySelection(&cfg, "autonomous");
+    try std.testing.expectEqual(config_mod.AutonomyLevel.full, cfg.autonomy.level);
+    try std.testing.expect(cfg.autonomy.block_high_risk_commands);
+    try std.testing.expect(cfg.autonomy.block_medium_risk_commands);
+
+    try applyAutonomySelection(&cfg, "fully_autonomous");
+    try std.testing.expectEqual(config_mod.AutonomyLevel.full, cfg.autonomy.level);
+    try std.testing.expect(!cfg.autonomy.block_high_risk_commands);
+    try std.testing.expect(!cfg.autonomy.block_medium_risk_commands);
+}
+
 test "applyChannelsFromString enables webhook from csv" {
     var cfg = Config{
         .workspace_dir = "/tmp",
