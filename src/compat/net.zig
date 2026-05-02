@@ -87,6 +87,8 @@ pub const Stream = struct {
     }
 
     pub fn read(self: Stream, buffer: []u8) ReadError!usize {
+        if (buffer.len == 0) return 0;
+
         const io = shared.io();
         var data = [1][]u8{buffer};
         return io.vtable.netRead(io.userdata, self.handle, &data) catch |err| switch (err) {
@@ -96,6 +98,8 @@ pub const Stream = struct {
     }
 
     pub fn write(self: Stream, bytes: []const u8) WriteError!usize {
+        if (bytes.len == 0) return 0;
+
         const io = shared.io();
         var total: usize = 0;
         while (total < bytes.len) {
@@ -500,7 +504,7 @@ test "compat net normalizes listener and stream blocking mode" {
 
     var conn = server.accept() catch |err| switch (err) {
         error.WouldBlock => blk: {
-            std.time.sleep(10 * std.time.ns_per_ms);
+            std.Io.sleep(shared.io(), .fromNanoseconds(10 * std.time.ns_per_ms), .awake) catch {};
             break :blk try server.accept();
         },
         else => return err,
@@ -575,6 +579,53 @@ test "compat net stream write sends small socket payload" {
     }
 
     try std.testing.expectEqualStrings(payload, &buf);
+}
+
+test "compat net stream zero length io is no-op" {
+    const stream: Stream = .{ .handle = invalidHandle(Stream.Handle) };
+    var empty: [0]u8 = .{};
+
+    try std.testing.expectEqual(@as(usize, 0), try stream.read(&empty));
+    try std.testing.expectEqual(@as(usize, 0), try stream.write(""));
+    try stream.writeAll("");
+}
+
+test "compat net stream read returns zero after peer send shutdown" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const addr = try Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+
+    const client = try tcpConnectToAddress(server.listen_address);
+    defer client.close();
+
+    var conn = try server.accept();
+    defer conn.stream.close();
+
+    try client.shutdown(.send);
+
+    var buf: [8]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), try conn.stream.read(&buf));
+}
+
+test "compat net stream write after send shutdown reports socket unconnected" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const addr = try Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+
+    const client = try tcpConnectToAddress(server.listen_address);
+    defer client.close();
+
+    var conn = try server.accept();
+    defer conn.stream.close();
+
+    try conn.stream.shutdown(.send);
+
+    try std.testing.expectError(error.SocketUnconnected, conn.stream.write("x"));
+    try std.testing.expectError(error.SocketUnconnected, conn.stream.writeAll("x"));
 }
 
 fn socketIsNonblocking(handle: IoNet.Socket.Handle) bool {

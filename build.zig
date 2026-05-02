@@ -609,6 +609,9 @@ pub fn build(b: *std.Build) void {
 
     // ---------- tests ----------
     const test_step = b.step("test", "Run all tests");
+    const compat_tests = b.addTest(.{ .root_module = compat_module });
+    test_step.dependOn(&b.addRunArtifact(compat_tests).step);
+
     if (!is_wasi) {
         const lib_tests = b.addTest(.{ .root_module = lib_mod.? });
         if (sqlite3) |lib| {
