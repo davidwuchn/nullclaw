@@ -39,6 +39,21 @@ fn setSocketNonblocking(handle: IoNet.Socket.Handle, nonblocking: bool) !void {
     }
 }
 
+fn setSocketCloseOnExec(handle: IoNet.Socket.Handle) !void {
+    switch (builtin.os.tag) {
+        .windows, .wasi => return,
+        else => {},
+    }
+
+    while (true) {
+        switch (posix.errno(posix.system.fcntl(handle, posix.F.SETFD, @as(usize, posix.FD_CLOEXEC)))) {
+            .SUCCESS => return,
+            .INTR => continue,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+    }
+}
+
 pub const has_unix_sockets = false;
 
 pub const Stream = struct {
@@ -47,8 +62,8 @@ pub const Stream = struct {
     pub const Handle = IoNet.Socket.Handle;
     pub const Reader = IoNet.Stream.Reader;
     pub const Writer = IoNet.Stream.Writer;
-    pub const ReadError = IoNet.Stream.Reader.Error || error{ WouldBlock, Unexpected };
-    pub const WriteError = IoNet.Stream.Writer.Error || error{Unexpected};
+    pub const ReadError = IoNet.Stream.Reader.Error || error{WouldBlock};
+    pub const WriteError = IoNet.Stream.Writer.Error;
 
     fn toInner(self: Stream) IoNet.Stream {
         return .{
@@ -72,42 +87,43 @@ pub const Stream = struct {
     }
 
     pub fn read(self: Stream, buffer: []u8) ReadError!usize {
-        // Direct posix read — avoids creating a new stream_reader each call
-        // with empty internal buffer, which caused HTTP reads to hang
-        // silently (gateway accept loop appeared responsive but never
-        // returned data to higher-level request parsers).
-        if (comptime builtin.os.tag == .windows) {
-            var stream_reader = self.toInner().reader(shared.io(), &[_]u8{});
-            return stream_reader.interface.readSliceShort(buffer) catch |err| switch (err) {
-                error.ReadFailed => return stream_reader.err orelse error.Unexpected,
-            };
-        }
-        while (true) {
-            const rc = posix.system.read(self.handle, buffer.ptr, buffer.len);
-            switch (posix.errno(rc)) {
-                .SUCCESS => return @intCast(rc),
-                .INTR => continue,
-                .AGAIN => return error.WouldBlock,
-                else => |err| return posix.unexpectedErrno(err),
-            }
-        }
+        const io = shared.io();
+        var data = [1][]u8{buffer};
+        return io.vtable.netRead(io.userdata, self.handle, &data) catch |err| switch (err) {
+            error.Canceled => return error.Canceled,
+            else => return err,
+        };
     }
 
     pub fn write(self: Stream, bytes: []const u8) WriteError!usize {
-        if (comptime builtin.os.tag == .windows) {
-            var stream_writer = self.toInner().writer(shared.io(), &[_]u8{});
-            stream_writer.interface.writeAll(bytes) catch |err| switch (err) {
-                error.WriteFailed => return stream_writer.err orelse error.Unexpected,
-            };
-            return bytes.len;
-        }
         var total: usize = 0;
         while (total < bytes.len) {
-            const rc = posix.system.write(self.handle, bytes.ptr + total, bytes.len - total);
-            switch (posix.errno(rc)) {
-                .SUCCESS => total += @intCast(rc),
-                .INTR => continue,
-                else => |err| return posix.unexpectedErrno(err),
+            if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+                const io = shared.io();
+                var data = [1][]const u8{bytes[total..]};
+                const n = try io.vtable.netWrite(io.userdata, self.handle, &.{}, &data, 1);
+                if (n == 0) return error.Unexpected;
+                total += n;
+            } else {
+                const rc = posix.system.sendto(self.handle, bytes.ptr + total, bytes.len - total, posix.MSG.NOSIGNAL, null, 0);
+                switch (posix.errno(rc)) {
+                    .SUCCESS => {
+                        const n: usize = @intCast(rc);
+                        if (n == 0) return error.Unexpected;
+                        total += n;
+                    },
+                    .INTR => continue,
+                    .ALREADY => return error.FastOpenAlreadyInProgress,
+                    .CONNRESET => return error.ConnectionResetByPeer,
+                    .CONNREFUSED => return error.ConnectionRefused,
+                    .NOBUFS, .NOMEM => return error.SystemResources,
+                    .PIPE, .NOTCONN => return error.SocketUnconnected,
+                    .AFNOSUPPORT => return error.AddressFamilyUnsupported,
+                    .HOSTUNREACH => return error.HostUnreachable,
+                    .NETUNREACH => return error.NetworkUnreachable,
+                    .NETDOWN => return error.NetworkDown,
+                    else => |err| return posix.unexpectedErrno(err),
+                }
             }
         }
         return total;
@@ -282,7 +298,43 @@ pub const Server = struct {
 
     pub const AcceptError = IoNet.Server.AcceptError;
 
-    pub fn accept(self: *Server) AcceptError!Connection {
+    fn acceptPosixNonblocking(self: *Server) AcceptError!Connection {
+        if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+            unreachable;
+        }
+
+        var address: Address = undefined;
+        var address_len: posix.socklen_t = @sizeOf(Address);
+
+        while (true) {
+            const rc = posix.system.accept(self.stream.handle, &address.any, &address_len);
+            switch (posix.errno(rc)) {
+                .SUCCESS => {
+                    var stream: Stream = .{ .handle = @intCast(rc) };
+                    errdefer stream.close();
+                    try setSocketCloseOnExec(stream.handle);
+                    try setSocketNonblocking(stream.handle, false);
+                    return .{
+                        .stream = stream,
+                        .address = address,
+                    };
+                },
+                .INTR => continue,
+                .AGAIN => return error.WouldBlock,
+                .CONNABORTED => return error.ConnectionAborted,
+                .INVAL => return error.SocketNotListening,
+                .MFILE => return error.ProcessFdQuotaExceeded,
+                .NFILE => return error.SystemFdQuotaExceeded,
+                .NETDOWN => return error.NetworkDown,
+                .NOBUFS, .NOMEM => return error.SystemResources,
+                .PERM => return error.BlockedByFirewall,
+                .PROTO => return error.ProtocolFailure,
+                else => |err| return posix.unexpectedErrno(err),
+            }
+        }
+    }
+
+    fn acceptViaIo(self: *Server) AcceptError!Connection {
         const accept_options: IoNet.Server.AcceptOptions = if (comptime IoNet.Server.AcceptOptions == void) {} else .{ .mode = .stream, .protocol = .tcp };
         var server: IoNet.Server = .{
             .socket = .{
@@ -298,6 +350,18 @@ pub const Server = struct {
             .stream = .{ .handle = stream.socket.handle },
             .address = Address.fromCurrent(stream.socket.address),
         };
+    }
+
+    pub fn accept(self: *Server) AcceptError!Connection {
+        if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) {
+            return self.acceptViaIo();
+        }
+
+        if (socketIsNonblocking(self.stream.handle)) {
+            return self.acceptPosixNonblocking();
+        }
+
+        return self.acceptViaIo();
     }
 };
 
@@ -466,6 +530,73 @@ test "compat net normalizes listener and stream blocking mode" {
     defer conn.stream.close();
 
     try std.testing.expect(!socketIsNonblocking(conn.stream.handle));
+}
+
+test "compat net nonblocking listener accept reports WouldBlock when idle" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const addr = try Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{ .force_nonblocking = true });
+    defer server.deinit();
+
+    // Regression for #851: Zig 0.16 Threaded accept maps EAGAIN on externally
+    // non-blocking listeners to Unexpected instead of WouldBlock.
+    try std.testing.expectError(error.WouldBlock, server.accept());
+}
+
+test "compat net stream read receives small socket payload" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const addr = try Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+
+    const client = try tcpConnectToAddress(server.listen_address);
+    defer client.close();
+
+    var conn = try server.accept();
+    defer conn.stream.close();
+
+    try conn.stream.writeAll("$-1\r\n");
+
+    var buf: [8]u8 = undefined;
+    var filled: usize = 0;
+    while (filled < 5) {
+        const n = try client.read(buf[filled..5]);
+        if (n == 0) return error.TestUnexpectedResult;
+        filled += n;
+    }
+
+    try std.testing.expectEqualStrings("$-1\r\n", buf[0..5]);
+}
+
+test "compat net stream write sends small socket payload" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
+
+    const addr = try Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+
+    const client = try tcpConnectToAddress(server.listen_address);
+    defer client.close();
+
+    var conn = try server.accept();
+    defer conn.stream.close();
+
+    // Regression for #858: Stream.write must not create a one-off Io.Writer
+    // with an empty buffer for each socket write.
+    const payload = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+    try std.testing.expectEqual(payload.len, try conn.stream.write(payload));
+
+    var buf: [payload.len]u8 = undefined;
+    var filled: usize = 0;
+    while (filled < payload.len) {
+        const n = try client.read(buf[filled..]);
+        if (n == 0) return error.TestUnexpectedResult;
+        filled += n;
+    }
+
+    try std.testing.expectEqualStrings(payload, &buf);
 }
 
 fn socketIsNonblocking(handle: IoNet.Socket.Handle) bool {
