@@ -19,6 +19,7 @@ result
 .direnv/
 .worktrees
 config.signal.json
+nullclaw-codebase.md
 
 # IDE configurations
 .idea/
