@@ -1,5 +1,17 @@
 # Zig Installation
 
+## Prefer the packaged install when possible
+
+If you already use Homebrew on macOS or Linux, the shortest path is the
+prebuilt NullClaw package. It does not require a local Zig toolchain:
+
+```bash
+brew install nullclaw
+```
+
+Use the Debian steps below only when you want to build NullClaw from source and
+need the exact pinned Zig 0.16.0 toolchain.
+
 ## Debian
 
 These steps install Zig 0.16.0 from the official x86_64 Linux tarball on a fresh Debian system.
