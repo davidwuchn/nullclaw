@@ -190,10 +190,23 @@ fn prepareCurlBodyArg(
     return prepared;
 }
 
+/// Content delta from an SSE chunk.
+pub const DeltaContent = union(enum) {
+    text: []const u8,
+    reasoning: []const u8,
+
+    pub fn deinit(self: DeltaContent, allocator: std.mem.Allocator) void {
+        switch (self) {
+            .text => |t| allocator.free(t),
+            .reasoning => |r| allocator.free(r),
+        }
+    }
+};
+
 /// Result of parsing a single SSE line.
 pub const SseLineResult = union(enum) {
-    /// Text delta content (owned, caller frees).
-    delta: []const u8,
+    /// Text or reasoning delta content (owned, caller frees).
+    delta: DeltaContent,
     /// Stream is complete ([DONE] sentinel).
     done: void,
     /// Token usage from a stream chunk.
@@ -263,15 +276,17 @@ fn extractStreamUsage(json_str: []const u8) ?root.TokenUsage {
     return usage;
 }
 
-/// Extract visible streaming text from an SSE JSON payload.
-/// Falls back to `delta.reasoning`, `delta.reasoning_content`, or
-/// `delta.reasoning_details` when providers stream their thinking trace
-/// separately and wraps it in think tags so higher layers can suppress it
-/// from user-visible output.
-/// Returns owned slice or null if no content found.
-pub fn extractDeltaContent(allocator: std.mem.Allocator, json_str: []const u8) !?[]const u8 {
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_str, .{}) catch
+/// Extract visible streaming text or reasoning from an SSE JSON payload.
+/// Returns owned DeltaContent or null if no content found.
+pub fn extractDeltaContent(allocator: std.mem.Allocator, json_str: []const u8) !?DeltaContent {
+    if (verbose.isVerbose()) {
+        log.debug("SSE JSON: {s}", .{json_str});
+    }
+
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_str, .{}) catch |err| {
+        if (verbose.isVerbose()) log.err("Failed to parse SSE JSON: {s} | Error: {s}", .{json_str, @errorName(err)});
         return error.InvalidSseJson;
+    };
     defer parsed.deinit();
 
     const obj = parsed.value.object;
@@ -284,29 +299,25 @@ pub fn extractDeltaContent(allocator: std.mem.Allocator, json_str: []const u8) !
     const delta = first.object.get("delta") orelse return null;
     if (delta != .object) return null;
 
+    // Check content first, but only if not empty
     if (delta.object.get("content")) |content| {
         if (content == .string and content.string.len > 0) {
-            return try allocator.dupe(u8, content.string);
+            return .{ .text = try allocator.dupe(u8, content.string) };
         }
     }
 
-    if (delta.object.get("reasoning")) |reasoning| {
-        if (reasoning == .string and reasoning.string.len > 0) {
-            return try std.fmt.allocPrint(allocator, "<think>{s}</think>", .{reasoning.string});
-        }
-    }
-
-    if (delta.object.get("reasoning_content")) |reasoning_content| {
-        if (reasoning_content == .string and reasoning_content.string.len > 0) {
-            const wrapped = try std.fmt.allocPrint(allocator, "<think>{s}</think>", .{reasoning_content.string});
-            return wrapped;
-        }
-    }
-
-    if (delta.object.get("reasoning_details")) |reasoning_details| {
-        if (try root.extractReasoningTextFromDetails(allocator, reasoning_details)) |reasoning_text| {
-            defer allocator.free(reasoning_text);
-            return try std.fmt.allocPrint(allocator, "<think>{s}</think>", .{reasoning_text});
+    // Fallback to various reasoning fields
+    const reasoning_keys = [_][]const u8{ "reasoning", "reasoning_content", "reasoning_details" };
+    for (reasoning_keys) |key| {
+        if (delta.object.get(key)) |val| {
+            if (val == .string and val.string.len > 0) {
+                return .{ .reasoning = try allocator.dupe(u8, val.string) };
+            }
+            if (std.mem.eql(u8, key, "reasoning_details") and val == .object) {
+                if (try root.extractReasoningTextFromDetails(allocator, val)) |text| {
+                    return .{ .reasoning = text };
+                }
+            }
         }
     }
 
@@ -462,6 +473,13 @@ pub fn curlStream(
     var saw_done = false;
     var total_stdout: usize = 0;
     var stream_usage: ?root.TokenUsage = null;
+    var in_reasoning = false;
+    defer {
+        if (in_reasoning) {
+            accumulated.appendSlice(allocator, "</think>") catch {};
+            callback(ctx, root.StreamChunk.textDelta("</think>"));
+        }
+    }
 
     outer: while (true) {
         const n = stdout_file.read(&read_buf) catch |err| {
@@ -518,10 +536,28 @@ pub fn curlStream(
                 };
                 line_buf.clearRetainingCapacity();
                 switch (result) {
-                    .delta => |text| {
-                        defer allocator.free(text);
-                        try accumulated.appendSlice(allocator, text);
-                        callback(ctx, root.StreamChunk.textDelta(text));
+                    .delta => |content| {
+                        defer content.deinit(allocator);
+                        switch (content) {
+                            .text => |text| {
+                                if (in_reasoning) {
+                                    in_reasoning = false;
+                                    try accumulated.appendSlice(allocator, "</think>");
+                                    callback(ctx, root.StreamChunk.textDelta("</think>"));
+                                }
+                                try accumulated.appendSlice(allocator, text);
+                                callback(ctx, root.StreamChunk.textDelta(text));
+                            },
+                            .reasoning => |reasoning| {
+                                if (!in_reasoning) {
+                                    in_reasoning = true;
+                                    try accumulated.appendSlice(allocator, "<think>");
+                                    callback(ctx, root.StreamChunk.textDelta("<think>"));
+                                }
+                                try accumulated.appendSlice(allocator, reasoning);
+                                callback(ctx, root.StreamChunk.textDelta(reasoning));
+                            },
+                        }
                     },
                     .usage => |u| stream_usage = u,
                     .done => {
@@ -549,10 +585,28 @@ pub fn curlStream(
         line_buf.clearRetainingCapacity();
         if (trailing) |result| {
             switch (result) {
-                .delta => |text| {
-                    defer allocator.free(text);
-                    try accumulated.appendSlice(allocator, text);
-                    callback(ctx, root.StreamChunk.textDelta(text));
+                .delta => |content| {
+                    defer content.deinit(allocator);
+                    switch (content) {
+                        .text => |text| {
+                            if (in_reasoning) {
+                                in_reasoning = false;
+                                try accumulated.appendSlice(allocator, "</think>");
+                                callback(ctx, root.StreamChunk.textDelta("</think>"));
+                            }
+                            try accumulated.appendSlice(allocator, text);
+                            callback(ctx, root.StreamChunk.textDelta(text));
+                        },
+                        .reasoning => |reasoning| {
+                            if (!in_reasoning) {
+                                in_reasoning = true;
+                                try accumulated.appendSlice(allocator, "<think>");
+                                callback(ctx, root.StreamChunk.textDelta("<think>"));
+                            }
+                            try accumulated.appendSlice(allocator, reasoning);
+                            callback(ctx, root.StreamChunk.textDelta(reasoning));
+                        },
+                    }
                 },
                 .usage => |u| stream_usage = u,
                 .done => {},

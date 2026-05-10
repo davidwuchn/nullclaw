@@ -331,10 +331,12 @@ pub const OllamaProvider = struct {
         };
     }
 
-    const vtable = Provider.VTable{
+    pub const vtable = Provider.VTable{
         .chatWithSystem = chatWithSystemImpl,
         .chat = chatImpl,
+        .stream_chat = streamChatImpl,
         .supportsNativeTools = supportsNativeToolsImpl,
+        .supports_streaming = supportsStreamingImpl,
         .supports_vision = supportsVisionImpl,
         .getName = getNameImpl,
         .deinit = deinitImpl,
@@ -378,7 +380,7 @@ pub const OllamaProvider = struct {
         var url_buf: [2048]u8 = undefined;
         const url = std.fmt.bufPrint(&url_buf, "{s}/api/chat", .{self.base_url}) catch return error.OllamaApiError;
 
-        const body = try buildChatRequestBody(allocator, request, model, temperature);
+        const body = try buildChatRequestBody(allocator, request, model, temperature, false);
         defer allocator.free(body);
 
         var headers_buf: [1][]const u8 = undefined;
@@ -390,6 +392,43 @@ pub const OllamaProvider = struct {
 
         const text = try parseResponse(allocator, resp_body);
         return ChatResponse{ .content = text };
+    }
+
+    fn streamChatImpl(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        request: ChatRequest,
+        model: []const u8,
+        temperature: f64,
+        callback: root.StreamCallback,
+        callback_ctx: *anyopaque,
+    ) anyerror!root.StreamChatResult {
+        const self: *OllamaProvider = @ptrCast(@alignCast(ptr));
+        var url_buf: [2048]u8 = undefined;
+        // Use OpenAI-compatible endpoint for reasoning support via SSE
+        const url = try std.fmt.bufPrint(&url_buf, "{s}/v1/chat/completions", .{self.base_url});
+
+        var headers_buf: [1][]const u8 = undefined;
+        var auth_hdr_buf: [512]u8 = undefined;
+        const headers = self.buildAuthHeaders(&headers_buf, &auth_hdr_buf) catch return error.OllamaApiError;
+
+        const body = try buildChatRequestBody(allocator, request, model, temperature, true);
+        defer allocator.free(body);
+
+        return root.sse.curlStream(
+            allocator,
+            url,
+            body,
+            null,
+            headers,
+            request.timeout_secs,
+            callback,
+            callback_ctx,
+        );
+    }
+
+    fn supportsStreamingImpl(_: *anyopaque) bool {
+        return true;
     }
 
     fn supportsNativeToolsImpl(ptr: *anyopaque) bool {
@@ -414,6 +453,7 @@ fn buildChatRequestBody(
     request: ChatRequest,
     model: []const u8,
     temperature: f64,
+    stream: bool,
 ) ![]const u8 {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
@@ -465,7 +505,9 @@ fn buildChatRequestBody(
         }
     }
 
-    try buf.appendSlice(allocator, ",\"stream\":false,\"options\":{\"temperature\":");
+    try buf.appendSlice(allocator, ",\"stream\":");
+    try buf.appendSlice(allocator, if (stream) "true" else "false");
+    try buf.appendSlice(allocator, ",\"options\":{\"temperature\":");
     var temp_buf: [16]u8 = undefined;
     const temp_str = std.fmt.bufPrint(&temp_buf, "{d:.2}", .{temperature}) catch return error.OllamaApiError;
     try buf.appendSlice(allocator, temp_str);

@@ -40,6 +40,7 @@ const CliStreamCtx = struct {
     sink: streaming.Sink,
     emitted_text: bool = false,
     filter: streaming.TagFilter = undefined,
+    think_filter: streaming.ThinkPassthroughFilter = undefined,
 };
 
 const CliProviderContext = struct {
@@ -101,6 +102,13 @@ fn cliStreamSinkCallback(ctx_ptr: *anyopaque, event: streaming.Event) void {
 
 fn makeCliStreamSink(raw_sink: streaming.Sink, filter: *streaming.TagFilter) streaming.Sink {
     filter.* = streaming.TagFilter.init(raw_sink);
+    return filter.sink();
+}
+
+/// Like makeCliStreamSink but passes <think> blocks through with a header/footer
+/// instead of stripping them. Used when reasoning_mode == .stream.
+fn makeCliStreamSinkPassthrough(raw_sink: streaming.Sink, filter: *streaming.ThinkPassthroughFilter) streaming.Sink {
+    filter.* = streaming.ThinkPassthroughFilter.init(raw_sink);
     return filter.sink();
 }
 
@@ -547,7 +555,9 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         }
         defer agent.deinit();
 
-        // Enable streaming if provider supports it
+        // Enable streaming if provider supports it.
+        // When reasoning_mode == .stream, use ThinkPassthroughFilter so that
+        // <think> content is printed live instead of being silently stripped.
         var stream_ctx = CliStreamCtx{
             .sink = undefined,
         };
@@ -555,7 +565,11 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             .callback = cliStreamSinkCallback,
             .ctx = @ptrCast(&stream_ctx),
         };
-        stream_ctx.sink = makeCliStreamSink(raw_stream_sink, &stream_ctx.filter);
+        if (agent.reasoning_mode == .stream) {
+            stream_ctx.sink = makeCliStreamSinkPassthrough(raw_stream_sink, &stream_ctx.think_filter);
+        } else {
+            stream_ctx.sink = makeCliStreamSink(raw_stream_sink, &stream_ctx.filter);
+        }
         if (supports_streaming) {
             agent.stream_callback = cliStreamCallback;
             agent.stream_ctx = @ptrCast(&stream_ctx);
@@ -661,7 +675,9 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     }
     defer agent.deinit();
 
-    // Enable streaming if provider supports it
+    // Enable streaming if provider supports it.
+    // When reasoning_mode == .stream, use ThinkPassthroughFilter so that
+    // <think> content is printed live instead of being silently stripped.
     var stream_ctx = CliStreamCtx{
         .sink = undefined,
     };
@@ -669,7 +685,11 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         .callback = cliStreamSinkCallback,
         .ctx = @ptrCast(&stream_ctx),
     };
-    stream_ctx.sink = makeCliStreamSink(raw_stream_sink, &stream_ctx.filter);
+    if (agent.reasoning_mode == .stream) {
+        stream_ctx.sink = makeCliStreamSinkPassthrough(raw_stream_sink, &stream_ctx.think_filter);
+    } else {
+        stream_ctx.sink = makeCliStreamSink(raw_stream_sink, &stream_ctx.filter);
+    }
     if (supports_streaming) {
         agent.stream_callback = cliStreamCallback;
         agent.stream_ctx = @ptrCast(&stream_ctx);
@@ -719,6 +739,17 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
 
         // Append the effective turn input after debounce coalescing.
         repl_history.append(allocator, allocator.dupe(u8, debounced_input.current) catch continue) catch {};
+
+        // Re-evaluate sink in case reasoning_mode was changed by a previous slash command
+        const repl_raw_sink = streaming.Sink{
+            .callback = cliStreamSinkCallback,
+            .ctx = @ptrCast(&stream_ctx),
+        };
+        if (agent.reasoning_mode == .stream) {
+            stream_ctx.sink = makeCliStreamSinkPassthrough(repl_raw_sink, &stream_ctx.think_filter);
+        } else {
+            stream_ctx.sink = makeCliStreamSink(repl_raw_sink, &stream_ctx.filter);
+        }
 
         stream_ctx.emitted_text = false;
         const response = agent.turn(debounced_input.current) catch |err| {
