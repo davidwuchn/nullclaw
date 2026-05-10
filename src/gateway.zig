@@ -2387,11 +2387,11 @@ const LocalAgentRuntime = struct {
     provider_bundle: providers.runtime_bundle.RuntimeProviderBundle,
     session_mgr: session_mod.SessionManager,
     tools_slice: []const tools_mod.Tool,
-    mem_rt: ?memory_mod.MemoryRuntime,
+    mem_rt: ?*memory_mod.MemoryRuntime,
     bootstrap_provider: ?bootstrap_mod.BootstrapProvider,
     subagent_manager: ?*subagent_mod.SubagentManager,
-    sec_tracker: security.RateTracker,
-    sec_policy: security.SecurityPolicy,
+    sec_tracker: *security.RateTracker,
+    sec_policy: *security.SecurityPolicy,
 
     fn deinit(self: *LocalAgentRuntime, allocator: std.mem.Allocator) void {
         self.session_mgr.deinit();
@@ -2401,9 +2401,14 @@ const LocalAgentRuntime = struct {
             mgr.deinit();
             allocator.destroy(mgr);
         }
-        if (self.mem_rt) |*rt| rt.deinit();
+        if (self.mem_rt) |rt| {
+            rt.deinit();
+            allocator.destroy(rt);
+        }
         self.provider_bundle.deinit();
+        allocator.destroy(self.sec_policy);
         self.sec_tracker.deinit();
+        allocator.destroy(self.sec_tracker);
     }
 };
 
@@ -2419,8 +2424,18 @@ fn initLocalAgentRuntime(
     const provider_i: providers.Provider = provider_bundle.provider();
     const resolved_api_key = provider_bundle.primaryApiKey();
 
-    var mem_rt = memory_mod.initRuntime(allocator, &cfg.memory, cfg.workspace_dir);
-    errdefer if (mem_rt) |*rt| rt.deinit();
+    const mem_rt: ?*memory_mod.MemoryRuntime = blk: {
+        var rt_value = memory_mod.initRuntime(allocator, &cfg.memory, cfg.workspace_dir) orelse break :blk null;
+        errdefer rt_value.deinit();
+
+        const rt = try allocator.create(memory_mod.MemoryRuntime);
+        rt.* = rt_value;
+        break :blk rt;
+    };
+    errdefer if (mem_rt) |rt| {
+        rt.deinit();
+        allocator.destroy(rt);
+    };
     const mem_opt: ?memory_mod.Memory = if (mem_rt) |rt| rt.memory else null;
 
     const bootstrap_provider = bootstrap_mod.createProvider(
@@ -2440,9 +2455,16 @@ fn initLocalAgentRuntime(
         errdefer mgr.deinit();
     }
 
-    var sec_tracker = security.RateTracker.init(allocator, cfg.autonomy.max_actions_per_hour);
-    errdefer sec_tracker.deinit();
-    var sec_policy: security.SecurityPolicy = .{
+    const sec_tracker = try allocator.create(security.RateTracker);
+    sec_tracker.* = security.RateTracker.init(allocator, cfg.autonomy.max_actions_per_hour);
+    errdefer {
+        sec_tracker.deinit();
+        allocator.destroy(sec_tracker);
+    }
+
+    const sec_policy = try allocator.create(security.SecurityPolicy);
+    errdefer allocator.destroy(sec_policy);
+    sec_policy.* = .{
         .autonomy = cfg.autonomy.level,
         .workspace_dir = cfg.workspace_dir,
         .workspace_only = cfg.autonomy.workspace_only,
@@ -2452,7 +2474,7 @@ fn initLocalAgentRuntime(
         .block_high_risk_commands = cfg.autonomy.block_high_risk_commands,
         .block_medium_risk_commands = cfg.autonomy.block_medium_risk_commands,
         .allow_raw_url_chars = cfg.autonomy.allow_raw_url_chars,
-        .tracker = &sec_tracker,
+        .tracker = sec_tracker,
     };
 
     const tools_slice = tools_mod.allTools(allocator, cfg.workspace_dir, .{
@@ -2471,7 +2493,7 @@ fn initLocalAgentRuntime(
         .fallback_api_key = resolved_api_key,
         .allowed_paths = cfg.autonomy.allowed_paths,
         .tools_config = cfg.tools,
-        .policy = &sec_policy,
+        .policy = sec_policy,
         .subagent_manager = subagent_manager,
         .bootstrap_provider = bootstrap_provider,
         .backend_name = cfg.memory.backend,
@@ -2488,10 +2510,10 @@ fn initLocalAgentRuntime(
         mem_opt,
         runtime_observer.observer(),
         if (mem_rt) |rt| rt.session_store else null,
-        if (mem_rt) |*rt| rt.response_cache else null,
+        if (mem_rt) |rt| rt.response_cache else null,
     );
-    session_mgr.policy = &sec_policy;
-    if (mem_rt) |*rt| {
+    session_mgr.policy = sec_policy;
+    if (mem_rt) |rt| {
         session_mgr.mem_rt = rt;
         tools_mod.bindMemoryRuntime(tools_slice, rt);
     }
@@ -9015,6 +9037,51 @@ test "gateway daemon mode keeps local agent runtime lazy even when a2a enabled" 
     }
 
     try std.testing.expect(local_agent_runtime_opt == null);
+}
+
+test "local agent runtime keeps policy and memory pointers stable" {
+    var cfg = Config{
+        .workspace_dir = "/tmp/yc_test",
+        .config_path = "/tmp/yc_test/config.json",
+        .allocator = std.testing.allocator,
+    };
+    cfg.memory.backend = "none";
+    cfg.security.sandbox.enabled = false;
+
+    var gateway_observer = GatewayThreadObserver.init(std.testing.allocator);
+    defer gateway_observer.deinit();
+
+    const runtime_observer = try observability.RuntimeObserver.create(
+        std.testing.allocator,
+        .{
+            .workspace_dir = cfg.workspace_dir,
+            .backend = "none",
+        },
+        &.{},
+        &.{gateway_observer.observer()},
+    );
+    defer runtime_observer.destroy();
+
+    var runtime = try initLocalAgentRuntime(std.testing.allocator, &cfg, runtime_observer, null);
+    defer runtime.deinit(std.testing.allocator);
+
+    // Regression: initLocalAgentRuntime returns by value, so runtime-owned
+    // pointers must not target locals from inside the initializer.
+    try std.testing.expect(runtime.sec_policy.tracker.? == runtime.sec_tracker);
+    try std.testing.expect(runtime.session_mgr.policy.? == runtime.sec_policy);
+    try std.testing.expect(runtime.mem_rt != null);
+    try std.testing.expect(runtime.session_mgr.mem_rt.? == runtime.mem_rt.?);
+
+    var saw_shell = false;
+    for (runtime.tools_slice) |tool| {
+        if (std.mem.eql(u8, tool.name(), tools_mod.shell.ShellTool.tool_name)) {
+            const shell_tool: *tools_mod.shell.ShellTool = @ptrCast(@alignCast(tool.ptr));
+            try std.testing.expect(shell_tool.policy.? == runtime.sec_policy);
+            saw_shell = true;
+            break;
+        }
+    }
+    try std.testing.expect(saw_shell);
 }
 
 test "userFacingAgentError maps ProviderDoesNotSupportVision" {
